@@ -164,7 +164,7 @@ async def test_tool_calls_run_through_the_executor_as_the_agent(
     for event in events:
         assert (event.actor_user_id, event.actor_type) == (viewer.id, ActorType.AGENT)
         assert event.tenant_id == viewer.tenant_id
-    assert events[0].payload["message"] == "Help"
+    assert events[0].payload["message_chars"] == len("Help")
     assert events[2].result["steps"] == 2
     assert "delivered" in tool_message(llm, 1).content
 
@@ -487,3 +487,36 @@ def test_run_ids_are_uuids() -> None:
     from app.modules.agent.service import new_run_id
 
     assert UUID(new_run_id())
+
+
+# --- Audit retention: metadata only -------------------------------------------
+
+
+async def test_run_audit_keeps_metadata_but_never_conversation_text(
+    seeded_db: Database, seeded_users, registry, audit_log
+) -> None:
+    """Run events record sizes and counts; message, history, and answer text stay out."""
+    from packages.contracts.schemas import ChatHistoryMessage
+
+    message = "Confidential question about the Q3 payroll"
+    history = [
+        ChatHistoryMessage(role="user", content="Earlier private remark"),
+        ChatHistoryMessage(role="assistant", content="Earlier private reply"),
+    ]
+    reply = "Private answer with salary figures"
+    llm = FakeLLMProvider([answer(reply)])
+
+    response = await run(
+        seeded_db, seeded_users[VIEWER], deps(registry, llm), message=message, history=history
+    )
+
+    events = [e for e in await audit_log(seeded_db) if e.action.startswith("agent.")]
+    stored = json.dumps([[e.payload, e.result] for e in events], default=str)
+    for text in (message, reply, "Earlier private remark", "Earlier private reply"):
+        assert text not in stored
+    [started] = [e for e in events if e.action == "agent.run_started"]
+    assert started.payload == {"message_chars": len(message), "history_messages": 2}
+    [completed] = [e for e in events if e.action == "agent.run_completed"]
+    assert completed.result["answer_chars"] == len(response.answer)
+    assert completed.result["citations"] == 0
+    assert "answer" not in completed.result

@@ -29,6 +29,8 @@ Audit (actor = the user, ``actor_type`` agent, correlation = run id):
 ``agent.step_limit``, or ``agent.run_failed``; ``agent.invalid_tool_call``
 for calls refused before the executor (non-object arguments, over the
 per-step cap); every executed call adds the executor's ``tool.*`` event.
+Run events carry metadata only (sizes, counts, tool names, approval ids):
+the message, history, and answer text are never written to the audit log.
 
 Transactions: the loop commits only the approval requests it creates
 (``EXTRACT`` tools are read-only); audit events use their own transactions.
@@ -197,7 +199,7 @@ class AgentRun:
         """
         await self._audit(
             "agent.run_started",
-            payload={"message": self._message, "history_messages": self._history_count},
+            payload={"message_chars": len(self._message), "history_messages": self._history_count},
             result={"tools": [tool["function"]["name"] for tool in self._tools]},
         )
         yield AgentEvent("run_started", {"run_id": self.run_id})
@@ -367,9 +369,9 @@ class AgentRun:
             "agent.run_completed",
             result={
                 "steps": self._steps,
-                "answer": response.answer,
+                "answer_chars": len(response.answer),
                 "tool_calls": len(response.tool_calls),
-                "citations": [citation.number for citation in response.citations],
+                "citations": len(response.citations),
                 "pending_approvals": pending,
             },
         )
