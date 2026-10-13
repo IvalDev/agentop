@@ -30,6 +30,16 @@ make test      # pytest
 make run       # uvicorn app.main:app --reload
 ```
 
+## Database migrations
+
+Schema changes are managed with Alembic; migrations read `AA_DATABASE_URL` from the
+environment (see `.env.example`):
+
+```bash
+make migrate                        # alembic upgrade head
+make migrate-revision m="add users" # alembic revision --autogenerate -m "add users"
+```
+
 ## Docker Compose
 
 ```bash

@@ -9,8 +9,10 @@ from app.main import create_app
 
 @pytest.fixture
 def app() -> FastAPI:
-    """Build a fresh application instance."""
-    return create_app()
+    """Build a fresh application instance without a database attached."""
+    application = create_app()
+    application.state.db = None
+    return application
 
 
 @pytest.fixture
