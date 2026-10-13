@@ -40,7 +40,7 @@ Las pymes ejecutan tareas administrativas repetitivas dispersas en correo, carpe
 
 ## Checklist de tareas
 
-- [x] T1 — Scaffold: estructura del repo, pyproject, Docker Compose base, healthcheck, CI mínima (ruff+pytest)
+- [x] T1 — Scaffold: estructura del repo, pyproject, Docker Compose base, healthcheck, CI mínima (ruff+pytest) — commit `d1b7ea9`; ruff ✓, format ✓, pytest 1 passed, compose config ✓; review: high_risk (CI shell), consent declined_this_candidate
 - [ ] T2 — Configuración y arranque: settings tipadas, lifespan, logging estructurado, DB session, migraciones Alembic
 - [ ] T3 — Identidad: modelos User/Tenant/Role/Permission, registro de usuarios, login JWT, middleware de tenant, RBAC dependency
 - [ ] T4 — Almacenamiento: modelos Document/DocumentChunk, subida con validación, extracción de texto (PDF/DOCX/TXT/MD), worker de ingesta
@@ -76,7 +76,8 @@ Las pymes ejecutan tareas administrativas repetitivas dispersas en correo, carpe
 
 ## Progress / evidence
 
-- 2026-10-13: feature creada; T1 en curso.
+- 2026-10-13: feature creada.
+- 2026-10-13: T1 completa — commit `d1b7ea9` (feat/admin-agent-core, raíz: 29 archivos, 471 líneas). Verificación: ruff check ✓, ruff format ✓, pytest 1 passed, docker compose config ✓. RDD: assess high_risk (shell en CI workflow); consentimiento del humano: declined_this_candidate (omisión puntual, no desactiva revisiones). Siguiente: T2.
 
 ## Rationale de cambios aceptados
 
