@@ -17,9 +17,10 @@ service error                           HTTP
 ``ApprovalExpiredError``                410 Gone (TTL elapsed; request is ``expired``)
 ====================================== ====================================
 
-Reads are open to every authenticated role of the tenant; approve, reject,
-and execute need a role satisfying the tool's required role (requester
-included). A tool that ran but failed still answers 200 with status
+Every route needs a role satisfying the request's stored required role
+(requester included): list silently omits the other requests, while get,
+approve, reject, and execute answer 403 (404 still wins for unknown and
+other-tenant ids). A tool that ran but failed still answers 200 with status
 ``failed`` and ``execution_error`` — the approval was consumed either way.
 """
 
@@ -110,7 +111,7 @@ def _response(request: ApprovalRequest) -> ApprovalResponse:
 async def list_approvals(
     session: SessionDep, user: CurrentUserDep, status: ApprovalStatus | None = None
 ) -> ApprovalListResponse:
-    """Return the caller's tenant requests, newest first (any role)."""
+    """Return the caller's tenant requests their role may read, newest first."""
     requests = await list_approval_requests(session, user, status)
     return ApprovalListResponse(approvals=[_response(request) for request in requests])
 
@@ -119,7 +120,7 @@ async def list_approvals(
 async def get_approval(
     approval_id: UUID, session: SessionDep, user: CurrentUserDep
 ) -> ApprovalResponse:
-    """Return one request of the caller's tenant (any role); 404 otherwise."""
+    """Return one request of the caller's tenant; 404 otherwise, 403 below its role."""
     try:
         return _response(await get_approval_request(session, user, approval_id))
     except ApprovalError as exc:

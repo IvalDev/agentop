@@ -179,7 +179,7 @@ class ApprovalTools:
 
 @pytest.fixture
 def approval_tools() -> ApprovalTools:
-    """Registry with an admin-gated ACTION tool and an AUTO extract tool."""
+    """Registry with admin- and operator-gated ACTION tools and an AUTO extract tool."""
     registry = ToolRegistry()
     spy = ActionSpy()
     registry.register(
@@ -189,6 +189,17 @@ def approval_tools() -> ApprovalTools:
             kind=ToolKind.ACTION,
             approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
             required_role=UserRole.ADMIN,
+            handler=spy,
+            input_model=SendNoteInput,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="queue_note",
+            description="test-only operator action that needs human approval",
+            kind=ToolKind.ACTION,
+            approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+            required_role=UserRole.OPERATOR,
             handler=spy,
             input_model=SendNoteInput,
         )

@@ -47,6 +47,7 @@ Las pymes ejecutan tareas administrativas repetitivas dispersas en correo, carpe
 - [x] T5 — Embeddings y retrieval: adaptador de embeddings, indexación pgvector, endpoint de búsqueda semántica + híbrida, scoring — commit `361fa60`; ruff ✓, format ✓, pytest 89 passed; RDD: medium (slice_budget_reached), consent declined_this_candidate (omisión puntual)
 - [x] T6 — Motor de herramientas: registry de herramientas tipadas con permisos y política de aprobación, ejecución acotada, dry-run — commit `a7a9de8`; ruff ✓, format ✓, pytest 131 passed; RDD: medium (slice_budget_reached), consent declined_this_candidate (omisión puntual)
 - [x] T7 — Aprobaciones: modelos ApprovalRequest, flujo request→approve/reject con binding exacto, TTL, execute_approved_action — commit `fa070e0`; ruff ✓, format ✓, pytest 165 passed; RDD: medium (slice_budget_reached), consent declined_this_candidate (omisión puntual)
+- [ ] T7.1 — Lectura de aprobaciones restringida: list/get exigen el rol requerido por la herramienta (decisión del humano 2026-10-13; antes cualquier rol del tenant veía payloads)
 - [ ] T8 — Auditoría: tabla append-only, hooks en todas las acciones, consulta por tenant/actor/acción
 - [ ] T9 — Orquestador LLM: adaptador Ollama, loop de agente con tool-calling, prompt de sistema con política anti-prompt-injection, streaming chat con citas
 - [ ] T10 — Integración: chat endpoint end-to-end con RAG + herramientas + aprobación + auditoría sobre fixtures

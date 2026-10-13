@@ -57,12 +57,18 @@ async def _admin(client: AsyncClient) -> dict[str, str]:
 
 
 async def _create(
-    db: Database, tools, user, *, now: datetime | None = None, approve_at: datetime | None = None
+    db: Database,
+    tools,
+    user,
+    *,
+    now: datetime | None = None,
+    approve_at: datetime | None = None,
+    tool: str = "send_note",
 ) -> UUID:
-    """Create (and optionally approve) a ``send_note`` request via the service."""
+    """Create (and optionally approve) a ``tool`` request via the service."""
     async with db.sessionmaker() as session:
         request = await create_approval_request(
-            session, tools.registry, user, "send_note", NOTE, settings=APPROVAL_SETTINGS, now=now
+            session, tools.registry, user, tool, NOTE, settings=APPROVAL_SETTINGS, now=now
         )
         await session.commit()
         if approve_at is not None:
@@ -87,7 +93,7 @@ async def test_list_is_tenant_scoped_and_filters_by_status(
     owner = seeded_users["owner@acme.test"]
     pending_id = await _create(seeded_db, approval_tools, owner)
     approved_id = await _create(seeded_db, approval_tools, owner, approve_at=datetime.now(UTC))
-    headers = await _headers(approvals_client, "viewer@acme.test", "viewer-pass")
+    headers = await _admin(approvals_client)
 
     everything = await approvals_client.get(BASE, headers=headers)
     pending = await approvals_client.get(BASE, params={"status": "pending"}, headers=headers)
@@ -138,6 +144,35 @@ async def test_other_tenant_ids_are_not_found(
         response = await approvals_client.post(f"{BASE}/{request_id}/{action}", headers=headers)
         assert response.status_code == 404, action
     assert (await approvals_client.get(f"{BASE}/{uuid4()}", headers=headers)).status_code == 404
+
+
+async def test_reads_require_the_tool_role(
+    approvals_client: AsyncClient, seeded_db: Database, seeded_users, approval_tools
+) -> None:
+    """A viewer neither lists nor gets operator-level requests; higher ranks do."""
+    admin = seeded_users["admin@acme.test"]
+    operator_id = await _create(seeded_db, approval_tools, admin, tool="queue_note")
+    admin_id = await _create(seeded_db, approval_tools, admin)
+    viewer = await _headers(approvals_client, "viewer@acme.test", "viewer-pass")
+
+    listed = await approvals_client.get(BASE, headers=viewer)
+    assert listed.status_code == 200
+    assert listed.json()["approvals"] == []
+    for request_id in (operator_id, admin_id):
+        response = await approvals_client.get(f"{BASE}/{request_id}", headers=viewer)
+        assert response.status_code == 403
+        assert response.json() == {"detail": "forbidden"}
+    assert (await approvals_client.get(f"{BASE}/{uuid4()}", headers=viewer)).status_code == 404
+
+    for headers in (await _admin(approvals_client), await _owner(approvals_client)):
+        listed = await approvals_client.get(BASE, headers=headers)
+        assert {item["id"] for item in listed.json()["approvals"]} == {
+            str(operator_id),
+            str(admin_id),
+        }
+        response = await approvals_client.get(f"{BASE}/{operator_id}", headers=headers)
+        assert response.status_code == 200
+        assert response.json()["required_role"] == "operator"
 
 
 async def test_viewer_cannot_decide_or_execute(

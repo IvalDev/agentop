@@ -2,11 +2,13 @@
 
 Product policy:
 
-- Any user of the request's tenant whose role satisfies the tool's required
-  role may approve, reject, or execute it — the requester included. A
-  superadmin passes the role check, but the tenant must still match.
+- Any user of the request's tenant whose role satisfies the request's stored
+  ``required_role`` may read, approve, reject, or execute it — the requester
+  included. A superadmin passes the role check, but the tenant must still
+  match. Listing omits requests the caller's role does not satisfy; a get of
+  one raises :class:`ApprovalForbiddenError`.
 - Requests of other tenants are indistinguishable from missing ones
-  (:class:`ApprovalNotFoundError`); reads are open to every role of the tenant.
+  (:class:`ApprovalNotFoundError`), which is checked before the role.
 - The approval binds the exact tool + canonical input (decision A7):
   ``action_key`` is computed here with ``compute_action_key`` (never accepted
   from a caller); execution re-derives it from the stored payload, refuses on
@@ -98,6 +100,11 @@ async def _load(session: AsyncSession, user: ToolUser, request_id: UUID) -> Appr
 def _require_role(user: ToolUser, request: ApprovalRequest) -> None:
     if not role_satisfies(user, UserRole(request.required_role)):
         raise ApprovalForbiddenError("forbidden")
+
+
+def _readable_roles(user: ToolUser) -> list[str]:
+    """Stored ``required_role`` values ``user`` satisfies (every role for a superadmin)."""
+    return [role.value for role in UserRole if role_satisfies(user, role)]
 
 
 def _require_status(request: ApprovalRequest, expected: ApprovalStatus) -> None:
@@ -207,10 +214,16 @@ async def create_approval_request(
 async def list_approval_requests(
     session: AsyncSession, user: ToolUser, status: ApprovalStatus | None = None
 ) -> list[ApprovalRequest]:
-    """Return the tenant's requests, newest first, optionally filtered by status."""
+    """Return the tenant's requests ``user``'s role may read, newest first.
+
+    The role filter runs in the query (``required_role IN`` the satisfied
+    roles), so any status filter, limit, or count applies to readable rows only.
+    """
     context = TenantContext(tenant_id=user.tenant_id, user_id=user.id, role=user.role)
-    query = scoped_query(ApprovalRequest, context).order_by(
-        ApprovalRequest.created_at.desc(), ApprovalRequest.id
+    query = (
+        scoped_query(ApprovalRequest, context)
+        .where(ApprovalRequest.required_role.in_(_readable_roles(user)))
+        .order_by(ApprovalRequest.created_at.desc(), ApprovalRequest.id)
     )
     if status is not None:
         query = query.where(ApprovalRequest.status == status)
@@ -220,8 +233,15 @@ async def list_approval_requests(
 async def get_approval_request(
     session: AsyncSession, user: ToolUser, request_id: UUID
 ) -> ApprovalRequest:
-    """Return one request of ``user``'s tenant; not-found for foreign or unknown ids."""
-    return await _load(session, user, request_id)
+    """Return one request of ``user``'s tenant that ``user``'s role may read.
+
+    Raises :class:`ApprovalNotFoundError` for foreign or unknown ids, then
+    :class:`ApprovalForbiddenError` when the role does not satisfy the
+    request's stored ``required_role``.
+    """
+    request = await _load(session, user, request_id)
+    _require_role(user, request)
+    return request
 
 
 async def _decide(

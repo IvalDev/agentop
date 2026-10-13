@@ -8,7 +8,7 @@ is deterministic and no production tool is involved.
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import update
@@ -33,6 +33,7 @@ from app.modules.approvals.service import (
     reject_request,
 )
 from app.modules.identity.deps import CurrentUser
+from app.modules.identity.models import UserRole
 from app.modules.tools.executor import compute_action_key
 
 T0 = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
@@ -47,10 +48,12 @@ VIEWER = "viewer@acme.test"
 FOREIGN_OWNER = "owner@globex.test"
 
 
-async def _create(db: Database, tools, user: CurrentUser, raw_input: dict = NOTE) -> UUID:
+async def _create(
+    db: Database, tools, user: CurrentUser, raw_input: dict = NOTE, *, tool: str = "send_note"
+) -> UUID:
     async with db.sessionmaker() as session:
         request = await create_approval_request(
-            session, tools.registry, user, "send_note", raw_input, settings=SETTINGS, now=T0
+            session, tools.registry, user, tool, raw_input, settings=SETTINGS, now=T0
         )
         await session.commit()
         return request.id
@@ -156,7 +159,9 @@ async def test_viewer_cannot_decide(seeded_db: Database, seeded_users, approval_
     with pytest.raises(ApprovalForbiddenError):
         await _reject(seeded_db, viewer, request_id)
 
-    assert (await _reload(seeded_db, viewer, request_id)).status is ApprovalStatus.PENDING
+    assert (await _reload(seeded_db, seeded_users[ADMIN], request_id)).status is (
+        ApprovalStatus.PENDING
+    )
 
 
 async def test_superadmin_passes_role_check_in_own_tenant(
@@ -396,8 +401,61 @@ async def test_list_is_tenant_scoped_and_filters_by_status(
     await _approve(seeded_db, owner, approved_id)
 
     async with seeded_db.sessionmaker() as session:
-        everything = await list_approval_requests(session, seeded_users[VIEWER])
+        everything = await list_approval_requests(session, seeded_users[ADMIN])
         pending = await list_approval_requests(session, owner, status=ApprovalStatus.PENDING)
 
     assert {request.id for request in everything} == {pending_id, approved_id}
     assert [request.id for request in pending] == [pending_id]
+
+
+async def _visible(db: Database, user: CurrentUser, status: ApprovalStatus | None = None):
+    async with db.sessionmaker() as session:
+        return {request.id for request in await list_approval_requests(session, user, status)}
+
+
+async def test_reads_require_the_tool_role(
+    seeded_db: Database, seeded_users, approval_tools
+) -> None:
+    """List hides and get forbids requests whose tool role the reader lacks."""
+    admin, viewer = seeded_users[ADMIN], seeded_users[VIEWER]
+    operator = replace(viewer, role=UserRole.OPERATOR)
+    operator_id = await _create(seeded_db, approval_tools, admin, tool="queue_note")
+    admin_id = await _create(seeded_db, approval_tools, admin)
+
+    assert await _visible(seeded_db, viewer) == set()
+    for request_id in (operator_id, admin_id):
+        with pytest.raises(ApprovalForbiddenError):
+            await _reload(seeded_db, viewer, request_id)
+
+    assert await _visible(seeded_db, operator) == {operator_id}
+    assert (await _reload(seeded_db, operator, operator_id)).required_role == "operator"
+    with pytest.raises(ApprovalForbiddenError):
+        await _reload(seeded_db, operator, admin_id)
+
+    superviewer = replace(viewer, is_superadmin=True)
+    for reader in (admin, seeded_users[OWNER], superviewer):
+        assert await _visible(seeded_db, reader) == {operator_id, admin_id}
+        assert (await _reload(seeded_db, reader, operator_id)).id == operator_id
+        assert (await _reload(seeded_db, reader, admin_id)).id == admin_id
+
+
+async def test_requester_reads_own_request_and_filters_keep_role_scope(
+    seeded_db: Database, seeded_users, approval_tools
+) -> None:
+    """A self-requester at the tool's rank sees it; status filters stay role-scoped."""
+    operator = replace(seeded_users[VIEWER], role=UserRole.OPERATOR)
+    own_id = await _create(seeded_db, approval_tools, operator, tool="queue_note")
+    hidden_id = await _create(seeded_db, approval_tools, seeded_users[ADMIN])
+    await _approve(seeded_db, seeded_users[ADMIN], hidden_id)
+
+    assert (await _reload(seeded_db, operator, own_id)).requested_by == operator.id
+    assert await _visible(seeded_db, operator, ApprovalStatus.PENDING) == {own_id}
+    assert await _visible(seeded_db, operator, ApprovalStatus.APPROVED) == set()
+
+
+async def test_unknown_id_is_not_found_before_the_role_check(
+    seeded_db: Database, seeded_users
+) -> None:
+    """An insufficient role never turns a missing id into forbidden."""
+    with pytest.raises(ApprovalNotFoundError):
+        await _reload(seeded_db, seeded_users[VIEWER], uuid4())
