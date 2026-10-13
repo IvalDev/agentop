@@ -11,6 +11,7 @@ from sqlalchemy import select
 from app.core.config import Settings
 from app.core.db import Base, Database
 from app.main import create_app
+from app.modules.audit.models import AuditEvent
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, User, UserRole
 from app.modules.identity.security import hash_password
@@ -216,3 +217,21 @@ def approval_tools() -> ApprovalTools:
         )
     )
     return ApprovalTools(registry=registry, spy=spy)
+
+
+@pytest.fixture
+def audit_log():
+    """Async reader of stored audit events (oldest first), optionally filtered.
+
+    ``await audit_log(db, action="tool.executed")`` compares each keyword
+    against the ``AuditEvent`` column of the same name.
+    """
+
+    async def read(db: Database, **filters) -> list[AuditEvent]:
+        query = select(AuditEvent).order_by(AuditEvent.created_at, AuditEvent.id)
+        for name, value in filters.items():
+            query = query.where(getattr(AuditEvent, name) == value)
+        async with db.sessionmaker() as session:
+            return list((await session.execute(query)).scalars())
+
+    return read

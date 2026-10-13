@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     embedding_timeout_seconds: float = 30.0
     # Approvals (T7): how long a request stays decidable/executable after creation.
     approval_ttl_seconds: int = 24 * 60 * 60
+    # Audit (T8): cap on the compact JSON of each stored payload/result.
+    audit_max_payload_bytes: int = 16 * 1024
     log_level: str = "INFO"
     bootstrap_email: str = ""
     bootstrap_password: str = ""

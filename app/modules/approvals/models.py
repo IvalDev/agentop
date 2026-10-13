@@ -13,8 +13,8 @@ so concurrent callers cannot both win a transition)::
 a crash mid-execution never re-opens the request. Rows are tenant-scoped
 (decision A8 simplification): every query MUST filter on ``tenant_id``.
 
-The ``*_by``/``*_at`` columns are the seam the audit log (T8) reads; this
-module writes no audit records itself.
+The ``*_by``/``*_at`` columns record the latest decision and execution; the
+full history lives in the audit log (T8), written by the approvals service.
 """
 
 import enum

@@ -3,6 +3,12 @@
 Every query filters on ``tenant_id`` (mirrors identity's
 :func:`scoped_query`): a document id from another tenant must behave
 exactly like a missing one.
+
+Audit (T8): ``document.uploaded`` and ``document.ingested`` are staged in the
+caller's transaction (they commit with the document); ``document.ingest_failed``
+commits with the ``failed`` status this service persists itself; a refused
+upload is persisted at once as ``document.upload_rejected``. ``actor_user_id``
+is the acting user; ``None`` records a ``system`` actor (the ingest worker).
 """
 
 import logging
@@ -12,6 +18,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.modules.audit.service import persist_event, stage_event
 from app.modules.documents.chunking import chunk_text
 from app.modules.documents.extract import extract_text
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
@@ -21,6 +28,7 @@ from app.modules.retrieval.embeddings import EmbeddingError, EmbeddingProvider
 logger = logging.getLogger(__name__)
 
 MAX_FILENAME_LENGTH = 255
+_RESOURCE = "document"
 
 
 class DocumentNotFoundError(Exception):
@@ -66,6 +74,7 @@ async def create_document(
     storage: DocumentStorage,
     *,
     settings: Settings,
+    actor_user_id: int | None = None,
 ) -> Document:
     """Validate, store, and register a new document in ``uploaded`` state.
 
@@ -74,11 +83,23 @@ async def create_document(
     T12 lifecycle/backup story cleans up; the inverse (row without bytes)
     would break ingest instead.
     """
-    name = validate_filename(filename)
-    if len(data) > settings.max_upload_bytes:
-        raise FileTooLargeError(
-            f"file is {len(data)} bytes; limit is {settings.max_upload_bytes} bytes"
+    try:
+        name = validate_filename(filename)
+        if len(data) > settings.max_upload_bytes:
+            raise FileTooLargeError(
+                f"file is {len(data)} bytes; limit is {settings.max_upload_bytes} bytes"
+            )
+    except (InvalidFilenameError, FileTooLargeError) as exc:
+        await persist_event(
+            session,
+            tenant_id=tenant_id,
+            action="document.upload_rejected",
+            actor_user_id=actor_user_id,
+            resource_type=_RESOURCE,
+            payload={"filename": filename, "content_type": content_type, "size_bytes": len(data)},
+            result={"error": str(exc)},
         )
+        raise
     document_id = uuid4()
     key = storage_key_for(tenant_id, document_id, name)
     await storage.put(key, data)
@@ -92,7 +113,35 @@ async def create_document(
         status=DocumentStatus.UPLOADED,
     )
     session.add(document)
+    stage_event(
+        session,
+        tenant_id=tenant_id,
+        action="document.uploaded",
+        actor_user_id=actor_user_id,
+        resource_type=_RESOURCE,
+        resource_id=str(document_id),
+        payload={"filename": name, "content_type": content_type, "size_bytes": len(data)},
+    )
     return document
+
+
+def _stage_ingest_event(
+    session: AsyncSession,
+    tenant_id: int,
+    document_id: UUID,
+    actor_user_id: int | None,
+    action: str,
+    result: dict[str, object],
+) -> None:
+    stage_event(
+        session,
+        tenant_id=tenant_id,
+        action=action,
+        actor_user_id=actor_user_id,
+        resource_type=_RESOURCE,
+        resource_id=str(document_id),
+        result=result,
+    )
 
 
 async def ingest_document(
@@ -102,6 +151,7 @@ async def ingest_document(
     storage: DocumentStorage,
     *,
     embeddings: EmbeddingProvider | None = None,
+    actor_user_id: int | None = None,
 ) -> Document:
     """Extract, chunk, embed, and index one tenant-owned document.
 
@@ -137,6 +187,14 @@ async def ingest_document(
     except Exception as exc:
         document.status = DocumentStatus.FAILED
         document.error_message = str(exc) or type(exc).__name__
+        _stage_ingest_event(
+            session,
+            tenant_id,
+            document_id,
+            actor_user_id,
+            "document.ingest_failed",
+            {"stage": "extraction", "error": document.error_message},
+        )
         await session.commit()
         logger.warning(
             "document ingest failed",
@@ -168,7 +226,7 @@ async def ingest_document(
                     f"for {len(chunk_rows)} chunks"
                 )
         except Exception as exc:
-            await _commit_embedding_failure(session, tenant_id, document_id, exc)
+            await _commit_embedding_failure(session, tenant_id, document_id, exc, actor_user_id)
             if isinstance(exc, EmbeddingError):
                 raise
             raise EmbeddingError(str(exc) or type(exc).__name__) from exc
@@ -176,11 +234,23 @@ async def ingest_document(
             row.embedding = vector
 
     document.status = DocumentStatus.PROCESSED
+    _stage_ingest_event(
+        session,
+        tenant_id,
+        document_id,
+        actor_user_id,
+        "document.ingested",
+        {"chunks": len(chunk_rows), "embedded": embeddings is not None and bool(chunk_rows)},
+    )
     return document
 
 
 async def _commit_embedding_failure(
-    session: AsyncSession, tenant_id: int, document_id: UUID, exc: Exception
+    session: AsyncSession,
+    tenant_id: int,
+    document_id: UUID,
+    exc: Exception,
+    actor_user_id: int | None,
 ) -> None:
     """Discard pending chunks and persist the ``failed`` embedding status.
 
@@ -196,6 +266,14 @@ async def _commit_embedding_failure(
     document = result.scalar_one()
     document.status = DocumentStatus.FAILED
     document.error_message = str(exc) or type(exc).__name__
+    _stage_ingest_event(
+        session,
+        tenant_id,
+        document_id,
+        actor_user_id,
+        "document.ingest_failed",
+        {"stage": "embedding", "error": document.error_message},
+    )
     await session.commit()
     logger.warning(
         "document embedding failed",

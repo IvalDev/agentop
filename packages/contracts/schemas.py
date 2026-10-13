@@ -156,3 +156,34 @@ class ApprovalRejectRequest(BaseModel):
     """Optional body of ``POST /api/v1/approvals/{id}/reject``."""
 
     reason: str | None = Field(default=None, max_length=1000)
+
+
+class AuditEventResponse(BaseModel):
+    """Public view of one audit event (``tenant_id`` is server-internal).
+
+    ``payload``/``result`` are sanitized JSON; an oversized value arrives as
+    ``{"truncated": true, "original_bytes": n, "preview": "..."}``.
+    """
+
+    id: UUID
+    action: str
+    actor_type: Literal["user", "agent", "system"]
+    actor_user_id: int | None = None
+    resource_type: str | None = None
+    resource_id: str | None = None
+    tool_name: str | None = None
+    payload: Any | None = None
+    result: Any | None = None
+    correlation_id: str | None = None
+    created_at: datetime
+
+
+class AuditEventListResponse(BaseModel):
+    """One page of the caller tenant's audit trail, newest first.
+
+    Pass ``next_cursor`` back as ``cursor`` for the next page; ``None`` means
+    this is the last page.
+    """
+
+    events: list[AuditEventResponse]
+    next_cursor: str | None = None

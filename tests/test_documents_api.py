@@ -310,3 +310,35 @@ async def test_ingest_cross_tenant_is_404(documents_client: AsyncClient) -> None
         f"/api/v1/documents/{document_id}/ingest", headers=globex_headers
     )
     assert response.status_code == 404
+
+
+async def test_upload_ingest_and_rejections_are_audited(
+    documents_client: AsyncClient, seeded_db: Database, audit_log
+) -> None:
+    """Every upload/ingest outcome over HTTP leaves an audit event for the caller."""
+    headers = await _headers(documents_client)
+    me = (await documents_client.get("/api/v1/auth/me", headers=headers)).json()
+    ok = (await _upload(documents_client, headers)).json()["id"]
+    zipped = (
+        await _upload(
+            documents_client,
+            headers,
+            filename="b.zip",
+            content=b"PK",
+            content_type="application/zip",
+        )
+    ).json()["id"]
+    await _upload(documents_client, headers, filename="../escape.txt")
+    for document_id in (ok, zipped):
+        await documents_client.post(f"/api/v1/documents/{document_id}/ingest", headers=headers)
+
+    logged = await audit_log(seeded_db)
+    assert {(event.actor_type, event.actor_user_id) for event in logged} == {("user", me["id"])}
+    events = {(event.action, event.resource_id) for event in logged}
+    assert events == {
+        ("document.uploaded", ok),
+        ("document.uploaded", zipped),
+        ("document.upload_rejected", None),
+        ("document.ingested", ok),
+        ("document.ingest_failed", zipped),
+    }

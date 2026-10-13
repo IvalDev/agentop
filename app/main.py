@@ -11,6 +11,8 @@ from app.core.config import Settings
 from app.core.db import Database
 from app.core.logging import setup_logging
 from app.modules.approvals.router import router as approvals_router
+from app.modules.audit.router import router as audit_router
+from app.modules.audit.service import configure_audit
 from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.router import router as auth_router
@@ -61,6 +63,7 @@ def create_app() -> FastAPI:
     )
     application.state.settings = settings
     application.state.db = None
+    configure_audit(settings)
     application.state.storage = LocalDocumentStorage(settings.storage_base_dir)
     application.state.embeddings = build_embedding_provider(settings)
     application.state.tool_registry = default_registry
@@ -69,6 +72,7 @@ def create_app() -> FastAPI:
     application.include_router(documents_router)
     application.include_router(search_router)
     application.include_router(approvals_router)
+    application.include_router(audit_router)
     return application
 
 

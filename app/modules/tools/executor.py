@@ -39,17 +39,43 @@ Approval gate (decision A7: the model never authorizes)
   the validated input as a plain dict, ``required_role`` (its string value),
   and ``action_key`` — ``"<tool_name>:<sha256(tool_name + canonical input
   JSON)>"`` — the stable identifier an approval is bound to.
+
+Audit (T8)
+----------
+Every call writes exactly one audit event with ``persist_event`` (its own
+transaction: it survives the caller's rollback, and a handler's external
+effects are recorded even if the caller's database work is undone):
+
+========================== ============================== ===============================
+outcome                     action                         payload / result
+========================== ============================== ===============================
+unknown tool                ``tool.not_found``             input field names / error
+insufficient role           ``tool.denied``                input field names / error
+invalid input               ``tool.invalid_input``         input field names / error locs+types
+no grant (approval needed)  ``tool.approval_required``     canonical input / key + role
+rejected grant              ``tool.denied``                canonical input / error
+dry run                     ``tool.dry_run``               canonical input / approval needed
+handler or output failure   ``tool.failed``                canonical input / error
+success                     ``tool.executed``              canonical input / output
+========================== ============================== ===============================
+
+Unvalidated input values are never stored, nor is the grant. The actor is
+``user`` (``actor_type`` lets the T9 agent loop record ``agent``), and
+``correlation_id`` threads related events (the approvals service passes the
+approval id).
 """
 
 import hashlib
 import json
 import logging
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.approvals.grants import ApprovalGrant, consume_grant
+from app.modules.audit.models import ActorType
+from app.modules.audit.service import persist_event
 from app.modules.identity.models import UserRole
 from app.modules.tools.exceptions import ToolNotFoundError
 from app.modules.tools.registry import ApprovalPolicy, ToolRegistry, ToolUser
@@ -109,6 +135,28 @@ class ToolExecutionResult(BaseModel):
     error_kind: ErrorKind | None = None
 
 
+class _AuditRecord(NamedTuple):
+    """What one ``execute_tool`` call writes to the audit trail."""
+
+    action: str
+    payload: dict[str, Any]
+    result: dict[str, Any]
+
+
+def _input_fields(raw_input: Any) -> dict[str, Any]:
+    """Field names of unvalidated input: never its values."""
+    names = sorted(map(str, raw_input)) if isinstance(raw_input, dict) else []
+    return {"input_fields": names}
+
+
+def _error_summary(exc: ValidationError) -> list[dict[str, Any]]:
+    """Location and type of each validation error, without inputs or messages."""
+    return [
+        {"loc": list(error["loc"]), "type": error["type"]}
+        for error in exc.errors(include_url=False, include_context=False, include_input=False)
+    ]
+
+
 def compute_action_key(tool_name: str, validated_input: BaseModel) -> str:
     """Stable identifier binding a tool name to its canonical input.
 
@@ -141,6 +189,9 @@ async def execute_tool(
     raw_input: dict[str, Any],
     dry_run: bool = False,
     approval_grant: ApprovalGrant | None = None,
+    *,
+    actor_type: ActorType = ActorType.USER,
+    correlation_id: str | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
 
@@ -164,8 +215,35 @@ async def execute_tool(
 
     Handlers own their own transaction: the executor neither commits nor
     rolls back ``session`` (the caller/router does, mirroring the documents
-    router).
+    router). Every outcome is then audited once (see the module docstring).
     """
+    result, record = await _evaluate(
+        registry, session, user, tool_name, raw_input, dry_run, approval_grant
+    )
+    await persist_event(
+        session,
+        tenant_id=user.tenant_id,
+        action=record.action,
+        actor_user_id=user.id,
+        actor_type=actor_type,
+        tool_name=result.tool_name,
+        payload=record.payload,
+        result=record.result,
+        correlation_id=correlation_id,
+    )
+    return result
+
+
+async def _evaluate(
+    registry: ToolRegistry,
+    session: AsyncSession,
+    user: ToolUser,
+    tool_name: str,
+    raw_input: dict[str, Any],
+    dry_run: bool,
+    approval_grant: ApprovalGrant | None,
+) -> tuple[ToolExecutionResult, _AuditRecord]:
+    """Run the gates of :func:`execute_tool`; return its result and audit record."""
     try:
         spec = registry.get(tool_name)
     except ToolNotFoundError:
@@ -174,7 +252,7 @@ async def execute_tool(
             status="error",
             error=f"unknown tool: {tool_name}",
             error_kind="not_found",
-        )
+        ), _AuditRecord("tool.not_found", _input_fields(raw_input), {"error": "unknown tool"})
 
     if not role_satisfies(user, spec.required_role):
         return ToolExecutionResult(
@@ -182,7 +260,7 @@ async def execute_tool(
             status="error",
             error="forbidden",
             error_kind="forbidden",
-        )
+        ), _AuditRecord("tool.denied", _input_fields(raw_input), {"error": "forbidden"})
 
     # ToolRegistry.register guarantees input_model is a BaseModel subclass.
     input_model = spec.input_model
@@ -195,14 +273,17 @@ async def execute_tool(
             status="error",
             error=str(exc),
             error_kind="validation",
+        ), _AuditRecord(
+            "tool.invalid_input", _input_fields(raw_input), {"errors": _error_summary(exc)}
         )
 
+    canonical = validated_input.model_dump(mode="json")
     if spec.approval_policy is ApprovalPolicy.REQUIRE_APPROVAL and not dry_run:
         action_key = compute_action_key(spec.name, validated_input)
         if approval_grant is None:
             payload = ApprovalRequestPayload(
                 tool_name=spec.name,
-                input=validated_input.model_dump(mode="json"),
+                input=canonical,
                 required_role=spec.required_role.value,
                 action_key=action_key,
             )
@@ -210,6 +291,10 @@ async def execute_tool(
                 tool_name=spec.name,
                 status="approval_required",
                 approval_request=payload,
+            ), _AuditRecord(
+                "tool.approval_required",
+                canonical,
+                {"action_key": action_key, "required_role": spec.required_role.value},
             )
         if not consume_grant(approval_grant, action_key):
             logger.warning("tool %s refused an invalid approval grant", spec.name)
@@ -218,28 +303,32 @@ async def execute_tool(
                 status="error",
                 error="approval grant rejected",
                 error_kind="forbidden",
-            )
+            ), _AuditRecord("tool.denied", canonical, {"error": "approval grant rejected"})
 
     if dry_run:
+        needs_approval = spec.approval_policy is ApprovalPolicy.REQUIRE_APPROVAL
         info = DryRunInfo(
             tool_name=spec.name,
             kind=spec.kind.value,
             approval_policy=spec.approval_policy.value,
-            validated_input=validated_input.model_dump(mode="json"),
-            approval_required=spec.approval_policy is ApprovalPolicy.REQUIRE_APPROVAL,
+            validated_input=canonical,
+            approval_required=needs_approval,
         )
-        return ToolExecutionResult(tool_name=spec.name, status="dry_run", output=info)
+        return ToolExecutionResult(
+            tool_name=spec.name, status="dry_run", output=info
+        ), _AuditRecord("tool.dry_run", canonical, {"approval_required": needs_approval})
 
     try:
         output = await spec.handler(session, user.tenant_id, user, validated_input)
     except Exception as exc:
         logger.exception("tool %s failed", spec.name)
+        message = str(exc) or type(exc).__name__
         return ToolExecutionResult(
             tool_name=spec.name,
             status="error",
-            error=str(exc) or type(exc).__name__,
+            error=message,
             error_kind="execution",
-        )
+        ), _AuditRecord("tool.failed", canonical, {"error": message})
 
     if spec.output_model is not None:
         try:
@@ -255,6 +344,12 @@ async def execute_tool(
                 status="error",
                 error=f"invalid tool output: {exc}",
                 error_kind="execution",
+            ), _AuditRecord(
+                "tool.failed",
+                canonical,
+                {"error": "invalid tool output", "errors": _error_summary(exc)},
             )
 
-    return ToolExecutionResult(tool_name=spec.name, status="ok", output=output)
+    return ToolExecutionResult(tool_name=spec.name, status="ok", output=output), _AuditRecord(
+        "tool.executed", canonical, {"output": output}
+    )

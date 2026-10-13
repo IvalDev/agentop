@@ -26,12 +26,23 @@ must persist even when the caller raises afterwards.
 Every transition is a conditional ``UPDATE ... WHERE id = ? AND status = ?``
 whose rowcount picks the single winner, on SQLite and PostgreSQL alike. The
 clock is injectable (``now``, timezone-aware) and defaults to UTC now.
+
+Audit (T8): each transition stages its event in the same transaction that
+commits it — ``approval.created`` (with the caller's commit),
+``approval.approved``/``rejected``, ``approval.expired`` (actor ``system``;
+the triggering user is ``payload.detected_by``), ``approval.binding_mismatch``,
+and ``approval.executed``/``failed`` — so an event exists iff its transition
+does; losers of a race record nothing. A refused create/approve/reject/execute
+is persisted at once as ``approval.denied`` (no state changes, so it must not
+depend on the caller's transaction). Every event of a request carries its id
+as ``resource_id`` and ``correlation_id``; the tool run passes the same
+``correlation_id`` to the executor's ``tool.*`` event.
 """
 
 import hmac
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, NoReturn
 from uuid import UUID
 
 from pydantic import ValidationError
@@ -50,6 +61,7 @@ from app.modules.approvals.exceptions import (
 )
 from app.modules.approvals.grants import mint_grant
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
+from app.modules.audit.service import persist_event, stage_event
 from app.modules.identity.deps import TenantContext
 from app.modules.identity.models import UserRole
 from app.modules.identity.service import scoped_query
@@ -64,6 +76,7 @@ from app.modules.tools.registry import ApprovalPolicy, ToolRegistry, ToolSpec, T
 
 #: Statuses a TTL can still expire.
 _EXPIRABLE = (ApprovalStatus.PENDING, ApprovalStatus.APPROVED)
+_RESOURCE = "approval_request"
 
 
 @dataclass(frozen=True)
@@ -102,6 +115,64 @@ def _require_role(user: ToolUser, request: ApprovalRequest) -> None:
         raise ApprovalForbiddenError("forbidden")
 
 
+def _stage(
+    session: AsyncSession,
+    action: str,
+    *,
+    tenant_id: int,
+    request_id: UUID,
+    tool_name: str,
+    actor: ToolUser | None,
+    payload: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+) -> None:
+    """Stage a lifecycle event of one request (commits with its transition)."""
+    stage_event(
+        session,
+        tenant_id=tenant_id,
+        action=action,
+        actor_user_id=None if actor is None else actor.id,
+        resource_type=_RESOURCE,
+        resource_id=str(request_id),
+        tool_name=tool_name,
+        payload=payload,
+        result=result,
+        correlation_id=str(request_id),
+    )
+
+
+async def _deny(
+    session: AsyncSession,
+    user: ToolUser,
+    operation: str,
+    tool_name: str,
+    request_id: UUID | None = None,
+) -> NoReturn:
+    """Persist ``approval.denied`` for ``operation``, then raise forbidden."""
+    reference = None if request_id is None else str(request_id)
+    await persist_event(
+        session,
+        tenant_id=user.tenant_id,
+        action="approval.denied",
+        actor_user_id=user.id,
+        resource_type=_RESOURCE,
+        resource_id=reference,
+        tool_name=tool_name,
+        payload={"operation": operation},
+        result={"error": "forbidden"},
+        correlation_id=reference,
+    )
+    raise ApprovalForbiddenError("forbidden")
+
+
+async def _authorize(
+    session: AsyncSession, user: ToolUser, request: ApprovalRequest, operation: str
+) -> None:
+    """Audited :func:`_require_role` for state-changing operations."""
+    if not role_satisfies(user, UserRole(request.required_role)):
+        await _deny(session, user, operation, request.tool_name, request.id)
+
+
 def _readable_roles(user: ToolUser) -> list[str]:
     """Stored ``required_role`` values ``user`` satisfies (every role for a superadmin)."""
     return [role.value for role in UserRole if role_satisfies(user, role)]
@@ -137,12 +208,32 @@ async def _transition(
     return result.rowcount == 1
 
 
-async def _expire_if_due(session: AsyncSession, request: ApprovalRequest, now: datetime) -> None:
-    """Raise :class:`ApprovalExpiredError` for an expired request, marking it first."""
+async def _expire_if_due(
+    session: AsyncSession, user: ToolUser, request: ApprovalRequest, now: datetime
+) -> None:
+    """Raise :class:`ApprovalExpiredError` for an expired request, marking it first.
+
+    The winner of the ``expired`` transition stages a ``system`` event naming
+    ``user`` as the caller that detected the expiry.
+    """
     if request.status is ApprovalStatus.EXPIRED:
         raise ApprovalExpiredError("approval request expired")
     if request.status in _EXPIRABLE and now >= request.expires_at:
-        await _transition(session, request.id, request.status, {"status": ApprovalStatus.EXPIRED})
+        expired = {"status": ApprovalStatus.EXPIRED}
+        if await _transition(session, request.id, request.status, expired):
+            _stage(
+                session,
+                "approval.expired",
+                tenant_id=request.tenant_id,
+                request_id=request.id,
+                tool_name=request.tool_name,
+                actor=None,
+                payload={
+                    "detected_by": user.id,
+                    "previous_status": request.status.value,
+                    "expires_at": request.expires_at.isoformat(),
+                },
+            )
         await session.commit()
         raise ApprovalExpiredError("approval request expired")
 
@@ -192,7 +283,7 @@ async def create_approval_request(
     if spec.approval_policy is not ApprovalPolicy.REQUIRE_APPROVAL:
         raise ApprovalNotRequiredError(f"tool {tool_name!r} does not require approval")
     if not role_satisfies(user, spec.required_role):
-        raise ApprovalForbiddenError("forbidden")
+        await _deny(session, user, "create", spec.name)
     assert spec.input_model is not None  # registration invariant
     validated = spec.input_model.model_validate(raw_input)
     request = ApprovalRequest(
@@ -208,6 +299,20 @@ async def create_approval_request(
     )
     session.add(request)
     await session.flush()
+    _stage(
+        session,
+        "approval.created",
+        tenant_id=request.tenant_id,
+        request_id=request.id,
+        tool_name=spec.name,
+        actor=user,
+        payload=request.input_payload,
+        result={
+            "action_key": request.action_key,
+            "required_role": request.required_role,
+            "expires_at": request.expires_at.isoformat(),
+        },
+    )
     return request
 
 
@@ -255,8 +360,9 @@ async def _decide(
     """One-shot pending → ``outcome`` decision (see :func:`approve_request`)."""
     now = _utc(now)
     request = await _load(session, user, request_id)
-    _require_role(user, request)
-    await _expire_if_due(session, request, now)
+    operation = "approve" if outcome is ApprovalStatus.APPROVED else "reject"
+    await _authorize(session, user, request, operation)
+    await _expire_if_due(session, user, request, now)
     _require_status(request, ApprovalStatus.PENDING)
     decision = {
         "status": outcome,
@@ -267,6 +373,15 @@ async def _decide(
     if not await _transition(session, request_id, ApprovalStatus.PENDING, decision, alive_at=now):
         await session.rollback()
         raise ApprovalStateError("approval request was already decided")
+    _stage(
+        session,
+        f"approval.{outcome.value}",
+        tenant_id=request.tenant_id,
+        request_id=request_id,
+        tool_name=request.tool_name,
+        actor=user,
+        payload=None if reason is None else {"reason": reason},
+    )
     await session.commit()
     return await _load(session, user, request_id)
 
@@ -321,18 +436,28 @@ async def execute_approved_action(
     """
     now = _utc(now)
     request = await _load(session, user, request_id)
-    _require_role(user, request)
-    await _expire_if_due(session, request, now)
+    await _authorize(session, user, request, "execute")
+    await _expire_if_due(session, user, request, now)
     _require_status(request, ApprovalStatus.APPROVED)
+    tenant_id, stored_tool = request.tenant_id, request.tool_name
     try:
         spec = _verify_binding(registry, request)
     except ApprovalBindingError as exc:
         failure = {"status": ApprovalStatus.FAILED, "execution_error": str(exc)}
-        await _transition(session, request_id, ApprovalStatus.APPROVED, failure)
+        if await _transition(session, request_id, ApprovalStatus.APPROVED, failure):
+            _stage(
+                session,
+                "approval.binding_mismatch",
+                tenant_id=tenant_id,
+                request_id=request_id,
+                tool_name=stored_tool,
+                actor=user,
+                result={"error": str(exc)},
+            )
         await session.commit()
         raise
     if not role_satisfies(user, spec.required_role):
-        raise ApprovalForbiddenError("forbidden")
+        await _deny(session, user, "execute", spec.name, request_id)
 
     payload, action_key = dict(request.input_payload), request.action_key
     claim = {"status": ApprovalStatus.EXECUTING, "executed_by": user.id, "executed_at": now}
@@ -348,15 +473,27 @@ async def execute_approved_action(
         spec.name,
         payload,
         approval_grant=mint_grant(request_id, action_key),
+        correlation_id=str(request_id),
     )
     if result.status == "ok":
         outcome = {
             "status": ApprovalStatus.EXECUTED,
             "execution_result": to_jsonable_python(result.output, fallback=str),
         }
+        audit_action, audit_result = "approval.executed", {"status": "executed"}
     else:
         await session.rollback()
         outcome = {"status": ApprovalStatus.FAILED, "execution_error": result.error}
+        audit_action, audit_result = "approval.failed", {"error": result.error}
+    _stage(
+        session,
+        audit_action,
+        tenant_id=tenant_id,
+        request_id=request_id,
+        tool_name=spec.name,
+        actor=user,
+        result=audit_result,
+    )
     await _transition(session, request_id, ApprovalStatus.EXECUTING, outcome)
     await session.commit()
     return ApprovalExecution(request=await _load(session, user, request_id), result=result)

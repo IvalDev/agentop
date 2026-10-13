@@ -97,6 +97,7 @@ async def upload_document(
             data,
             storage,
             settings=settings,
+            actor_user_id=user.id,
         )
     except InvalidFilenameError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -143,7 +144,12 @@ async def ingest(
     """
     try:
         document = await ingest_document(
-            session, user.tenant_id, document_id, storage, embeddings=embeddings
+            session,
+            user.tenant_id,
+            document_id,
+            storage,
+            embeddings=embeddings,
+            actor_user_id=user.id,
         )
     except DocumentNotFoundError as exc:
         raise HTTPException(status_code=404, detail="document not found") from exc
