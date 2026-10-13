@@ -1,0 +1,32 @@
+FACTURA CI-2026-0103
+
+Documento ficticio de demostración. Todas las empresas, identificadores y datos bancarios son inventados.
+
+PROVEEDOR (EMISOR)
+Razón social: Climatización Inventada, S.A.
+CIF: A00000033
+Domicilio: Calle Supuesta 8, 00000 Villaficticia
+Correo de administración: admin@climatizacion-inventada.test
+
+CLIENTE (DESTINATARIO)
+Razón social: Suministros Ficticios Demo, S.L.
+CIF: B00000010
+
+DATOS DE LA FACTURA
+Número de factura: CI-2026-0103
+Fecha de emisión: 18/09/2026
+Fecha de vencimiento: 18/10/2026
+Forma de pago: transferencia bancaria
+IBAN del proveedor: ES00 0000 0000 0000 0000 0000
+
+CONCEPTOS
+- Mantenimiento preventivo de equipos de aire acondicionado: 2 unidades x 250,00 € = 500,00 €
+- Sustitución de filtros: 1 servicio x 150,00 € = 150,00 €
+
+TOTALES
+Base imponible: 650,00 €
+IVA (21 %): 136,50 €
+Total factura: 786,50 €
+
+ESTADO INTERNO
+Pendiente de pago. Recepción del servicio confirmada por Óscar Operario Demo el 19/09/2026.

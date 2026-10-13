@@ -29,6 +29,8 @@ dependencies = [
     "pgvector>=0.3",
     # Async HTTP client used by the Ollama embedding adapter at runtime.
     "httpx>=0.27",
+    # Dotenv parsing for the dev-only demo seed (--env-file).
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]

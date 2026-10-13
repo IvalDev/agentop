@@ -1,0 +1,20 @@
+De: Óscar Operario Demo <operator@demo.test>
+Para: Adrián Gestor Demo <admin@demo.test>
+CC: Olga Dueña Demo <owner@demo.test>
+Fecha: 09/10/2026 16:05
+Asunto: Solicitud de aprobación: compra de impresora multifunción
+
+(Correo ficticio de demostración. Personas y empresas inventadas.)
+
+Hola, Adrián:
+
+La impresora de la oficina ha vuelto a averiarse y el técnico desaconseja repararla. Papelería Ficticia Ejemplo, S.L. nos ofrece una impresora multifunción láser por 1.350,00 € más IVA (1.633,50 € en total), con entrega en 48 horas y dos años de garantía.
+
+Como el importe supera los 1.000 €, según el procedimiento PRC-FIN-02 necesito tu aprobación antes de confirmar el pedido. He pedido también un presupuesto a otro proveedor, que llegará el lunes.
+
+¿Me confirmas si seguimos adelante?
+
+Gracias,
+Óscar Operario Demo
+Operaciones
+Suministros Ficticios Demo, S.L.

@@ -1,0 +1,19 @@
+De: Marta Ejemplo <compras@comercial-ejemplo.test>
+Para: Adrián Gestor Demo <admin@demo.test>
+Fecha: 08/10/2026 12:40
+Asunto: Consulta sobre la factura V-2026-0031
+
+(Correo ficticio de demostración. Personas y empresas inventadas.)
+
+Buenos días, Adrián:
+
+Hemos recibido vuestra factura V-2026-0031 por un total de 2.420,00 €. En nuestro pedido CEL-PED-0456 acordamos un descuento comercial del 5 % sobre la base imponible por volumen, y no aparece aplicado.
+
+Con el descuento, la base imponible debería ser 1.900,00 €, el IVA 399,00 € y el total 2.299,00 €.
+
+¿Podéis revisarlo y enviarnos una factura rectificativa antes del vencimiento del 25/10/2026? Mientras tanto dejamos el pago en espera.
+
+Gracias y un saludo,
+Marta Ejemplo
+Departamento de compras
+Comercial Ejemplo Levante, S.L.
