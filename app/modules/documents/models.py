@@ -3,9 +3,11 @@
 Rows are tenant-scoped like every other tenant-owned model (decision A8
 simplification): ``Document.tenant_id`` is the isolation key and every
 query MUST filter on it. ``DocumentChunk.tenant_id`` is denormalized so
-chunk reads in the retrieval layer (T5) never need a join back to
-``documents``. Embeddings are added in T5 as a pgvector column on
-``DocumentChunk``; the schema here deliberately stays free of them.
+chunk reads in the retrieval layer never need a join back to
+``documents``. The ``DocumentChunk.embedding`` column uses the dual-backend
+:type:`~app.modules.retrieval.vector_type.EmbeddingVector` type (pgvector
+on PostgreSQL, JSON on SQLite for tests); ``start_offset``/``end_offset``
+make every chunk a verifiable citation into its source document.
 """
 
 import enum
@@ -15,6 +17,7 @@ from sqlalchemy import Enum, ForeignKey, Integer, String, Text, Uuid
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base, TimestampMixin
+from app.modules.retrieval.vector_type import EmbeddingVector
 
 
 class DocumentStatus(enum.StrEnum):
@@ -53,5 +56,10 @@ class DocumentChunk(TimestampMixin, Base):
     tenant_id: Mapped[int] = mapped_column(Integer, index=True)
     chunk_index: Mapped[int] = mapped_column(Integer)
     content: Mapped[str] = mapped_column(Text)
+    # Verifiable citation offsets: original_text[start_offset:end_offset] == content.
+    start_offset: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_offset: Mapped[int] = mapped_column(Integer, nullable=False)
     # Populated by the embedding pipeline in T5; null until then.
     token_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Vector index built during ingest when an embedding provider is wired.
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingVector(), nullable=True)

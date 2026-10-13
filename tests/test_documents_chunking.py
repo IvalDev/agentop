@@ -19,7 +19,7 @@ def test_text_under_chunk_size_stays_in_one_chunk() -> None:
     """Text shorter than the chunk size is returned unchanged in one chunk."""
     text = "Short note about the quarterly invoice."
     chunks = chunk_text(text, chunk_size=1000, overlap=200)
-    assert chunks == [text]
+    assert chunks == [(text, 0, len(text))]
 
 
 def test_long_text_produces_multiple_chunks_with_overlap() -> None:
@@ -27,10 +27,11 @@ def test_long_text_produces_multiple_chunks_with_overlap() -> None:
     paragraphs = [f"Paragraph {i}: " + ("lorem ipsum " * 20) for i in range(12)]
     text = "\n\n".join(paragraphs)
     chunks = chunk_text(text, chunk_size=400, overlap=80)
+    texts = [chunk for chunk, _, _ in chunks]
 
     assert len(chunks) > 1
-    assert all(len(chunk) <= 400 for chunk in chunks)
-    for previous, current in zip(chunks, chunks[1:], strict=False):
+    assert all(len(chunk) <= 400 for chunk in texts)
+    for previous, current in zip(texts, texts[1:], strict=False):
         assert previous[-80:] == current[:80]
 
 
@@ -38,9 +39,32 @@ def test_chunks_reassemble_to_cover_original_content() -> None:
     """Dropping each chunk's overlap from its predecessor rebuilds the input."""
     text = "\n\n".join(f"Section {i} " + ("data " * 40) for i in range(20))
     chunks = chunk_text(text, chunk_size=500, overlap=100)
+    texts = [chunk for chunk, _, _ in chunks]
 
-    rebuilt = chunks[0] + "".join(chunk[100:] for chunk in chunks[1:])
+    rebuilt = texts[0] + "".join(chunk[100:] for chunk in texts[1:])
     assert rebuilt == text
+
+
+def test_chunk_offsets_slice_the_original_text_exactly() -> None:
+    """Every (start, end) pair reproduces its chunk from the source text."""
+    text = "\n\n".join(f"Section {i}: " + ("contenido " * 50) for i in range(15))
+    chunks = chunk_text(text, chunk_size=300, overlap=60)
+
+    assert len(chunks) > 1
+    for chunk, start, end in chunks:
+        assert text[start:end] == chunk
+
+
+def test_offsets_advance_and_terminal_chunk_reaches_text_end() -> None:
+    """Offsets strictly advance; the last chunk ends exactly at the text end."""
+    text = "\n\n".join(f"Section {i}: " + ("contenido " * 50) for i in range(15))
+    chunks = chunk_text(text, chunk_size=300, overlap=60)
+
+    starts = [start for _, start, _ in chunks]
+    assert starts == sorted(starts)
+    assert all(later > earlier for earlier, later in zip(starts, starts[1:], strict=False))
+    assert chunks[0][1] == 0
+    assert chunks[-1][2] == len(text)
 
 
 def test_rejects_overlap_not_smaller_than_chunk_size() -> None:

@@ -6,6 +6,10 @@ deliberately simple and pure: split ``text`` into windows of at most
 character suffix/prefix. Split points snap to paragraph (``\\n\\n``) or
 line (``\\n``) boundaries when one sits in the fuller half of the window,
 because retrieval cites verbatim text and mid-word cuts read badly.
+
+Each chunk carries ``start_offset``/``end_offset`` positions into the
+original text (``text[start:end] == chunk``); retrieval returns them with
+every hit so a citation is verifiable against the source document.
 """
 
 _PARAGRAPH_SEP = "\n\n"
@@ -26,29 +30,31 @@ def _snap_end(text: str, start: int, end: int, chunk_size: int, overlap: int) ->
     return end
 
 
-def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[str]:
+def chunk_text(text: str, chunk_size: int = 1000, overlap: int = 200) -> list[tuple[str, int, int]]:
     """Split ``text`` into overlapping chunks of at most ``chunk_size`` chars.
 
-    Returns ``[]`` for an empty string and ``[text]`` when the whole text
-    already fits in one window. Raises ``ValueError`` when ``overlap`` is
-    not a non-negative count strictly smaller than ``chunk_size`` (such a
-    window could never advance).
+    Returns ``[]`` for an empty string and ``[(text, 0, len(text))]`` when
+    the whole text already fits in one window; otherwise a list of
+    ``(chunk, start_offset, end_offset)`` tuples where
+    ``text[start_offset:end_offset] == chunk``. Raises ``ValueError`` when
+    ``overlap`` is not a non-negative count strictly smaller than
+    ``chunk_size`` (such a window could never advance).
     """
     if not 0 <= overlap < chunk_size:
         raise ValueError(f"overlap must satisfy 0 <= overlap < chunk_size, got {overlap}")
     if not text:
         return []
     if len(text) <= chunk_size:
-        return [text]
+        return [(text, 0, len(text))]
 
-    chunks: list[str] = []
+    chunks: list[tuple[str, int, int]] = []
     start = 0
     length = len(text)
     while start < length:
         end = min(start + chunk_size, length)
         if end < length:
             end = _snap_end(text, start, end, chunk_size, overlap)
-        chunks.append(text[start:end])
+        chunks.append((text[start:end], start, end))
         if end >= length:
             # The final chunk already reaches the end of the text; nothing
             # remains past its overlap suffix, so advancing would stall.

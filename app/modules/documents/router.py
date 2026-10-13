@@ -27,6 +27,7 @@ from app.modules.documents.service import (
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.deps import CurrentUser, get_current_user, require_roles
 from app.modules.identity.models import UserRole
+from app.modules.retrieval.embeddings import EmbeddingError, EmbeddingProvider
 from packages.contracts.schemas import DocumentListResponse, DocumentResponse
 
 router = APIRouter(prefix="/api/v1/documents", tags=["documents"])
@@ -44,7 +45,13 @@ def get_storage(request: Request) -> DocumentStorage:
     return request.app.state.storage
 
 
+def get_embeddings(request: Request) -> EmbeddingProvider:
+    """Return the embedding provider attached to ``app.state.embeddings``."""
+    return request.app.state.embeddings
+
+
 StorageDep = Annotated[DocumentStorage, Depends(get_storage)]
+EmbeddingsDep = Annotated[EmbeddingProvider, Depends(get_embeddings)]
 
 
 def _response(document: Document) -> DocumentResponse:
@@ -124,18 +131,25 @@ async def ingest(
     document_id: UUID,
     session: SessionDep,
     storage: StorageDep,
+    embeddings: EmbeddingsDep,
     user: OperatorUserDep,
 ) -> DocumentResponse:
-    """Run extraction and chunking synchronously (operator+).
+    """Run extraction, chunking, and embedding synchronously (operator+).
 
     Extraction failures mark the document ``failed`` (persisted by the
-    service) and surface as 422; other failures are 500s.
+    service) and surface as 422; embedding-backend failures also persist
+    ``failed`` and surface as 502 (upstream service unavailable); other
+    failures are 500s.
     """
     try:
-        document = await ingest_document(session, user.tenant_id, document_id, storage)
+        document = await ingest_document(
+            session, user.tenant_id, document_id, storage, embeddings=embeddings
+        )
     except DocumentNotFoundError as exc:
         raise HTTPException(status_code=404, detail="document not found") from exc
     except UnsupportedFormatError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except EmbeddingError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     await session.commit()
     return _response(document)

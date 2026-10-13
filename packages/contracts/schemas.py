@@ -1,9 +1,10 @@
 """Shared request/response schemas; populated as feature tasks land."""
 
 from datetime import datetime
+from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
@@ -80,3 +81,41 @@ class DocumentListResponse(BaseModel):
     """Caller-scoped listing of documents."""
 
     documents: list[DocumentResponse]
+
+
+class SearchRequest(BaseModel):
+    """Body of ``POST /api/v1/search``.
+
+    The tenant is never part of the body: it always comes from the
+    authenticated user's token claims.
+    """
+
+    query: str = Field(min_length=1)
+    mode: Literal["semantic", "hybrid", "keyword"] = "hybrid"
+    top_k: int = Field(default=10, ge=1, le=50)
+
+
+class SearchHit(BaseModel):
+    """One retrieved chunk with a verifiable citation.
+
+    ``document_id`` + ``start_offset``/``end_offset`` locate the exact
+    characters of ``content`` inside the source document (acceptance
+    criterion 3).
+    """
+
+    document_id: UUID
+    document_filename: str
+    chunk_id: UUID
+    chunk_index: int
+    content: str
+    score: float
+    start_offset: int
+    end_offset: int
+
+
+class SearchResponse(BaseModel):
+    """Ranked hits for one search request."""
+
+    query: str
+    mode: str
+    hits: list[SearchHit]

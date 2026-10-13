@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 30
     max_upload_bytes: int = 20 * 1024 * 1024
     storage_base_dir: str = "./var/storage"
+    # Retrieval (T5): adapter selection, model identity, and vector size.
+    embedding_provider: str = "ollama"  # "ollama" | "fake"
+    embedding_model: str = "nomic-embed-text"
+    embedding_dim: int = 768
+    embedding_timeout_seconds: float = 30.0
     log_level: str = "INFO"
     bootstrap_email: str = ""
     bootstrap_password: str = ""

@@ -11,6 +11,18 @@ from app.modules.identity.models import Tenant, User, UserRole
 from app.modules.identity.security import hash_password
 
 
+@pytest.fixture(autouse=True)
+def default_embedding_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never call a live Ollama: default every app to the fake provider.
+
+    ``create_app`` builds the embedding adapter from ``Settings``; fixtures
+    that build an app after this runs pick up the offline fake. Tests that
+    need a specific provider override ``app.state.embeddings`` explicitly
+    (constructor arguments still beat environment variables in pydantic).
+    """
+    monkeypatch.setenv("AA_EMBEDDING_PROVIDER", "fake")
+
+
 @pytest.fixture
 def app() -> FastAPI:
     """Build a fresh application instance without a database attached."""

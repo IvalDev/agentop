@@ -16,6 +16,7 @@ from app.modules.documents.chunking import chunk_text
 from app.modules.documents.extract import extract_text
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.storage import DocumentStorage
+from app.modules.retrieval.embeddings import EmbeddingError, EmbeddingProvider
 
 logger = logging.getLogger(__name__)
 
@@ -95,15 +96,28 @@ async def create_document(
 
 
 async def ingest_document(
-    session: AsyncSession, tenant_id: int, document_id: UUID, storage: DocumentStorage
+    session: AsyncSession,
+    tenant_id: int,
+    document_id: UUID,
+    storage: DocumentStorage,
+    *,
+    embeddings: EmbeddingProvider | None = None,
 ) -> Document:
-    """Extract, chunk, and index one tenant-owned document.
+    """Extract, chunk, embed, and index one tenant-owned document.
 
     On success the caller commits the ``processed`` status and the new
     chunks (the worker's ``session_scope`` or the router). On extraction
     failure this function commits the ``failed`` status itself before
     re-raising, so the failure survives the caller's rollback and the
     client can read ``error_message`` afterwards.
+
+    When ``embeddings`` is provided, every chunk is embedded in a single
+    ``embed_texts`` call and the vectors stored on the chunk rows. An
+    embedding failure follows the same commit pattern — the pending chunk
+    insert is rolled back (no orphaned rows or vectors), the ``failed``
+    status with a clear ``error_message`` is committed, and the error is
+    re-raised as :class:`EmbeddingError`. Without a provider the chunks
+    simply keep null embeddings.
     """
     result = await session.execute(
         select(Document).where(Document.id == document_id, Document.tenant_id == tenant_id)
@@ -132,16 +146,58 @@ async def ingest_document(
 
     # Re-ingest must not duplicate chunks: replace any previous extraction.
     await session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == document.id))
-    session.add_all(
-        [
-            DocumentChunk(
-                document_id=document.id,
-                tenant_id=tenant_id,
-                chunk_index=index,
-                content=chunk,
-            )
-            for index, chunk in enumerate(chunks)
-        ]
-    )
+    chunk_rows = [
+        DocumentChunk(
+            document_id=document.id,
+            tenant_id=tenant_id,
+            chunk_index=index,
+            content=chunk,
+            start_offset=start_offset,
+            end_offset=end_offset,
+        )
+        for index, (chunk, start_offset, end_offset) in enumerate(chunks)
+    ]
+    session.add_all(chunk_rows)
+
+    if embeddings is not None and chunk_rows:
+        try:
+            vectors = await embeddings.embed_texts([row.content for row in chunk_rows])
+            if len(vectors) != len(chunk_rows):
+                raise EmbeddingError(
+                    f"embedding provider returned {len(vectors)} vectors "
+                    f"for {len(chunk_rows)} chunks"
+                )
+        except Exception as exc:
+            await _commit_embedding_failure(session, tenant_id, document_id, exc)
+            if isinstance(exc, EmbeddingError):
+                raise
+            raise EmbeddingError(str(exc) or type(exc).__name__) from exc
+        for row, vector in zip(chunk_rows, vectors, strict=True):
+            row.embedding = vector
+
     document.status = DocumentStatus.PROCESSED
     return document
+
+
+async def _commit_embedding_failure(
+    session: AsyncSession, tenant_id: int, document_id: UUID, exc: Exception
+) -> None:
+    """Discard pending chunks and persist the ``failed`` embedding status.
+
+    Mirrors the extraction-failure commit above: the rollback drops the
+    uncommitted chunk rows (and their vectors), then a fresh load of the
+    document commits ``failed`` so the error survives the caller's own
+    rollback.
+    """
+    await session.rollback()
+    result = await session.execute(
+        select(Document).where(Document.id == document_id, Document.tenant_id == tenant_id)
+    )
+    document = result.scalar_one()
+    document.status = DocumentStatus.FAILED
+    document.error_message = str(exc) or type(exc).__name__
+    await session.commit()
+    logger.warning(
+        "document embedding failed",
+        extra={"document_id": str(document_id), "tenant_id": tenant_id},
+    )
