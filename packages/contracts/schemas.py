@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class LoginRequest(BaseModel):
@@ -187,3 +187,88 @@ class AuditEventListResponse(BaseModel):
 
     events: list[AuditEventResponse]
     next_cursor: str | None = None
+
+
+#: Longest chat message (and history turn) the API accepts, in characters.
+CHAT_MESSAGE_MAX_CHARS = 4000
+#: Most prior turns a client may replay as ``history``.
+CHAT_HISTORY_MAX_MESSAGES = 20
+
+
+class ChatHistoryMessage(BaseModel):
+    """One prior turn replayed by the client.
+
+    Only ``user`` and ``assistant`` turns exist here: a client can never add
+    a ``system`` or ``tool`` message to the conversation.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=CHAT_MESSAGE_MAX_CHARS)
+
+
+class ChatRequest(BaseModel):
+    """Body of ``POST /api/v1/chat`` and ``/api/v1/chat/stream``.
+
+    The tenant always comes from the authenticated user, never the body.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    message: str = Field(min_length=1, max_length=CHAT_MESSAGE_MAX_CHARS)
+    history: list[ChatHistoryMessage] = Field(
+        default_factory=list, max_length=CHAT_HISTORY_MAX_MESSAGES
+    )
+
+
+class ChatCitation(BaseModel):
+    """A numbered passage the agent read, verifiable against its document.
+
+    ``number`` is the ``[n]`` marker used in the answer; the stored document
+    text satisfies ``text[start_offset:end_offset] == content``.
+    """
+
+    number: int
+    document_id: UUID
+    document_filename: str
+    chunk_id: UUID
+    chunk_index: int
+    start_offset: int
+    end_offset: int
+    content: str
+
+
+class PendingApproval(BaseModel):
+    """An action the agent submitted for human approval (not executed)."""
+
+    approval_id: UUID
+    tool_name: str
+    expires_at: datetime
+
+
+class ToolCallSummary(BaseModel):
+    """Outcome of one model tool call (error codes only, never handler details)."""
+
+    call_id: str
+    tool_name: str
+    status: Literal["ok", "error", "approval_required"]
+    error: str | None = None
+    approval_id: UUID | None = None
+
+
+class ChatResponse(BaseModel):
+    """Result of one agent run.
+
+    ``citations`` are the passages whose ``[n]`` markers appear in
+    ``answer``; ``sources`` are every passage the model was shown.
+    ``stop_reason`` is ``step_limit`` when the run hit the step budget.
+    """
+
+    run_id: str
+    answer: str
+    stop_reason: Literal["completed", "step_limit"]
+    citations: list[ChatCitation]
+    sources: list[ChatCitation]
+    pending_approvals: list[PendingApproval]
+    tool_calls: list[ToolCallSummary]

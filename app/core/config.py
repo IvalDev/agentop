@@ -1,6 +1,6 @@
 """Typed application settings loaded from environment variables."""
 
-from pydantic import model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,6 +10,21 @@ class Settings(BaseSettings):
     Every field is read from an environment variable prefixed with ``AA_``
     (for example ``AA_DATABASE_URL``). Defaults keep the app importable
     without any environment configuration during scaffolding.
+
+    Chat model (T9): ``llm_provider`` is ``ollama`` (default, local inference
+    at ``ollama_base_url``), ``fake`` (offline tests), or ``openai_compatible``
+    — an opt-in door for development against an external OpenAI-compatible
+    API. The external provider sends prompts and document content off the
+    machine, so it refuses to start unless ``allow_external_llm`` is true and
+    ``llm_api_key`` / ``llm_base_url`` are set. Example (xAI Grok)::
+
+        AA_LLM_PROVIDER=openai_compatible
+        AA_ALLOW_EXTERNAL_LLM=true
+        AA_LLM_BASE_URL=https://api.x.ai/v1
+        AA_LLM_MODEL=grok-4
+        AA_LLM_API_KEY=<key>
+
+    Embeddings keep their own ``embedding_*`` settings in every case.
     """
 
     model_config = SettingsConfigDict(env_prefix="AA_")
@@ -33,6 +48,14 @@ class Settings(BaseSettings):
     embedding_model: str = "nomic-embed-text"
     embedding_dim: int = 768
     embedding_timeout_seconds: float = 30.0
+    # Agent (T9): chat model adapter, external-inference guard, and loop bound.
+    llm_provider: str = "ollama"  # "ollama" | "fake" | "openai_compatible"
+    llm_model: str = "qwen2.5:7b-instruct"
+    llm_timeout_seconds: float = 120.0
+    llm_base_url: str = ""  # openai_compatible only; Ollama uses ollama_base_url
+    llm_api_key: SecretStr | None = None  # openai_compatible only
+    allow_external_llm: bool = False
+    agent_max_steps: int = Field(default=6, ge=1, le=50)  # model calls per chat run
     # Approvals (T7): how long a request stays decidable/executable after creation.
     approval_ttl_seconds: int = 24 * 60 * 60
     # Audit (T8): cap on the compact JSON of each stored payload/result.

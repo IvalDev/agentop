@@ -15,17 +15,16 @@ authenticated user. Every tool declares:
 
 Handler contract (exact signature)::
 
-    async def handler(
-        session: AsyncSession,
-        tenant_id: int,
-        user: ToolUser,
-        validated_input: BaseModel,
-    ) -> Any | BaseModel
+    async def handler(context: ToolContext, validated_input: BaseModel) -> Any | BaseModel
 
-``tenant_id`` comes from the authenticated principal and is the isolation key
-(decision A8): handlers MUST scope every query with it. ``ToolUser`` is a
+:class:`ToolContext` is built by the executor for every call: the caller's
+``session``, the ``tenant_id`` and ``user`` of the authenticated principal,
+and the optional services a handler may need (the ``embeddings`` provider for
+semantic search, the run's ``correlation_id``). ``tenant_id`` is the isolation
+key (decision A8): handlers MUST scope every query with it. ``ToolUser`` is a
 structural protocol satisfied by both the ORM ``User`` and the request-scoped
-``CurrentUser`` value object, so handlers stay decoupled from either.
+``CurrentUser`` value object, so handlers stay decoupled from either. New
+services are added as context fields, never as extra positional arguments.
 
 Registration invariants are enforced by :meth:`ToolRegistry.register` and
 raise :class:`ToolRegistrationError`; lookups raise
@@ -42,6 +41,7 @@ from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.identity.models import UserRole
+from app.modules.retrieval.embeddings import EmbeddingProvider
 from app.modules.tools.exceptions import ToolNotFoundError, ToolRegistrationError
 
 
@@ -68,7 +68,24 @@ class ToolUser(Protocol):
     is_superadmin: bool
 
 
-ToolHandler = Callable[[AsyncSession, int, ToolUser, BaseModel], Awaitable[Any]]
+@dataclass(frozen=True)
+class ToolContext:
+    """Everything a handler may use besides its validated input.
+
+    ``tenant_id`` always equals ``user.tenant_id`` (the executor builds it
+    from the authenticated principal, never from tool input). ``embeddings``
+    is ``None`` when the caller wired no provider; handlers must degrade or
+    fail closed instead of assuming one.
+    """
+
+    session: AsyncSession
+    tenant_id: int
+    user: ToolUser
+    embeddings: EmbeddingProvider | None = None
+    correlation_id: str | None = None
+
+
+ToolHandler = Callable[[ToolContext, BaseModel], Awaitable[Any]]
 
 # Lowercase identifier-ish names such as ``extract_invoice`` / ``send_email``.
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")

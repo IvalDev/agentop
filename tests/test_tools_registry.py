@@ -22,7 +22,7 @@ class DemoInput(BaseModel):
     value: int
 
 
-async def stub_handler(session, tenant_id, user, validated_input) -> dict:
+async def stub_handler(context, validated_input) -> dict:
     """Minimal async handler satisfying the ToolSpec handler contract."""
     return {"value": validated_input.value}
 

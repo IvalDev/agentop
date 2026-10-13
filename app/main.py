@@ -10,6 +10,8 @@ from app.api.health import router as health_router
 from app.core.config import Settings
 from app.core.db import Database
 from app.core.logging import setup_logging
+from app.modules.agent.llm import build_llm_provider
+from app.modules.agent.router import router as chat_router
 from app.modules.approvals.router import router as approvals_router
 from app.modules.audit.router import router as audit_router
 from app.modules.audit.service import configure_audit
@@ -18,6 +20,7 @@ from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.router import router as auth_router
 from app.modules.retrieval.embeddings import build_embedding_provider
 from app.modules.retrieval.router import router as search_router
+from app.modules.tools import builtin  # noqa: F401  (registers the production tools)
 from app.modules.tools.registry import default_registry
 
 logger = logging.getLogger(__name__)
@@ -66,6 +69,8 @@ def create_app() -> FastAPI:
     configure_audit(settings)
     application.state.storage = LocalDocumentStorage(settings.storage_base_dir)
     application.state.embeddings = build_embedding_provider(settings)
+    # Fails fast on a misconfigured or unapproved external chat provider.
+    application.state.llm = build_llm_provider(settings)
     application.state.tool_registry = default_registry
     application.include_router(health_router)
     application.include_router(auth_router)
@@ -73,6 +78,7 @@ def create_app() -> FastAPI:
     application.include_router(search_router)
     application.include_router(approvals_router)
     application.include_router(audit_router)
+    application.include_router(chat_router)
     return application
 
 

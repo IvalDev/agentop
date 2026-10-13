@@ -14,28 +14,34 @@ expose a shell, arbitrary SQL, or open filesystem access:
 
 Tools:
 
-- ``search_documents`` — ``EXTRACT`` / ``AUTO`` / viewer+: keyword search over
-  the caller's tenant chunks, returning hits with verifiable citations
-  (``document_id`` + character offsets, acceptance criterion 3). The handler
-  contract carries no embedding provider, so the tool ranks with the
-  retrieval service's ``keyword`` mode; semantic/hybrid ranking through a
-  tool needs a provider seam that the orchestrator (T9) owns.
+- ``search_documents`` — ``EXTRACT`` / ``AUTO`` / viewer+: search over the
+  caller's tenant chunks (``hybrid`` by default, or ``semantic`` /
+  ``keyword``), returning hits with verifiable citations (``document_id`` +
+  character offsets, acceptance criterion 3). Semantic ranking embeds the
+  query with the :class:`~app.modules.tools.registry.ToolContext`'s
+  provider. Without a provider, or when the embedding backend fails, the
+  tool degrades to ``keyword`` ranking (logged) instead of failing the
+  agent's run; the output's ``mode`` reports the ranking actually used.
 """
 
+import logging
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.identity.models import UserRole
 from app.modules.retrieval.embeddings import EmbeddingError
 from app.modules.retrieval.service import search
 from app.modules.tools.registry import (
     ApprovalPolicy,
+    ToolContext,
     ToolKind,
     ToolSpec,
-    ToolUser,
     register_default,
 )
 from packages.contracts.schemas import SearchHit
+
+logger = logging.getLogger(__name__)
 
 SEARCH_QUERY_MAX_LENGTH = 500
 SEARCH_TOP_K_DEFAULT = 5
@@ -50,7 +56,7 @@ class SearchDocumentsInput(BaseModel):
     query: str = Field(
         min_length=1,
         max_length=SEARCH_QUERY_MAX_LENGTH,
-        description="Keywords to look for in the tenant's documents.",
+        description="What to look for in the organization's documents.",
     )
     top_k: int = Field(
         default=SEARCH_TOP_K_DEFAULT,
@@ -58,51 +64,60 @@ class SearchDocumentsInput(BaseModel):
         le=SEARCH_TOP_K_MAX,
         description="Maximum number of passages to return.",
     )
+    mode: Literal["hybrid", "semantic", "keyword"] = Field(
+        default="hybrid",
+        description="Ranking: hybrid (default), semantic (meaning), or keyword (exact words).",
+    )
 
 
 class SearchDocumentsOutput(BaseModel):
-    """Ranked passages, each a verifiable citation into its source document."""
+    """Ranked passages, each a verifiable citation into its source document.
+
+    ``mode`` is the ranking actually used (``keyword`` after a degradation).
+    """
 
     hits: list[SearchHit]
+    mode: Literal["hybrid", "semantic", "keyword"]
 
 
-class _KeywordOnlyEmbeddings:
-    """Embedding placeholder for keyword search: keyword mode never embeds.
+async def search_documents(
+    context: ToolContext, validated_input: SearchDocumentsInput
+) -> SearchDocumentsOutput:
+    """Return the caller's tenant passages that best match the query."""
+    query, top_k, mode = validated_input.query, validated_input.top_k, validated_input.mode
+    if mode != "keyword":
+        if context.embeddings is not None:
+            try:
+                hits = await search(
+                    context.session, context.tenant_id, query, mode, top_k, context.embeddings
+                )
+                return SearchDocumentsOutput(hits=hits, mode=mode)
+            except EmbeddingError:
+                logger.warning("search_documents: embeddings failed; degrading to keyword search")
+        else:
+            logger.warning("search_documents: no embedding provider; using keyword search")
+    hits = await search(context.session, context.tenant_id, query, "keyword", top_k, _NO_EMBEDDINGS)
+    return SearchDocumentsOutput(hits=hits, mode="keyword")
 
-    Fails closed instead of returning fake vectors if the mode ever changes
-    without wiring a real provider.
-    """
+
+class _NoEmbeddings:
+    """Provider stand-in for keyword mode, which never embeds (fails closed)."""
 
     dimension: int = 0
 
     async def embed_texts(self, texts: list[str]) -> list[list[float]]:
-        raise EmbeddingError("search_documents is keyword-only; no embedding provider is wired")
+        raise EmbeddingError("keyword search does not embed")
 
 
-async def search_documents(
-    session: AsyncSession,
-    tenant_id: int,
-    user: ToolUser,
-    validated_input: SearchDocumentsInput,
-) -> SearchDocumentsOutput:
-    """Return the caller's tenant passages that best match the keywords."""
-    hits = await search(
-        session,
-        tenant_id,
-        validated_input.query,
-        "keyword",
-        validated_input.top_k,
-        _KeywordOnlyEmbeddings(),
-    )
-    return SearchDocumentsOutput(hits=hits)
+_NO_EMBEDDINGS = _NoEmbeddings()
 
 
 SEARCH_DOCUMENTS = register_default(
     ToolSpec(
         name="search_documents",
         description=(
-            "Search the organization's documents by keywords and return matching "
-            "passages with citations (document id and character offsets)."
+            "Search the organization's documents and return the most relevant "
+            "passages, each numbered for citation."
         ),
         kind=ToolKind.EXTRACT,
         approval_policy=ApprovalPolicy.AUTO,

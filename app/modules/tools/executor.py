@@ -17,6 +17,12 @@ result                        HTTP                 ``error_kind``
 ``error`` (rejected grant)    403                  ``forbidden``
 ============================ ==================== ==================
 
+Error messages are safe to show to API clients and to the model: a handler
+exception is reported as :data:`TOOL_FAILED` and an output-schema violation
+as :data:`INVALID_OUTPUT` (the detail goes to the server log and the
+``tool.failed`` audit event only), and validation errors list field
+locations and messages without echoing input values.
+
 Role checks compare an explicit rank map (lower = more privileged), mirroring
 the declaration order of :class:`~app.modules.identity.models.UserRole`:
 ``owner=0, admin=1, operator=2, viewer=3``. A user may invoke a tool when
@@ -77,12 +83,18 @@ from app.modules.approvals.grants import ApprovalGrant, consume_grant
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
 from app.modules.identity.models import UserRole
+from app.modules.retrieval.embeddings import EmbeddingProvider
 from app.modules.tools.exceptions import ToolNotFoundError
-from app.modules.tools.registry import ApprovalPolicy, ToolRegistry, ToolUser
+from app.modules.tools.registry import ApprovalPolicy, ToolContext, ToolRegistry, ToolUser
 
 logger = logging.getLogger(__name__)
 
 ErrorKind = Literal["not_found", "forbidden", "validation", "execution"]
+
+#: Caller-facing message of a handler exception (the detail is audited only).
+TOOL_FAILED = "tool_failed"
+#: Caller-facing message of a handler return that violates ``output_model``.
+INVALID_OUTPUT = "invalid tool output"
 
 #: Role precedence: lower number = more privileged. Mirrors UserRole's
 #: declaration order ("ordered from most to least privileged").
@@ -157,6 +169,16 @@ def _error_summary(exc: ValidationError) -> list[dict[str, Any]]:
     ]
 
 
+def _validation_message(exc: ValidationError) -> str:
+    """``loc: message`` per error, without the offending input values."""
+    errors = exc.errors(include_url=False, include_context=False, include_input=False)
+    parts = [
+        f"{'.'.join(str(part) for part in error['loc']) or 'input'}: {error['msg']}"
+        for error in errors
+    ]
+    return "invalid input: " + "; ".join(parts)
+
+
 def compute_action_key(tool_name: str, validated_input: BaseModel) -> str:
     """Stable identifier binding a tool name to its canonical input.
 
@@ -192,6 +214,7 @@ async def execute_tool(
     *,
     actor_type: ActorType = ActorType.USER,
     correlation_id: str | None = None,
+    embeddings: EmbeddingProvider | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
 
@@ -202,23 +225,33 @@ async def execute_tool(
     2. Authorization — insufficient role ⇒ ``error``/``forbidden`` with a
        generic message that reveals neither the requirement nor internals.
     3. Validation — ``spec.input_model`` rejects ``raw_input`` ⇒
-       ``error``/``validation`` with Pydantic's message; handler not called.
+       ``error``/``validation`` listing each failing field (no input
+       values); handler not called.
     4. Approval gate (``REQUIRE_APPROVAL`` and not ``dry_run``) — no
        ``approval_grant`` ⇒ ``approval_required`` carrying the payload to
        approve; a grant that ``consume_grant`` rejects for this call's
        action key ⇒ ``error``/``forbidden``.
     5. Dry run ⇒ ``dry_run`` describing the call; handler not called.
-    6. Handler run — exceptions ⇒ ``error``/``execution`` (message only; the
-       traceback goes to the server log, never to the API).
+    6. Handler run with a :class:`ToolContext` (``session``, the user's
+       tenant, ``embeddings``, ``correlation_id``) — exceptions ⇒
+       ``error``/``execution`` with the generic :data:`TOOL_FAILED`; the
+       exception text goes to the server log and the audit event only.
     7. Output validation — ``spec.output_model`` rejects the return ⇒
-       ``error``/``execution``.
+       ``error``/``execution`` with :data:`INVALID_OUTPUT`.
 
     Handlers own their own transaction: the executor neither commits nor
     rolls back ``session`` (the caller/router does, mirroring the documents
     router). Every outcome is then audited once (see the module docstring).
     """
+    context = ToolContext(
+        session=session,
+        tenant_id=user.tenant_id,
+        user=user,
+        embeddings=embeddings,
+        correlation_id=correlation_id,
+    )
     result, record = await _evaluate(
-        registry, session, user, tool_name, raw_input, dry_run, approval_grant
+        registry, context, tool_name, raw_input, dry_run, approval_grant
     )
     await persist_event(
         session,
@@ -236,14 +269,14 @@ async def execute_tool(
 
 async def _evaluate(
     registry: ToolRegistry,
-    session: AsyncSession,
-    user: ToolUser,
+    context: ToolContext,
     tool_name: str,
     raw_input: dict[str, Any],
     dry_run: bool,
     approval_grant: ApprovalGrant | None,
 ) -> tuple[ToolExecutionResult, _AuditRecord]:
     """Run the gates of :func:`execute_tool`; return its result and audit record."""
+    user = context.user
     try:
         spec = registry.get(tool_name)
     except ToolNotFoundError:
@@ -271,7 +304,7 @@ async def _evaluate(
         return ToolExecutionResult(
             tool_name=spec.name,
             status="error",
-            error=str(exc),
+            error=_validation_message(exc),
             error_kind="validation",
         ), _AuditRecord(
             "tool.invalid_input", _input_fields(raw_input), {"errors": _error_summary(exc)}
@@ -319,16 +352,16 @@ async def _evaluate(
         ), _AuditRecord("tool.dry_run", canonical, {"approval_required": needs_approval})
 
     try:
-        output = await spec.handler(session, user.tenant_id, user, validated_input)
+        output = await spec.handler(context, validated_input)
     except Exception as exc:
         logger.exception("tool %s failed", spec.name)
-        message = str(exc) or type(exc).__name__
+        detail = str(exc) or type(exc).__name__
         return ToolExecutionResult(
             tool_name=spec.name,
             status="error",
-            error=message,
+            error=TOOL_FAILED,
             error_kind="execution",
-        ), _AuditRecord("tool.failed", canonical, {"error": message})
+        ), _AuditRecord("tool.failed", canonical, {"error": detail})
 
     if spec.output_model is not None:
         try:
@@ -342,12 +375,12 @@ async def _evaluate(
             return ToolExecutionResult(
                 tool_name=spec.name,
                 status="error",
-                error=f"invalid tool output: {exc}",
+                error=INVALID_OUTPUT,
                 error_kind="execution",
             ), _AuditRecord(
                 "tool.failed",
                 canonical,
-                {"error": "invalid tool output", "errors": _error_summary(exc)},
+                {"error": INVALID_OUTPUT, "errors": _error_summary(exc)},
             )
 
     return ToolExecutionResult(tool_name=spec.name, status="ok", output=output), _AuditRecord(

@@ -355,7 +355,8 @@ async def test_handler_failure_marks_request_failed_and_single_use(
 
     assert outcome.result.status == "error"
     assert outcome.request.status is ApprovalStatus.FAILED
-    assert "smtp down" in (outcome.request.execution_error or "")
+    # Reviewers see the masked code; the handler's detail stays in the audit trail.
+    assert outcome.request.execution_error == "tool_failed"
     assert len(approval_tools.spy.calls) == 1
 
 

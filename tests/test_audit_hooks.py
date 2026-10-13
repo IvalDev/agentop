@@ -372,7 +372,8 @@ async def test_failed_execution_is_audited(
     [tool_failed] = await audit_log(seeded_db, action="tool.failed")
     [approval_failed] = await audit_log(seeded_db, action="approval.failed")
     assert tool_failed.correlation_id == approval_failed.correlation_id == str(request_id)
-    assert approval_failed.result == {"error": "smtp down"}
+    assert tool_failed.result == {"error": "smtp down"}
+    assert approval_failed.result == {"error": "tool_failed"}
 
 
 async def test_denied_approval_operations_are_audited(

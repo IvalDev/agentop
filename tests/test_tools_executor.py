@@ -17,10 +17,12 @@ from app.modules.approvals.grants import ApprovalGrant, mint_grant
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, UserRole
+from app.modules.retrieval.embeddings import EmbeddingError, FakeEmbeddingProvider
 from app.modules.tools import builtin
 from app.modules.tools.executor import compute_action_key, execute_tool
 from app.modules.tools.registry import (
     ApprovalPolicy,
+    ToolContext,
     ToolKind,
     ToolRegistry,
     ToolSpec,
@@ -47,9 +49,11 @@ class SpyHandler:
         self.result = result
         self.error = error
         self.calls: list[tuple[int, CurrentUser, DemoInput]] = []
+        self.contexts: list[ToolContext] = []
 
-    async def __call__(self, session, tenant_id, user, validated_input) -> object:
-        self.calls.append((tenant_id, user, validated_input))
+    async def __call__(self, context: ToolContext, validated_input: DemoInput) -> object:
+        self.calls.append((context.tenant_id, context.user, validated_input))
+        self.contexts.append(context)
         if self.error is not None:
             raise self.error
         return self.result
@@ -179,6 +183,29 @@ async def test_auto_extract_executes_and_returns_ok(
     assert tenant_id == 1
     assert user.role is UserRole.OWNER
     assert validated == DemoInput(value=2)
+
+
+async def test_handler_receives_a_context_with_session_and_services(
+    tools: ToolBundle, identity_db: Database
+) -> None:
+    """The ``ToolContext`` carries the caller's session, principal, and providers."""
+    embeddings = FakeEmbeddingProvider(dimension=8)
+    async with identity_db.sessionmaker() as session:
+        await execute_tool(
+            tools.registry,
+            session,
+            make_user(tenant_id=3),
+            "spy_extract",
+            {"value": 2},
+            correlation_id="run-1",
+            embeddings=embeddings,
+        )
+        [context] = tools.extract_spy.contexts
+        assert context.session is session
+
+    assert (context.tenant_id, context.user.tenant_id) == (3, 3)
+    assert context.embeddings is embeddings
+    assert context.correlation_id == "run-1"
 
 
 async def test_invalid_input_returns_validation_error_and_skips_handler(
@@ -417,17 +444,19 @@ async def test_dry_run_of_auto_tool_needs_no_approval(
     assert tools.extract_spy.calls == []
 
 
-async def test_handler_exception_returns_error_without_traceback(
-    tools: ToolBundle, identity_db: Database
+async def test_handler_exception_is_masked_for_callers_and_kept_in_audit(
+    tools: ToolBundle, identity_db: Database, audit_log
 ) -> None:
-    """Handler failures surface as an error result; no stack trace leaks."""
+    """Callers get a generic ``tool_failed``; the detail lives in the audit trail."""
     async with identity_db.sessionmaker() as session:
         result = await execute_tool(tools.registry, session, make_user(), "boom", {"value": 1})
 
     assert result.status == "error"
     assert result.error_kind == "execution"
-    assert "kapow" in (result.error or "")
-    assert "Traceback" not in (result.error or "")
+    assert result.error == "tool_failed"
+    assert "kapow" not in result.model_dump_json()
+    [event] = await audit_log(identity_db, action="tool.failed")
+    assert event.result == {"error": "kapow"}
 
 
 async def test_invalid_output_returns_error(tools: ToolBundle, identity_db: Database) -> None:
@@ -439,7 +468,7 @@ async def test_invalid_output_returns_error(tools: ToolBundle, identity_db: Data
 
     assert result.status == "error"
     assert result.error_kind == "execution"
-    assert "output" in (result.error or "").lower()
+    assert result.error == "invalid tool output"
 
 
 async def test_unknown_tool_returns_not_found_error(
@@ -609,8 +638,16 @@ async def test_search_documents_rejects_tenant_override_in_input(seeded_db: Data
         {"query": "x" * 501},
         {"query": "invoice", "top_k": 0},
         {"query": "invoice", "top_k": 21},
+        {"query": "invoice", "mode": "regex"},
     ],
-    ids=["missing-query", "empty-query", "query-too-long", "top-k-zero", "top-k-too-big"],
+    ids=[
+        "missing-query",
+        "empty-query",
+        "query-too-long",
+        "top-k-zero",
+        "top-k-too-big",
+        "unknown-mode",
+    ],
 )
 async def test_search_documents_rejects_unbounded_input(
     raw_input: dict, identity_db: Database
@@ -641,6 +678,85 @@ async def test_search_documents_dry_run_skips_the_search(seeded_db: Database) ->
         )
 
     assert result.status == "dry_run"
-    assert result.output.validated_input == {"query": "invoice", "top_k": 5}
+    assert result.output.validated_input == {"query": "invoice", "top_k": 5, "mode": "hybrid"}
     assert result.output.approval_required is False
     assert not hasattr(result.output, "hits")
+
+
+class RecordingEmbeddings(FakeEmbeddingProvider):
+    """Fake embedder that records queries and can be told to fail."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__(dimension=64)
+        self.fail = fail
+        self.queries: list[str] = []
+
+    async def embed_texts(self, texts: list[str]) -> list[list[float]]:
+        self.queries.extend(texts)
+        if self.fail:
+            raise EmbeddingError("embedding backend down")
+        return await super().embed_texts(texts)
+
+
+async def _seed_embedded(db: Database, tenant_id: int, contents: list[str]) -> None:
+    document_id = await _seed_document(db, tenant_id, "embedded.txt", contents)
+    vectors = await FakeEmbeddingProvider(dimension=64).embed_texts(contents)
+    async with db.sessionmaker() as session:
+        chunks = (
+            await session.execute(
+                select(DocumentChunk)
+                .where(DocumentChunk.document_id == document_id)
+                .order_by(DocumentChunk.chunk_index)
+            )
+        ).scalars()
+        for chunk, vector in zip(chunks, vectors, strict=True):
+            chunk.embedding = vector
+        await session.commit()
+
+
+@pytest.mark.parametrize("mode", ["semantic", "hybrid"])
+async def test_search_documents_embeds_the_query_with_the_context_provider(
+    seeded_db: Database, mode: str
+) -> None:
+    """Semantic and hybrid modes rank with the provider from the ``ToolContext``."""
+    acme = await _tenant_id(seeded_db, "acme")
+    await _seed_embedded(seeded_db, acme, ["invoice total 100", "holiday calendar"])
+    embeddings = RecordingEmbeddings()
+
+    async with seeded_db.sessionmaker() as session:
+        result = await execute_tool(
+            default_registry,
+            session,
+            make_user(UserRole.VIEWER, tenant_id=acme),
+            "search_documents",
+            {"query": "invoice total", "mode": mode},
+            embeddings=embeddings,
+        )
+
+    assert result.status == "ok"
+    assert result.output.mode == mode
+    assert embeddings.queries == ["invoice total"]
+    assert result.output.hits[0].content == "invoice total 100"
+
+
+@pytest.mark.parametrize("embeddings", [None, RecordingEmbeddings(fail=True)], ids=["none", "down"])
+async def test_search_documents_degrades_to_keyword_without_working_embeddings(
+    seeded_db: Database, embeddings: RecordingEmbeddings | None
+) -> None:
+    """No provider, or a failing one, still answers with keyword ranking."""
+    acme = await _tenant_id(seeded_db, "acme")
+    await _seed_embedded(seeded_db, acme, ["invoice total 100", "holiday calendar"])
+
+    async with seeded_db.sessionmaker() as session:
+        result = await execute_tool(
+            default_registry,
+            session,
+            make_user(UserRole.VIEWER, tenant_id=acme),
+            "search_documents",
+            {"query": "invoice"},
+            embeddings=embeddings,
+        )
+
+    assert result.status == "ok"
+    assert result.output.mode == "keyword"
+    assert [hit.content for hit in result.output.hits] == ["invoice total 100"]

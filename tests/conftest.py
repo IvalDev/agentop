@@ -15,19 +15,27 @@ from app.modules.audit.models import AuditEvent
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, User, UserRole
 from app.modules.identity.security import hash_password
-from app.modules.tools.registry import ApprovalPolicy, ToolKind, ToolRegistry, ToolSpec
+from app.modules.tools.registry import (
+    ApprovalPolicy,
+    ToolContext,
+    ToolKind,
+    ToolRegistry,
+    ToolSpec,
+)
 
 
 @pytest.fixture(autouse=True)
 def default_embedding_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Tests never call a live Ollama: default every app to the fake provider.
+    """Tests never call a live Ollama: default every app to the fake providers.
 
-    ``create_app`` builds the embedding adapter from ``Settings``; fixtures
-    that build an app after this runs pick up the offline fake. Tests that
-    need a specific provider override ``app.state.embeddings`` explicitly
-    (constructor arguments still beat environment variables in pydantic).
+    ``create_app`` builds the embedding and chat adapters from ``Settings``;
+    fixtures that build an app after this runs pick up the offline fakes.
+    Tests that need a specific provider override ``app.state.embeddings`` /
+    ``app.state.llm`` explicitly (constructor arguments still beat environment
+    variables in pydantic).
     """
     monkeypatch.setenv("AA_EMBEDDING_PROVIDER", "fake")
+    monkeypatch.setenv("AA_LLM_PROVIDER", "fake")
 
 
 @pytest.fixture
@@ -163,8 +171,8 @@ class ActionSpy:
     error: Exception | None = None
     calls: list[tuple[int, CurrentUser, BaseModel]] = field(default_factory=list)
 
-    async def __call__(self, session, tenant_id, user, validated_input) -> dict:
-        self.calls.append((tenant_id, user, validated_input))
+    async def __call__(self, context: ToolContext, validated_input: BaseModel) -> dict:
+        self.calls.append((context.tenant_id, context.user, validated_input))
         if self.error is not None:
             raise self.error
         return {"delivered": True, "to": validated_input.to}
