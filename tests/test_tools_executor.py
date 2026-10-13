@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.core.db import Database
+from app.modules.approvals.grants import ApprovalGrant, mint_grant
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, UserRole
@@ -275,7 +276,7 @@ async def test_dry_run_still_requires_sufficient_role(
     assert tools.extract_spy.calls == []
 
 
-async def test_require_approval_without_token_returns_approval_request(
+async def test_require_approval_without_grant_returns_approval_request(
     tools: ToolBundle, identity_db: Database
 ) -> None:
     """An unapproved ACTION returns approval_required without calling the handler."""
@@ -316,15 +317,48 @@ async def test_action_key_is_stable_and_bound_to_input(
     )
 
 
-async def test_approval_token_proceeds_pending_t7_validation(
+async def test_minted_grant_for_the_exact_action_runs_handler_once(
     tools: ToolBundle, identity_db: Database
 ) -> None:
-    """Non-None approval_token means approved; T7 must validate it (see docstring).
+    """A live grant bound to this tool+input runs the handler, then is spent."""
+    grant = mint_grant(uuid4(), compute_action_key("demo_action", DemoInput(value=3)))
+    async with identity_db.sessionmaker() as session:
+        first = await execute_tool(
+            tools.registry, session, make_user(), "demo_action", {"value": 3}, approval_grant=grant
+        )
+        replayed = await execute_tool(
+            tools.registry, session, make_user(), "demo_action", {"value": 3}, approval_grant=grant
+        )
 
-    T6 has no token issuer, so this only pins the seam shape: the executor
-    trusts ``approval_token`` and T7's ``execute_approved_action`` is the sole
-    caller allowed to pass a validated one.
-    """
+    assert first.status == "ok"
+    assert (replayed.status, replayed.error_kind) == ("error", "forbidden")
+    assert len(tools.action_spy.calls) == 1
+
+
+async def test_grant_for_another_input_is_refused(tools: ToolBundle, identity_db: Database) -> None:
+    """A grant minted for one payload cannot authorize a different one."""
+    grant = mint_grant(uuid4(), compute_action_key("demo_action", DemoInput(value=3)))
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            tools.registry, session, make_user(), "demo_action", {"value": 4}, approval_grant=grant
+        )
+
+    assert (result.status, result.error_kind) == ("error", "forbidden")
+    assert tools.action_spy.calls == []
+
+
+@pytest.mark.parametrize(
+    "forged",
+    [
+        "t7-issued-placeholder",
+        ApprovalGrant(uuid4(), compute_action_key("demo_action", DemoInput(value=3))),
+    ],
+    ids=["free-form-string", "unminted-grant"],
+)
+async def test_forged_grants_are_refused(
+    forged: object, tools: ToolBundle, identity_db: Database
+) -> None:
+    """Only grants minted by the approvals service unlock an ACTION tool."""
     async with identity_db.sessionmaker() as session:
         result = await execute_tool(
             tools.registry,
@@ -332,11 +366,12 @@ async def test_approval_token_proceeds_pending_t7_validation(
             make_user(),
             "demo_action",
             {"value": 3},
-            approval_token="t7-issued-placeholder",
+            approval_grant=forged,
         )
 
-    assert result.status == "ok"
-    assert len(tools.action_spy.calls) == 1
+    assert (result.status, result.error_kind) == ("error", "forbidden")
+    assert result.approval_request is None
+    assert tools.action_spy.calls == []
 
 
 async def test_dry_run_reports_would_be_action_without_handler(

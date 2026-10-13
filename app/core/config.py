@@ -33,6 +33,8 @@ class Settings(BaseSettings):
     embedding_model: str = "nomic-embed-text"
     embedding_dim: int = 768
     embedding_timeout_seconds: float = 30.0
+    # Approvals (T7): how long a request stays decidable/executable after creation.
+    approval_ttl_seconds: int = 24 * 60 * 60
     log_level: str = "INFO"
     bootstrap_email: str = ""
     bootstrap_password: str = ""

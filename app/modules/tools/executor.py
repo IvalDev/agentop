@@ -14,6 +14,7 @@ result                        HTTP                 ``error_kind``
 ``error`` (unknown tool)      400                  ``not_found``
 ``error`` (handler/output)    400                  ``execution``
 ``error`` (insufficient role) 403                  ``forbidden``
+``error`` (rejected grant)    403                  ``forbidden``
 ============================ ==================== ==================
 
 Role checks compare an explicit rank map (lower = more privileged), mirroring
@@ -22,18 +23,22 @@ the declaration order of :class:`~app.modules.identity.models.UserRole`:
 ``rank(user.role) <= rank(spec.required_role)`` or ``user.is_superadmin``
 (the superadmin bypass mirrors :func:`app.modules.identity.deps.require_roles`).
 
-Approval seam for T7 (approvals module)
----------------------------------------
-- ``approval_token: str | None`` — ``None`` means "not approved yet": a
+Approval gate (decision A7: the model never authorizes)
+------------------------------------------------------
+- ``approval_grant`` — ``None`` means "not approved yet": a
   ``REQUIRE_APPROVAL`` tool stops at ``approval_required`` and its handler is
-  never called. T7 is the only caller allowed to pass a token, and T7 must
-  validate it against a persisted, unexpired, payload-bound ApprovalRequest
-  before passing it here. The HTTP layer never accepts a token from clients.
+  never called. Any other value must be a live
+  :class:`~app.modules.approvals.grants.ApprovalGrant`, which only the
+  approvals service mints (``execute_approved_action``, after claiming an
+  approved, unexpired, payload-bound request). The executor spends it with
+  ``consume_grant`` against the key it recomputes for *this* call; a string,
+  an unminted or replayed grant, or a grant for another tool/input yields
+  ``error``/``forbidden`` and the handler is never called. The HTTP layer
+  never accepts a grant from clients.
 - ``approval_request`` payload (``ApprovalRequestPayload``): ``tool_name``,
   the validated input as a plain dict, ``required_role`` (its string value),
   and ``action_key`` — ``"<tool_name>:<sha256(tool_name + canonical input
-  JSON)>"`` — the stable identifier T7 binds an approval to (decision A7:
-  exact action + payload binding).
+  JSON)>"`` — the stable identifier an approval is bound to.
 """
 
 import hashlib
@@ -44,6 +49,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.approvals.grants import ApprovalGrant, consume_grant
 from app.modules.identity.models import UserRole
 from app.modules.tools.exceptions import ToolNotFoundError
 from app.modules.tools.registry import ApprovalPolicy, ToolRegistry, ToolUser
@@ -63,10 +69,10 @@ _ROLE_RANK: dict[UserRole, int] = {
 
 
 class ApprovalRequestPayload(BaseModel):
-    """Seam T7 binds to: what must be approved before a tool may run.
+    """What must be approved before a ``REQUIRE_APPROVAL`` tool may run.
 
-    T7 replaces/extends this with its persisted ApprovalRequest rows; the
-    field names here are the contract ``execute_tool`` produces today.
+    The approvals service persists the equivalent ``ApprovalRequest`` row,
+    recomputing ``action_key`` itself rather than trusting this value.
     """
 
     tool_name: str
@@ -120,7 +126,7 @@ def compute_action_key(tool_name: str, validated_input: BaseModel) -> str:
     return f"{tool_name}:{digest}"
 
 
-def _authorized(user: ToolUser, required_role: UserRole) -> bool:
+def role_satisfies(user: ToolUser, required_role: UserRole) -> bool:
     """True when ``user``'s rank satisfies ``required_role`` (or superadmin)."""
     if user.is_superadmin:
         return True
@@ -134,7 +140,7 @@ async def execute_tool(
     tool_name: str,
     raw_input: dict[str, Any],
     dry_run: bool = False,
-    approval_token: str | None = None,
+    approval_grant: ApprovalGrant | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
 
@@ -146,8 +152,10 @@ async def execute_tool(
        generic message that reveals neither the requirement nor internals.
     3. Validation — ``spec.input_model`` rejects ``raw_input`` ⇒
        ``error``/``validation`` with Pydantic's message; handler not called.
-    4. Approval gate — ``REQUIRE_APPROVAL`` without ``approval_token`` and
-       not ``dry_run`` ⇒ ``approval_required`` carrying the T7 payload.
+    4. Approval gate (``REQUIRE_APPROVAL`` and not ``dry_run``) — no
+       ``approval_grant`` ⇒ ``approval_required`` carrying the payload to
+       approve; a grant that ``consume_grant`` rejects for this call's
+       action key ⇒ ``error``/``forbidden``.
     5. Dry run ⇒ ``dry_run`` describing the call; handler not called.
     6. Handler run — exceptions ⇒ ``error``/``execution`` (message only; the
        traceback goes to the server log, never to the API).
@@ -168,7 +176,7 @@ async def execute_tool(
             error_kind="not_found",
         )
 
-    if not _authorized(user, spec.required_role):
+    if not role_satisfies(user, spec.required_role):
         return ToolExecutionResult(
             tool_name=spec.name,
             status="error",
@@ -189,22 +197,28 @@ async def execute_tool(
             error_kind="validation",
         )
 
-    if (
-        spec.approval_policy is ApprovalPolicy.REQUIRE_APPROVAL
-        and approval_token is None
-        and not dry_run
-    ):
-        payload = ApprovalRequestPayload(
-            tool_name=spec.name,
-            input=validated_input.model_dump(mode="json"),
-            required_role=spec.required_role.value,
-            action_key=compute_action_key(spec.name, validated_input),
-        )
-        return ToolExecutionResult(
-            tool_name=spec.name,
-            status="approval_required",
-            approval_request=payload,
-        )
+    if spec.approval_policy is ApprovalPolicy.REQUIRE_APPROVAL and not dry_run:
+        action_key = compute_action_key(spec.name, validated_input)
+        if approval_grant is None:
+            payload = ApprovalRequestPayload(
+                tool_name=spec.name,
+                input=validated_input.model_dump(mode="json"),
+                required_role=spec.required_role.value,
+                action_key=action_key,
+            )
+            return ToolExecutionResult(
+                tool_name=spec.name,
+                status="approval_required",
+                approval_request=payload,
+            )
+        if not consume_grant(approval_grant, action_key):
+            logger.warning("tool %s refused an invalid approval grant", spec.name)
+            return ToolExecutionResult(
+                tool_name=spec.name,
+                status="error",
+                error="approval grant rejected",
+                error_kind="forbidden",
+            )
 
     if dry_run:
         info = DryRunInfo(

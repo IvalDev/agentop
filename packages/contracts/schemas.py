@@ -1,7 +1,7 @@
 """Shared request/response schemas; populated as feature tasks land."""
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -119,3 +119,40 @@ class SearchResponse(BaseModel):
     query: str
     mode: str
     hits: list[SearchHit]
+
+
+class ApprovalResponse(BaseModel):
+    """Public view of one approval request.
+
+    ``tool_name`` + ``input`` are exactly what will run, and ``action_key``
+    is the server-computed binding of both. ``tenant_id`` is server-internal.
+    """
+
+    id: UUID
+    tool_name: str
+    input: dict[str, Any]
+    action_key: str
+    required_role: str
+    status: Literal["pending", "approved", "rejected", "expired", "executing", "executed", "failed"]
+    requested_by: int
+    created_at: datetime
+    expires_at: datetime
+    decided_by: int | None = None
+    decided_at: datetime | None = None
+    decision_reason: str | None = None
+    executed_by: int | None = None
+    executed_at: datetime | None = None
+    execution_result: Any | None = None
+    execution_error: str | None = None
+
+
+class ApprovalListResponse(BaseModel):
+    """Caller-tenant listing of approval requests, newest first."""
+
+    approvals: list[ApprovalResponse]
+
+
+class ApprovalRejectRequest(BaseModel):
+    """Optional body of ``POST /api/v1/approvals/{id}/reject``."""
+
+    reason: str | None = Field(default=None, max_length=1000)
