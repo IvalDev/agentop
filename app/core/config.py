@@ -27,6 +27,8 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
     log_level: str = "INFO"
+    bootstrap_email: str = ""
+    bootstrap_password: str = ""
 
     @model_validator(mode="after")
     def require_jwt_secret_in_production(self) -> "Settings":

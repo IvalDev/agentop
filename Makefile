@@ -1,4 +1,4 @@
-.PHONY: install lint format test run migrate migrate-revision
+.PHONY: install lint format test run migrate migrate-revision bootstrap
 
 install:
 	pip install -e ".[dev]"
@@ -20,3 +20,6 @@ migrate:
 
 migrate-revision:
 	alembic revision --autogenerate -m "$(m)"
+
+bootstrap:
+	python -m app.modules.identity.seed

@@ -10,6 +10,7 @@ from app.api.health import router as health_router
 from app.core.config import Settings
 from app.core.db import Database
 from app.core.logging import setup_logging
+from app.modules.identity.router import router as auth_router
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ def create_app() -> FastAPI:
     application.state.settings = settings
     application.state.db = None
     application.include_router(health_router)
+    application.include_router(auth_router)
     return application
 
 
