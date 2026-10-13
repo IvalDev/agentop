@@ -21,6 +21,10 @@ dependencies = [
     # bcrypt>=4.1 (noisy warning); pin below 4.1 until passlib ships a fix.
     "passlib[bcrypt]>=1.7.4",
     "bcrypt>=4.0,<4.1",
+    "pypdf>=4",
+    "python-docx>=1.1",
+    # FastAPI multipart parsing for the document upload endpoint.
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]

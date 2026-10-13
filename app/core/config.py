@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
+    max_upload_bytes: int = 20 * 1024 * 1024
+    storage_base_dir: str = "./var/storage"
     log_level: str = "INFO"
     bootstrap_email: str = ""
     bootstrap_password: str = ""

@@ -1,6 +1,7 @@
 """Shared request/response schemas; populated as feature tasks land."""
 
 from datetime import datetime
+from uuid import UUID
 
 from pydantic import BaseModel
 
@@ -57,3 +58,25 @@ class AdminProbeResponse(BaseModel):
     """Response of the admin+ role-gate probe endpoint."""
 
     status: str
+
+
+class DocumentResponse(BaseModel):
+    """Public metadata of a tenant-owned document.
+
+    Mirrors the ``Document`` model minus ``storage_key``/``tenant_id``:
+    storage locations and tenant ids are server-internal.
+    """
+
+    id: UUID
+    filename: str
+    content_type: str
+    size_bytes: int
+    status: str
+    created_at: datetime
+    error_message: str | None = None
+
+
+class DocumentListResponse(BaseModel):
+    """Caller-scoped listing of documents."""
+
+    documents: list[DocumentResponse]
