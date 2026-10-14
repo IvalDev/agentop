@@ -36,7 +36,10 @@ does; losers of a race record nothing. A refused create/approve/reject/execute
 is persisted at once as ``approval.denied`` (no state changes, so it must not
 depend on the caller's transaction). Every event of a request carries its id
 as ``resource_id`` and ``correlation_id``; the tool run passes the same
-``correlation_id`` to the executor's ``tool.*`` event.
+``correlation_id`` to the executor's ``tool.*`` event. The one exception is
+``approval.created``, whose actor type and correlation a caller may set: the
+agent loop records it as ``agent`` with its run id, linking the request to
+the run that submitted it.
 """
 
 import hmac
@@ -61,6 +64,7 @@ from app.modules.approvals.exceptions import (
 )
 from app.modules.approvals.grants import mint_grant
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
+from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event, stage_event
 from app.modules.identity.deps import TenantContext
 from app.modules.identity.models import UserRole
@@ -125,19 +129,26 @@ def _stage(
     actor: ToolUser | None,
     payload: dict[str, Any] | None = None,
     result: dict[str, Any] | None = None,
+    actor_type: ActorType | None = None,
+    correlation_id: str | None = None,
 ) -> None:
-    """Stage a lifecycle event of one request (commits with its transition)."""
+    """Stage a lifecycle event of one request (commits with its transition).
+
+    ``actor_type`` defaults to the audit service's rule (``user`` with an
+    actor, else ``system``) and ``correlation_id`` to the request id.
+    """
     stage_event(
         session,
         tenant_id=tenant_id,
         action=action,
         actor_user_id=None if actor is None else actor.id,
+        actor_type=actor_type,
         resource_type=_RESOURCE,
         resource_id=str(request_id),
         tool_name=tool_name,
         payload=payload,
         result=result,
-        correlation_id=str(request_id),
+        correlation_id=str(request_id) if correlation_id is None else correlation_id,
     )
 
 
@@ -269,8 +280,14 @@ async def create_approval_request(
     *,
     settings: Settings,
     now: datetime | None = None,
+    actor_type: ActorType = ActorType.USER,
+    correlation_id: str | None = None,
 ) -> ApprovalRequest:
     """Persist a pending request to run ``tool_name`` with ``raw_input`` (caller commits).
+
+    ``user`` is always the requester. ``actor_type`` and ``correlation_id``
+    (default: the new request's id) apply to the ``approval.created`` event
+    only; every later event of the request is correlated by its id.
 
     Raises:
         ToolNotFoundError: unknown tool.
@@ -312,6 +329,8 @@ async def create_approval_request(
             "required_role": request.required_role,
             "expires_at": request.expires_at.isoformat(),
         },
+        actor_type=actor_type,
+        correlation_id=correlation_id,
     )
     return request
 

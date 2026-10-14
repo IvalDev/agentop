@@ -300,6 +300,50 @@ async def test_approved_execution_is_audited_and_correlated(
     assert events["tool.executed"].payload == CANONICAL_NOTE
 
 
+async def test_approval_created_defaults_to_the_user_and_the_request_id(
+    seeded_db: Database, seeded_users, approval_tools, audit_log
+) -> None:
+    """Without attribution options the requester is a ``user`` correlated by the request."""
+    admin = seeded_users[ADMIN]
+    request_id = await _create(seeded_db, approval_tools, admin)
+
+    [created] = await audit_log(seeded_db, action="approval.created")
+    assert (created.actor_type, created.actor_user_id) == (ActorType.USER, admin.id)
+    assert created.correlation_id == created.resource_id == str(request_id)
+
+
+async def test_approval_created_can_be_attributed_to_an_agent_run(
+    seeded_db: Database, seeded_users, approval_tools, audit_log
+) -> None:
+    """Only ``approval.created`` takes the caller's actor type and correlation."""
+    admin, owner = seeded_users[ADMIN], seeded_users[OWNER]
+    async with seeded_db.sessionmaker() as session:
+        request = await create_approval_request(
+            session,
+            approval_tools.registry,
+            admin,
+            "send_note",
+            NOTE,
+            settings=SETTINGS,
+            now=T0,
+            actor_type=ActorType.AGENT,
+            correlation_id="run-7",
+        )
+        await session.commit()
+        request_id = request.id
+    await _approve(seeded_db, owner, request_id)
+    await _execute(seeded_db, approval_tools, owner, request_id)
+
+    events = {event.action: event for event in await audit_log(seeded_db)}
+    created = events["approval.created"]
+    assert (created.actor_type, created.actor_user_id) == (ActorType.AGENT, admin.id)
+    assert created.correlation_id == "run-7"
+    assert (created.resource_type, created.resource_id) == ("approval_request", str(request_id))
+    for action in ("approval.approved", "tool.executed", "approval.executed"):
+        assert events[action].actor_type is ActorType.USER, action
+        assert events[action].correlation_id == str(request_id), action
+
+
 async def test_rejection_is_audited_with_its_reason(
     seeded_db: Database, seeded_users, approval_tools, audit_log
 ) -> None:

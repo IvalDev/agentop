@@ -223,6 +223,29 @@ async def test_approval_required_creates_one_pending_request_and_never_runs_it(
     assert completed.result["pending_approvals"] == [str(request.id)]
 
 
+async def test_agent_created_approval_is_attributed_to_the_run(
+    seeded_db: Database, seeded_users, registry, audit_log
+) -> None:
+    """``approval.created`` from the loop is an ``agent`` event correlated by the run id."""
+    admin = seeded_users[ADMIN]
+    llm = FakeLLMProvider([call("send_note", NOTE), answer("Submitted for approval.")])
+
+    response = await run(seeded_db, admin, deps(registry, llm))
+
+    [approval] = response.pending_approvals
+    [created] = await audit_log(seeded_db, action="approval.created")
+    assert (created.actor_type, created.actor_user_id) == (ActorType.AGENT, admin.id)
+    assert created.correlation_id == response.run_id
+    assert created.resource_id == str(approval.approval_id)
+    run_events = await audit_log(seeded_db, correlation_id=response.run_id)
+    assert [event.action for event in run_events] == [
+        "agent.run_started",
+        "tool.approval_required",
+        "approval.created",
+        "agent.run_completed",
+    ]
+
+
 # --- Robustness: malformed calls, errors, limits ------------------------------------
 
 

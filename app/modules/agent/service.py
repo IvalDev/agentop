@@ -28,9 +28,12 @@ Audit (actor = the user, ``actor_type`` agent, correlation = run id):
 ``agent.run_started``, then exactly one of ``agent.run_completed``,
 ``agent.step_limit``, or ``agent.run_failed``; ``agent.invalid_tool_call``
 for calls refused before the executor (non-object arguments, over the
-per-step cap); every executed call adds the executor's ``tool.*`` event.
-Run events carry metadata only (sizes, counts, tool names, approval ids):
-the message, history, and answer text are never written to the audit log.
+per-step cap); every executed call adds the executor's ``tool.*`` event, and
+every approval request the run submits adds its ``approval.created`` event
+(also ``agent`` with the run id; later ``approval.*`` events of that request
+are correlated by the request id). Run events carry metadata only (sizes,
+counts, tool names, approval ids): the message, history, and answer text are
+never written to the audit log.
 
 Transactions: the loop commits only the approval requests it creates
 (``EXTRACT`` tools are read-only); audit events use their own transactions.
@@ -341,6 +344,8 @@ class AgentRun:
                 payload.tool_name,
                 payload.input,
                 settings=self._deps.settings,
+                actor_type=ActorType.AGENT,
+                correlation_id=self.run_id,
             )
             approval = PendingApproval(
                 approval_id=request.id, tool_name=request.tool_name, expires_at=request.expires_at
