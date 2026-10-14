@@ -44,7 +44,8 @@ class FieldSpec:
     toward the user's connection and must never appear in onboarding state,
     API responses, logs, audit payloads, or model messages. Display metadata
     (``label``, ``help_text``) keeps the renderer code free of per-module
-    branches.
+    branches. ``options`` bounds a ``select`` field to a fixed choice list
+    (empty means unconstrained; the T4 engine enforces membership when set).
     """
 
     key: str
@@ -53,6 +54,7 @@ class FieldSpec:
     required: bool = True
     secret: bool = False
     help_text: str = ""
+    options: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

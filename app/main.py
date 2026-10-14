@@ -27,6 +27,8 @@ from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.router import router as auth_router
 from app.modules.identity.users_router import router as users_router
+from app.modules.onboarding.router import router as onboarding_router
+from app.modules.onboarding.testers import connection_testers
 from app.modules.retrieval.embeddings import build_embedding_provider
 from app.modules.retrieval.router import router as search_router
 from app.modules.tools import builtin  # noqa: F401  (registers the production tools)
@@ -189,6 +191,9 @@ def create_app() -> FastAPI:
     application.state.llm = build_llm_provider(settings)
     application.state.tool_registry = default_registry
     application.state.module_catalog = default_catalog
+    # Per-module connection testers for onboarding's test_connection steps
+    # (empty in production; module packages register theirs at import time).
+    application.state.connection_testers = connection_testers
     application.include_router(health_router)
     application.include_router(auth_router)
     application.include_router(users_router)
@@ -198,6 +203,7 @@ def create_app() -> FastAPI:
     application.include_router(audit_router)
     application.include_router(modules_router)
     application.include_router(connections_router)
+    application.include_router(onboarding_router)
     application.include_router(chat_router)
     if settings.is_development:
         # Static dev console over the public API; any other environment answers 404.

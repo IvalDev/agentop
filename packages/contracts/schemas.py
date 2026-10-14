@@ -441,3 +441,67 @@ class ConnectionCreateRequest(BaseModel):
         if not isinstance(value, str) and not value:
             raise ValueError("credentials must not be empty")
         return value
+
+
+class OnboardingFieldResponse(BaseModel):
+    """One input of the current onboarding step, for the generic renderer.
+
+    ``secret`` marks a field whose value is encrypted toward the connection
+    and never appears in onboarding state, responses, or audit payloads;
+    ``options`` is the fixed choice list of a ``select`` widget (empty when
+    unconstrained).
+    """
+
+    key: str
+    label: str
+    type: Literal["text", "email", "password", "url", "number", "select"]
+    required: bool
+    secret: bool
+    help_text: str = ""
+    options: list[str] = Field(default_factory=list)
+
+
+class OnboardingStepResponse(BaseModel):
+    """Declarative definition of the step the user is parked on."""
+
+    key: str
+    type: Literal["form", "redirect", "scope_select", "test_connection"]
+    title: str
+    description: str
+    fields: list[OnboardingFieldResponse]
+
+
+class OnboardingStateResponse(BaseModel):
+    """The caller's own onboarding state plus the current step definition.
+
+    State is derived from the authenticated principal — there is no user id
+    in the path or body, so a response can only ever describe the caller's
+    own flow. ``data`` carries the NON-secret answers only; the contract has
+    no field for secrets of any kind, so they cannot leak through
+    serialization. ``step`` is ``None`` once the flow is completed (and for
+    modules that declare no steps — those answer ``completed``).
+    ``created_at``/``updated_at`` are ``None`` while the state is still
+    virtual (no row before the first successful submit).
+    """
+
+    module_key: str
+    status: Literal["not_started", "in_progress", "completed"]
+    current_step: str | None
+    step: OnboardingStepResponse | None
+    data: dict[str, Any]
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class OnboardingStepSubmitRequest(BaseModel):
+    """Body of ``POST /api/v1/onboarding/{module_key}/steps/{step_key}``.
+
+    The step's answers keyed by field key; the engine validates them strictly
+    against the step's manifest declaration (unknown keys are rejected).
+    ``test_connection`` steps take an empty object; ``redirect`` steps are
+    refused by the engine before any answer is read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answers: dict[str, Any] = Field(default_factory=dict)
