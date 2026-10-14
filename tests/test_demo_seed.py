@@ -7,6 +7,7 @@ audit events as an upload through the API.
 
 import os
 import re
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -274,6 +275,21 @@ def test_cli_seeds_a_sqlite_file_twice_and_prints_credentials(
         assert spec.email in first and spec.default_password in first
         assert spec.email in second and spec.default_password not in second
     assert "created" in first and "existing" in second
+
+
+def test_cli_no_documents_seeds_only_the_tenant_and_team(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db_file = _cli_env(monkeypatch, tmp_path)
+
+    assert main(["--create-schema", "--no-documents"]) == 0
+
+    out = capsys.readouterr().out
+    for spec in DEMO_USERS:
+        assert spec.email in out
+    assert "Documents: 0 processed, 0 failed" in out
+    with sqlite3.connect(db_file) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM documents").fetchone() == (0,)
 
 
 def test_cli_without_schema_on_an_empty_database_hints_the_flag(

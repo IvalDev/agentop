@@ -89,6 +89,7 @@ picks another file). Variables already exported in the shell win over the file.
 | `--env-file PATH` | Loads `AA_*` settings from a file, like `uvicorn --env-file`. |
 | `--password PW` | Password for every newly created demo user (also `AA_DEMO_PASSWORD`). Default: `demo-<role>-pass`. |
 | `--force` | Seeds even when `AA_ENVIRONMENT` is not `dev`, `development`, `local`, or `test`, with a loud warning. Without it the seed refuses. |
+| `--no-documents` | Creates only the tenant and team: an empty knowledge base to fill through the console or the API. |
 
 It creates the tenant **Suministros Ficticios Demo, S.L.** (slug `demo`), its team, and the
 29 documents in `app/demo/fixtures/`, ingested through the real documents service with the

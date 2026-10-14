@@ -140,11 +140,13 @@ async def seed_demo(
     settings: Settings,
     password: str | None = None,
     fixtures_dir: Path = FIXTURES_DIR,
+    include_documents: bool = True,
 ) -> SeedSummary:
     """Ensure the demo tenant, team, and documents exist; return what happened.
 
     ``password`` overrides every new user's default development password.
-    Each document gets its own session and commits: an ingest failure
+    ``include_documents=False`` seeds only the tenant and team (an empty
+    knowledge base). Each document gets its own session and commits: an ingest failure
     rolls back that session, and must not take other documents with it.
     """
     async with db.sessionmaker() as session:
@@ -159,7 +161,7 @@ async def seed_demo(
     )
 
     documents = []
-    for path in fixture_paths(fixtures_dir):
+    for path in fixture_paths(fixtures_dir) if include_documents else []:
         async with db.sessionmaker() as session:
             documents.append(
                 await _ensure_document(
@@ -297,7 +299,13 @@ def format_summary(summary: SeedSummary) -> str:
     return "\n".join(lines)
 
 
-async def _run(settings: Settings, *, create_schema_first: bool, password: str | None):
+async def _run(
+    settings: Settings,
+    *,
+    create_schema_first: bool,
+    password: str | None,
+    include_documents: bool = True,
+):
     db = Database(
         settings.database_url,
         pool_size=settings.database_pool_size,
@@ -312,6 +320,7 @@ async def _run(settings: Settings, *, create_schema_first: bool, password: str |
             embeddings=build_embedding_provider(settings),
             settings=settings,
             password=password,
+            include_documents=include_documents,
         )
     finally:
         await db.dispose()
@@ -340,6 +349,11 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="seed even when AA_ENVIRONMENT is not a development environment",
     )
+    parser.add_argument(
+        "--no-documents",
+        action="store_true",
+        help="create only the tenant and team, without the fixture documents",
+    )
     return parser.parse_args(argv)
 
 
@@ -367,7 +381,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     password = args.password or os.environ.get(PASSWORD_ENV_VAR) or None
     try:
         summary = asyncio.run(
-            _run(settings, create_schema_first=args.create_schema, password=password)
+            _run(
+                settings,
+                create_schema_first=args.create_schema,
+                password=password,
+                include_documents=not args.no_documents,
+            )
         )
     except DBAPIError as exc:
         print(
