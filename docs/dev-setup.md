@@ -56,8 +56,8 @@ Prerequisites: Python 3.12+, an xAI API key. Run everything from the repository 
    make chat user=viewer  # as any other role
    ```
 
-   Or use the [browser console](#browser-console-development-only) at
-   <http://localhost:8000/ui/>.
+   Or use the [web app](#web-app) (`make app`, then <http://localhost:8000/>), or the
+   [browser console](#browser-console-development-only) at <http://localhost:8000/ui/>.
 
 Questions to try (the documents are in Spanish):
 
@@ -184,6 +184,78 @@ curl -s localhost:8000/api/v1/users -H "Authorization: Bearer $TOKEN" \
 
 Changing the embedding provider or model after seeding mixes incompatible vectors: delete
 `dev.db` and `var/storage` and run `make demo` again.
+
+## Web app
+
+The React app in `web/` is the product console: log in, then use **Chat**, **Base de
+conocimiento**, and **Configuración → Equipo**. Its interface is in Spain Spanish.
+Prerequisites: Node 22.22+ with npm, plus steps 1–3 of the [quick path](#quick-path-sqlite--grok--no-embedding-model).
+
+### Run it
+
+```bash
+make app
+```
+
+This installs the web dependencies when they are missing or outdated, builds `web/dist`, and
+starts the API on <http://localhost:8000/> with the same `.env` handling as `make dev`. Log in
+with company `demo` and any user of [the demo team](#the-demo-team), for example
+`admin@demo.test` / `demo-admin-pass`.
+
+| Route | Section | Who sees it | State |
+| --- | --- | --- | --- |
+| `/login` | Iniciar sesión | Everyone | Done: company, email, password |
+| `/chat` | Chat | Every role | Placeholder; streaming, citations, and history come in L3 |
+| `/conocimiento` | Base de conocimiento | Every role | Placeholder; documents and uploads come in L4 |
+| `/configuracion/equipo` | Configuración → Equipo | Owner and admin; other roles are sent to `/chat` | Placeholder; user management comes in L5 |
+
+The header shows your name and role and has **Cerrar sesión**. On a phone-width screen the
+navigation collapses behind a **Menú** button.
+
+### Develop with hot reload
+
+```bash
+make dev       # terminal 1: the API on :8000
+make web-dev   # terminal 2: Vite on http://localhost:5173, forwarding /api to :8000
+make web-test  # typecheck, lint (with jsx-a11y), and component tests with axe checks
+```
+
+After changing the frontend, `make app` (or `npm --prefix web run build`) rebuilds `web/dist`;
+the running API serves the new files without a restart.
+
+### How the API serves it
+
+| Request | Answer |
+| --- | --- |
+| `/api/...`, `/healthz`, `/docs`, `/redoc`, `/openapi.json`, `/ui` | As before; never the web app |
+| A file in `web/dist`, such as `/assets/index-<hash>.js` | The file; hashed assets are cached for a year |
+| A missing file (`/assets/...`, or a name with an extension) | 404 JSON, never the page |
+| Any other `GET` (`/`, `/chat`, ...) | `index.html`, and the app routes on the client |
+
+The app is mounted in every environment, but only when `web/dist/index.html` exists
+(`AA_WEB_DIST_DIR` points elsewhere). Without a build, backend-only development and the test
+suite work as before.
+
+### Session and security
+
+- The access token lives in memory and in the tab's `sessionStorage`: a reload keeps you
+  logged in, closing the tab logs you out, and it never goes to `localStorage` or cookies.
+- The API has no refresh token. After `AA_ACCESS_TOKEN_EXPIRE_MINUTES` (30 by default) any
+  request answers 401 and the app returns to the login page with "Tu sesión ha caducado".
+  Planned: an httpOnly refresh cookie.
+- The email is trimmed and lowercased before login, because the API compares it exactly.
+- Server text is always rendered as text, and the app loads no external scripts, fonts, or CDNs.
+
+### Code layout
+
+| Path in `web/src` | Holds |
+| --- | --- |
+| `i18n/` | `es-ES.ts` catalog (every visible string) and `t()`, `formatDate()`, `formatNumber()` |
+| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling) and auth calls |
+| `session/` | `SessionProvider`, `useSession()`, roles, token storage |
+| `components/` | Presentational atoms, molecules, organisms, and templates |
+| `pages/`, `routes/` | Route containers, guards (`RequireAuth`, `RequireRole`), and `paths` |
+| `test/` | Fake API, `renderApp()`, and the axe helper |
 
 ## Browser console (development only)
 
