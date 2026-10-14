@@ -3,7 +3,8 @@
 Run the whole agent on a modest laptop against a **fictional demo company**: one SQLite
 file instead of Postgres, the chat model hosted by xAI (Grok) instead of local inference,
 and no embedding model at all (or a single small one). You get a seeded team with one user
-per role, about a dozen synthetic Spanish business documents, and a console chat client.
+per role, 29 synthetic Spanish business documents about the company and its staff, and a
+console chat client.
 
 > **Privacy warning — read before using an external model.**
 > With the Grok profile every chat message, the conversation history, and every document
@@ -61,6 +62,10 @@ Questions to try (the documents are in Spanish):
 - ¿Quién tiene que aprobar la factura TIS-2026-0150 según el procedimiento interno?
 - ¿Cuánto pagamos al mes por la oficina, IVA incluido?
 - ¿Qué reclama Comercial Ejemplo Levante sobre la factura V-2026-0031?
+- ¿Cuántas personas trabajan en la empresa y quién dirige cada departamento?
+- ¿Quién lleva la contabilidad y cuál es su extensión?
+- ¿Dónde está el almacén y en qué horario se recibe la mercancía?
+- ¿A quién pido las vacaciones y con cuánta antelación?
 
 ## What the commands do
 
@@ -83,9 +88,20 @@ picks another file). Variables already exported in the shell win over the file.
 | `--force` | Seeds even when `AA_ENVIRONMENT` is not `dev`, `development`, `local`, or `test`, with a loud warning. Without it the seed refuses. |
 
 It creates the tenant **Suministros Ficticios Demo, S.L.** (slug `demo`), its team, and the
-documents in `app/demo/fixtures/` — five invoices, two contracts, three emails, and an
-internal payment procedure — ingested through the real documents service with the owner
-as the acting user, so chunks, citation offsets, embeddings, and audit events are real.
+29 documents in `app/demo/fixtures/`, ingested through the real documents service with the
+owner as the acting user, so chunks, citation offsets, embeddings, and audit events are real:
+
+| Prefix | Count | Documents |
+| --- | --- | --- |
+| `empresa_` | 7 | General data, statutes, sites and addresses, org chart and staff directory, main clients and suppliers, product catalogue, internal FAQ |
+| `empleado_` | 8 | One record per employee, including the four demo users |
+| `rrhh_` | 3 | Welcome manual, leave policy, 2026 work calendar |
+| `factura_`, `contrato_`, `correo_`, `procedimiento_` | 5, 2, 3, 1 | Invoices, contracts, emails, and the internal payment procedure |
+
+Employee records deliberately omit sensitive personal data (ID numbers, salary, bank
+accounts, home address, personal phone, date of birth, health or family data): documents
+have no per-role permissions, so every role, viewer included, can retrieve every document.
+`tests/test_demo_seed.py` checks the records for ID numbers, IBANs, and pay amounts.
 
 Re-running keeps existing rows untouched (a changed password is not reset; the summary
 shows `(unchanged)`) and retries documents whose ingest failed, for example because

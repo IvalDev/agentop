@@ -17,6 +17,7 @@ from app.core.config import Settings
 from app.core.db import Database
 from app.demo.chat import iter_sse
 from app.demo.seed import (
+    FIXTURES_DIR,
     EnvironmentNotAllowedError,
     check_environment,
     fixture_paths,
@@ -80,6 +81,9 @@ def test_fixture_set_covers_the_demo_business_documents() -> None:
     assert len([name for name in names if name.startswith("contrato_")]) >= 2
     assert len([name for name in names if name.startswith("correo_")]) >= 3
     assert len([name for name in names if name.startswith("procedimiento_")]) >= 1
+    assert len([name for name in names if name.startswith("empresa_")]) >= 5
+    assert len([name for name in names if name.startswith("empleado_")]) >= 6
+    assert len([name for name in names if name.startswith("rrhh_")]) >= 2
     assert all(path.suffix in {".md", ".txt"} for path in fixture_paths())
 
 
@@ -380,6 +384,80 @@ def test_fixture_contains_only_obviously_fictional_data(path: Path) -> None:
     for iban in IBAN.findall(text):
         assert set(re.sub(r"\D", "", iban)) == {"0"}, f"real-looking IBAN {iban}"
     assert "ficticio" in text.lower()
+
+
+STAFF_DIRECTORY = "empresa_organigrama_directorio_personal.md"
+EMPLOYEE_RECORDS = [path for path in fixture_paths() if path.name.startswith("empleado_")]
+FULL_NAME_FIELD = re.compile(r"^- \*\*Nombre completo:\*\* (.+)$", re.MULTILINE)
+DNI_OR_NIE = re.compile(r"\b[XYZ]?\d{7,8}-?[A-Z]\b")
+IBAN_LIKE = re.compile(r"\bES\d{2}")
+PAY_TERMS = re.compile(r"(?i)\b(?:salario|sueldo|n[oó]minas?|retribuci[oó]n|bruto anual)\b")
+
+
+def _employee_names() -> dict[str, str]:
+    """The full name each employee record declares, keyed by file name."""
+    names = {}
+    for path in EMPLOYEE_RECORDS:
+        match = FULL_NAME_FIELD.search(path.read_text(encoding="utf-8"))
+        assert match, f"{path.name} declares no '- **Nombre completo:** ...' field"
+        names[path.name] = match.group(1).strip()
+    return names
+
+
+def _sensitive_findings(text: str) -> list[str]:
+    """ID numbers, bank accounts, and pay amounts (a pay term and a digit on one line)."""
+    findings = DNI_OR_NIE.findall(text) + IBAN_LIKE.findall(text)
+    findings += [
+        line for line in text.splitlines() if PAY_TERMS.search(line) and re.search(r"\d", line)
+    ]
+    return findings
+
+
+def test_every_demo_user_has_an_employee_record() -> None:
+    recorded = set(_employee_names().values())
+
+    missing = sorted(spec.full_name for spec in DEMO_USERS if spec.full_name not in recorded)
+
+    assert not missing, f"no empleado_*.md record for {missing}"
+
+
+def test_staff_directory_lists_every_employee_and_the_headcount() -> None:
+    directory = (FIXTURES_DIR / STAFF_DIRECTORY).read_text(encoding="utf-8")
+    names = _employee_names()
+    people = set(names.values()) | {spec.full_name for spec in DEMO_USERS}
+
+    missing = sorted(name for name in people if name not in directory)
+
+    assert not missing, f"{STAFF_DIRECTORY} does not list {missing}"
+    assert f"{len(names)} personas" in directory
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "DNI: 12345678Z",
+        "NIE X1234567L",
+        "Cuenta: ES76 1234 5678 9012 3456 7890",
+        "Salario bruto anual: 24.000 €",
+        "Nómina de marzo de 1.800,00 €",
+    ],
+)
+def test_sensitive_data_guard_flags_personal_identifiers_and_pay(text: str) -> None:
+    assert _sensitive_findings(text)
+
+
+def test_sensitive_data_guard_accepts_work_data() -> None:
+    text = "Aprueba compras de hasta 1.000 € (PRC-FIN-02).\nPrepara las nóminas con la asesoría."
+
+    assert _sensitive_findings(text) == []
+
+
+@pytest.mark.parametrize("path", EMPLOYEE_RECORDS, ids=lambda path: path.name)
+def test_employee_record_omits_sensitive_personal_data(path: Path) -> None:
+    """Documents have no per-role permissions: any role, viewer included, reads them."""
+    text = path.read_text(encoding="utf-8")
+
+    assert _sensitive_findings(text) == [], path.name
 
 
 def test_demo_team_is_obviously_fictional() -> None:
