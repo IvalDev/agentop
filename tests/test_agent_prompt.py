@@ -55,6 +55,19 @@ def test_system_prompt_states_the_security_policy() -> None:
     assert "[1]" in SYSTEM_PROMPT
 
 
+def test_system_prompt_grounds_every_answer_in_the_knowledge_base() -> None:
+    """Facts come only from searched passages: no general knowledge, no guessing."""
+    prompt = " ".join(SYSTEM_PROMPT.lower().split())
+
+    assert "only source of facts" in prompt
+    assert "never answer from general knowledge" in prompt
+    assert "call search_documents before answering" in prompt
+    assert "the knowledge base has no information" in prompt
+    assert "a statement you cannot cite must not be in your answer" in prompt
+    assert "never claim a capability your tools do not provide" in prompt
+    assert "when you use document passages" not in prompt
+
+
 def test_build_messages_puts_the_policy_first_and_alone() -> None:
     """One system message (the policy), then history, then the new user turn."""
     history = [

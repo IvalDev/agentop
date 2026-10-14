@@ -61,6 +61,8 @@ Las pymes ejecutan tareas administrativas repetitivas dispersas en correo, carpe
   - Hallazgo a resolver dentro de T9.4 (verificado 2026-10-14 sobre un servidor temporal): la subida guarda el `content_type` que envía el cliente y la ingesta elige el extractor con él; `curl -F file=@x.md` envía `application/octet-stream` y la ingesta responde 422 `unsupported content type`. Los navegadores tampoco garantizan `text/markdown` para `.md`. Inferir el tipo por extensión cuando llega vacío u `application/octet-stream`, con test
   - Checks: tests del montaje de estáticos (solo en dev) y de la inferencia de tipo; recorrido manual completo (login → subir → ingestar → buscar → chat) en `docs/dev-setup.md`
   - Ruta prevista: delegated direct (writer; trigger: 2+ archivos no triviales)
+- [ ] T9.5 — Respuestas solo desde la base de conocimiento (pedido del humano 2026-10-14: "contestar únicamente desde su base de conocimiento; no inventar ni alucinar"). El prompt de sistema decía "cuando uses pasajes, respondé solo desde ellos", condicional que permitía responder de conocimiento general sin buscar. Política nueva: la base de conocimiento es la única fuente de hechos; buscar antes de responder; nada sin cita; si no está, decirlo. Test de la política en `tests/test_agent_prompt.py` (RED antes del cambio) y prueba en vivo con Groq. Refuerzo estructural (forzar búsqueda en el primer paso con `tool_choice`) solo si la prueba muestra que el modelo responde sin buscar
+  - Ruta: direct inline (una constante + un test; sin investigación pendiente)
 - [x] T10 — Integración: chat endpoint end-to-end con RAG + herramientas + aprobación + auditoría sobre fixtures — commits `503ef9c` (T10.a) + `ac1229f` (T10.b); ruff ✓, format ✓, pytest 373 passed; RDD: medium (slice_budget_reached, slice T9.2+T10 desde `f95d390`), consent declined_this_candidate (omisión puntual)
   - [x] T10.a — `approval.created` originado por el agente queda con `actor_type=agent` y `correlation_id` = run id (kwargs en `create_approval_request`, por defecto sin cambios para el resto de llamadores); los demás eventos `approval.*` mantienen correlación = approval id
   - [x] T10.b — Suite e2e solo por HTTP sobre el tenant demo sembrado con `app.demo.seed` (fixtures sintéticos, embeddings fake, `FakeLLMProvider` guionado): respuesta RAG con cita verificable (doc_id + offsets contra el texto almacenado), cadena de aprobación con herramienta ACTION solo de test (pendiente → viewer no la ve → admin aprueba → ejecuta → re-ejecución 409), rastro de auditoría completo por run id y approval id (criterio 6, sin texto de conversación en `agent.*`), aislamiento frente a otro tenant y la misma cadena por `/chat/stream`
@@ -71,6 +73,17 @@ Las pymes ejecutan tareas administrativas repetitivas dispersas en correo, carpe
   - [ ] T11.c — **Diferida a la fase de módulos de negocio.** Prueba viviente: suite e2e por HTTP sobre el tenant demo (chat → `extract_invoice` → `register_invoice` → aprobación por importe → ejecución → factura registrada → rastro de auditoría; factura > 1.000 € no la aprueba un operator; duplicado rechazado; valores inventados rechazados por precheck) + guía en `docs/dev-setup.md`
   - Ruta: delegated direct, un writer por sub-tarea (trigger: 2+ archivos no triviales + lectura que prepara la escritura). Un commit por sub-tarea.
 - [ ] T12 — Deployment: docker-compose de producción por cliente, backup/restore, documentación de operaciones
+
+## Backlog de mejoras del agente (anotado 2026-10-14; sin autorizar)
+
+- Ingesta: un documento sin texto extraíble (PDF de solo imágenes, p. ej. impreso desde el navegador) queda `processed` con un chunk de solo espacios que aparece en todas las búsquedas. Debe fallar con un mensaje claro ("sin texto extraíble: ¿escaneado o imagen?"). OCR fuera de alcance por ahora (pesado para la máquina de desarrollo)
+- Embeddings: el 502 oculta el cuerpo del error de Ollama (`model "nomic-embed-text" not found, try pulling it first`); mostrarlo
+- Consola `/ui`: botón para reintentar la ingesta de documentos `failed` (el servicio ya lo permite)
+- Búsqueda por palabras: el puntaje cuenta substrings, así que palabras comunes ("de", "demo", "oficina") dominan el ranking
+- Evaluación de retrieval (preguntas con documento esperado → hit@k / MRR por modo y modelo) y prueba de un modelo multilingüe de 768 dimensiones (`nomic-embed-text-v2-moe`) para documentos en español
+- `/ui`: declarar los estáticos como package data; `environment` por defecto es `dev`, así que un despliegue sin `AA_ENVIRONMENT` monta `/ui`
+- Plantilla y guía para Groq (la guía y `grok.env.example` siguen hablando de xAI Grok)
+- Inconsistencias en fixtures previos detectadas en T9.3
 
 ## Authorized scope
 
