@@ -73,6 +73,44 @@ export const esES = {
       description: 'Da de alta a las personas de tu empresa y gestiona sus roles.',
     },
   },
+  chat: {
+    logLabel: 'Conversación',
+    empty: 'Todavía no hay mensajes. Escribe tu pregunta para empezar.',
+    you: 'Tú',
+    assistant: 'Asistente',
+    messageLabel: 'Mensaje',
+    messageHint: 'Pulsa Intro para enviar y Mayús + Intro para añadir una línea.',
+    messageRequired: 'Escribe un mensaje antes de enviarlo.',
+    send: 'Enviar',
+    stop: 'Detener',
+    reset: 'Nueva conversación',
+    resetDone: 'Has empezado una conversación nueva.',
+    activity: {
+      thinking: 'Preparando la respuesta…',
+      searching: 'Buscando en la base de conocimiento…',
+      usingTool: 'Consultando una herramienta…',
+    },
+    sources: 'Fuentes',
+    sourceSummary: '[{number}] {document}',
+    sourceLink: '[{number}] Fuente: {document}',
+    approval:
+      'Esta acción necesita aprobación y no se ejecutará hasta que una persona autorizada la apruebe. ' +
+      'Identificador de la aprobación: {id}. Caduca el {expiresAt}.',
+    answerAnnouncement: 'Respuesta del asistente: {answer}',
+    notices: {
+      stepLimit:
+        'El asistente no ha podido terminar la respuesta en el número de pasos permitido. ' +
+        'Concreta la pregunta o inténtalo de nuevo.',
+      stopped: 'Has detenido la respuesta.',
+    },
+    errors: {
+      modelUnavailable: 'El asistente no está disponible en este momento. Inténtalo de nuevo más tarde.',
+      network: 'No se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
+      interrupted: 'La respuesta se ha interrumpido. Inténtalo de nuevo.',
+      invalidMessage: 'No se ha podido enviar el mensaje. Revisa su longitud e inténtalo de nuevo.',
+      unexpected: 'Se ha producido un error inesperado. Inténtalo de nuevo.',
+    },
+  },
   notFound: {
     title: 'Página no encontrada',
     description: 'La dirección que has abierto no existe.',

@@ -205,12 +205,38 @@ with company `demo` and any user of [the demo team](#the-demo-team), for example
 | Route | Section | Who sees it | State |
 | --- | --- | --- | --- |
 | `/login` | Iniciar sesión | Everyone | Done: company, email, password |
-| `/chat` | Chat | Every role | Placeholder; streaming, citations, and history come in L3 |
+| `/chat` | Chat | Every role | Done: streamed answers, sources, history, stop, and reset ([below](#chat)) |
 | `/conocimiento` | Base de conocimiento | Every role | Placeholder; documents and uploads come in L4 |
 | `/configuracion/equipo` | Configuración → Equipo | Owner and admin; other roles are sent to `/chat` | Placeholder; user management comes in L5 |
 
 The header shows your name and role and has **Cerrar sesión**. On a phone-width screen the
 navigation collapses behind a **Menú** button.
+
+### Chat
+
+The Chat section talks to `POST /api/v1/chat/stream` (Server-Sent Events), like the dev
+console and `python -m app.demo.chat`.
+
+- **Mensaje** is a multi-line field: Enter sends, Shift+Enter adds a line, and **Enviar** does
+  the same. Focus stays in the field after sending. Messages are limited to 4000 characters.
+- The answer appears as it streams. While the agent works it shows what it is doing:
+  "Buscando en la base de conocimiento…" for `search_documents`, a generic message for any
+  other tool (tool names are never shown). The `done` event's answer replaces the streamed
+  text.
+- Under each answer, **Fuentes** lists the cited documents; each opens to show the cited
+  excerpt. The `[n]` markers in the answer stay as typed and link to their source.
+- Answers, excerpts, and file names are untrusted text: shown as plain text, never as
+  Markdown or HTML.
+- An approval request shows a notice with its id and expiry; there is no approvals panel yet.
+- Errors and stops are shown in Spanish, never the API's English text: model unavailable,
+  connection lost, answer cut short, or the step limit (`stop_reason: step_limit`).
+- **Detener** aborts the request and keeps the text that had arrived. **Nueva conversación**
+  stops any answer and forgets the history.
+- Each message replays the last 10 messages of answered turns as history, with assistant text
+  cut to 4000 characters. Stopped or failed turns are not replayed. The conversation lives in
+  memory: it survives visiting other sections, and a reload or **Cerrar sesión** clears it.
+- Screen readers: the conversation is a `log` that does not read tokens as they arrive; a
+  polite status announces the agent's activity and then the finished answer once.
 
 ### Develop with hot reload
 
@@ -263,11 +289,12 @@ suite work as before.
 | Path in `web/src` | Holds |
 | --- | --- |
 | `i18n/` | `es-ES.ts` catalog (every visible string) and `t()`, `formatDate()`, `formatNumber()` |
-| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling) and auth calls |
+| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling), auth calls, and `chat.ts` (SSE parser, typed chat events) |
 | `session/` | `SessionProvider`, `useSession()`, roles, token storage |
+| `chat/` | `ChatProvider` and `useChat()` (the conversation, mounted by the dashboard shell), its reducer, history, and message texts |
 | `components/` | Presentational atoms, molecules, organisms, and templates |
 | `pages/`, `routes/` | Route containers, guards (`RequireAuth`, `RequireRole`), and `paths` |
-| `test/` | Fake API, `renderApp()`, and the axe helper |
+| `test/` | Fake API, `renderApp()`, the axe helper, and `fakeChat.ts` (scripted SSE streams cut mid-line and mid-character) |
 
 ## Browser console (development only)
 

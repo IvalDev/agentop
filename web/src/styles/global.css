@@ -356,6 +356,124 @@ main:focus {
   border-radius: var(--radius);
 }
 
+/* Chat */
+.field__input--multiline {
+  min-height: 5rem;
+  resize: vertical;
+}
+
+.chat-log__turns {
+  display: grid;
+  gap: var(--space-6);
+}
+
+.chat-log__empty {
+  color: var(--color-text-muted);
+}
+
+.chat-turn {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.chat-message {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius);
+}
+
+.chat-message--user {
+  justify-self: end;
+  max-width: min(100%, 40rem);
+  background: var(--color-surface);
+}
+
+.chat-message--assistant {
+  border: 1px solid var(--color-divider);
+}
+
+.chat-message__author {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+/* Model and user text is plain text: keep its line breaks, wrap long words. */
+.chat-message__text,
+.cited-text,
+.citation__excerpt {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chat-message__activity {
+  color: var(--color-text-muted);
+  font-style: italic;
+}
+
+.cited-text__marker {
+  font-weight: 600;
+}
+
+.chat-notice {
+  padding: var(--space-2) var(--space-3);
+  border-left: 4px solid currentColor;
+  border-radius: var(--radius);
+}
+
+.chat-notice--info {
+  background: var(--color-info-bg);
+  color: var(--color-primary-strong);
+}
+
+.chat-notice--error {
+  background: var(--color-error-bg);
+  color: var(--color-error);
+}
+
+.citations {
+  display: grid;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--color-divider);
+}
+
+.citations__title {
+  font-size: 1rem;
+}
+
+.citations__list {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding-left: 0;
+  list-style: none;
+}
+
+.citation__summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.citation__excerpt {
+  margin-top: var(--space-2);
+  padding-left: var(--space-3);
+  border-left: 3px solid var(--color-divider);
+  color: var(--color-text-muted);
+}
+
+/* The field stays in view at the bottom while the conversation scrolls. */
+.chat-composer {
+  position: sticky;
+  bottom: 0;
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-3) 0 var(--space-4);
+  border-top: 1px solid var(--color-divider);
+  background: var(--color-bg);
+}
+
 /* Phone width: the navigation collapses behind the "Menú" toggle. */
 @media (max-width: 47.99rem) {
   .main-nav {
