@@ -27,6 +27,7 @@ from app.core.db import Database, get_session
 from app.core.deps import get_settings
 from app.modules.agent.llm import LLMError
 from app.modules.agent.service import AgentDeps, AgentRun, run_agent
+from app.modules.documents.router import StorageDep
 from app.modules.identity.deps import CurrentUser, get_current_user
 from app.modules.retrieval.router import EmbeddingsDep
 from packages.contracts.schemas import ChatRequest, ChatResponse
@@ -42,13 +43,16 @@ SettingsDep = Annotated[Settings, Depends(get_settings)]
 _LLM_UNAVAILABLE = "language model unavailable"
 
 
-def get_agent_deps(request: Request, settings: SettingsDep, embeddings: EmbeddingsDep) -> AgentDeps:
-    """Collaborators of a run from ``app.state`` (registry, model, embeddings)."""
+def get_agent_deps(
+    request: Request, settings: SettingsDep, embeddings: EmbeddingsDep, storage: StorageDep
+) -> AgentDeps:
+    """Collaborators of a run from ``app.state`` (registry, model, embeddings, storage)."""
     return AgentDeps(
         registry=request.app.state.tool_registry,
         llm=request.app.state.llm,
         embeddings=embeddings,
         settings=settings,
+        storage=storage,
     )
 
 

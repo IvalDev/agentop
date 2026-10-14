@@ -7,6 +7,13 @@ are part of the public surface reserved for the approval/execution layers
 conditions as ``ToolExecutionResult(status="error")`` values instead of
 raising, so API handlers never need to translate tool errors into HTTP
 responses by hand.
+
+Tools raise :class:`ToolPrecheckError` from their ``precheck`` to refuse a
+call (the executor turns it into a ``precheck_failed`` result).
+:class:`ToolApprovalRoleError` is raised by
+:func:`~app.modules.tools.executor.resolve_approval_role` when a tool's
+``approval_role`` resolver fails, so no caller ever falls back to a guessed
+approver.
 """
 
 
@@ -28,3 +35,21 @@ class ToolPermissionError(ToolError):
 
 class ToolExecutionError(ToolError):
     """A tool handler failed while executing."""
+
+
+class ToolApprovalRoleError(ToolError):
+    """A tool's ``approval_role`` resolver raised or returned no valid role."""
+
+
+class ToolPrecheckError(ToolError):
+    """A tool's precheck refused the call against current tenant state.
+
+    ``reason`` must be short and safe to show: the executor returns it to the
+    caller as ``precheck_failed: <reason>``, the agent shows it to the model,
+    and the approvals service stores it as the request's execution error. It
+    must never carry internals, secrets, or another tenant's data.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason

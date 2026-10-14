@@ -238,6 +238,29 @@ async def test_chat_returns_pending_approvals_readable_through_the_approvals_api
     assert approval_tools.spy.calls == []
 
 
+async def test_chat_gives_tools_the_apps_llm_and_storage(
+    chat_app: FastAPI, chat_client: AsyncClient, approval_tools
+) -> None:
+    """The chat route wires ``app.state.llm`` and ``app.state.storage`` into tool calls."""
+    chat_app.state.tool_registry = approval_tools.registry
+    note = {"to": "ops@acme.test", "body": "Report ready"}
+    chat_app.state.llm = FakeLLMProvider(
+        [
+            AssistantMessage(content="", tool_calls=(ToolCall("peek_note", note),)),
+            AssistantMessage(content="Peeked."),
+        ]
+    )
+
+    response = await chat_client.post(
+        "/api/v1/chat", json={"message": "Peek"}, headers=await _headers(chat_client)
+    )
+
+    assert response.status_code == 200, response.text
+    [context] = approval_tools.spy.contexts
+    assert context.llm is chat_app.state.llm
+    assert context.storage is chat_app.state.storage
+
+
 async def test_chat_stream_emits_typed_events_in_order(
     chat_app: FastAPI, chat_client: AsyncClient, seeded_db: Database, storage
 ) -> None:

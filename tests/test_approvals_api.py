@@ -11,28 +11,36 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import update
 
 from app.core.config import Settings
 from app.core.db import Database
 from app.main import create_app
+from app.modules.approvals.models import ApprovalRequest
 from app.modules.approvals.service import approve_request, create_approval_request
 
 TTL_SECONDS = 3600
 APPROVAL_SETTINGS = Settings(approval_ttl_seconds=TTL_SECONDS)
 NOTE = {"to": "ops@acme.test", "body": "Quarterly report is ready"}
+#: ``route_note`` input that only an owner may approve (``note_approver`` in conftest).
+OWNER_TIER_NOTE = {**NOTE, "priority": 5}
 BASE = "/api/v1/approvals"
 
 
 @pytest.fixture
-async def approvals_client(
-    seeded_db: Database, identity_settings: Settings, approval_tools
-) -> AsyncClient:
-    """HTTP client bound to an app whose tool registry holds test-only tools."""
+def approvals_app(seeded_db: Database, identity_settings: Settings, approval_tools) -> FastAPI:
+    """App whose tool registry holds the test-only tools."""
     application: FastAPI = create_app()
     application.state.db = seeded_db
     application.state.settings = identity_settings
     application.state.tool_registry = approval_tools.registry
-    transport = ASGITransport(app=application)
+    return application
+
+
+@pytest.fixture
+async def approvals_client(approvals_app: FastAPI) -> AsyncClient:
+    """HTTP client bound to :func:`approvals_app`."""
+    transport = ASGITransport(app=approvals_app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
 
@@ -64,11 +72,12 @@ async def _create(
     now: datetime | None = None,
     approve_at: datetime | None = None,
     tool: str = "send_note",
+    raw_input: dict = NOTE,
 ) -> UUID:
     """Create (and optionally approve) a ``tool`` request via the service."""
     async with db.sessionmaker() as session:
         request = await create_approval_request(
-            session, tools.registry, user, tool, NOTE, settings=APPROVAL_SETTINGS, now=now
+            session, tools.registry, user, tool, raw_input, settings=APPROVAL_SETTINGS, now=now
         )
         await session.commit()
         if approve_at is not None:
@@ -266,3 +275,96 @@ async def test_expired_approval_cannot_execute(
 
     assert response.status_code == 410
     assert approval_tools.spy.calls == []
+
+
+# --- Per-request approver role and precheck (T11.a) ------------------------------
+
+
+async def test_owner_tier_request_is_invisible_below_owner(
+    approvals_client: AsyncClient, seeded_db: Database, seeded_users, tiered_tools
+) -> None:
+    """The stored per-request role drives the read filter, not the tool's invocation role."""
+    request_id = await _create(
+        seeded_db,
+        tiered_tools,
+        seeded_users["owner@acme.test"],
+        tool="route_note",
+        raw_input=OWNER_TIER_NOTE,
+    )
+    admin = await _admin(approvals_client)
+
+    listed = await approvals_client.get(BASE, headers=admin)
+    fetched = await approvals_client.get(f"{BASE}/{request_id}", headers=admin)
+    approved = await approvals_client.post(f"{BASE}/{request_id}/approve", headers=admin)
+    as_owner = await approvals_client.get(
+        f"{BASE}/{request_id}", headers=await _owner(approvals_client)
+    )
+
+    assert listed.json()["approvals"] == []
+    assert (fetched.status_code, approved.status_code) == (403, 403)
+    assert as_owner.status_code == 200
+    assert as_owner.json()["required_role"] == "owner"
+
+
+async def test_tampered_approver_role_is_a_binding_conflict(
+    approvals_client: AsyncClient, seeded_db: Database, seeded_users, tiered_tools
+) -> None:
+    """Lowering the stored role after approval answers 409 and burns the request."""
+    request_id = await _create(
+        seeded_db,
+        tiered_tools,
+        seeded_users["owner@acme.test"],
+        approve_at=datetime.now(UTC),
+        tool="route_note",
+        raw_input=OWNER_TIER_NOTE,
+    )
+    async with seeded_db.sessionmaker() as session:
+        await session.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == request_id)
+            .values(required_role="admin")
+        )
+        await session.commit()
+
+    response = await approvals_client.post(
+        f"{BASE}/{request_id}/execute", headers=await _admin(approvals_client)
+    )
+    fetched = await approvals_client.get(
+        f"{BASE}/{request_id}", headers=await _owner(approvals_client)
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "approval binding mismatch"}
+    assert fetched.json()["status"] == "failed"
+    assert tiered_tools.spy.calls == []
+
+
+async def test_precheck_refusal_at_execution_answers_failed_with_app_services(
+    approvals_app: FastAPI,
+    approvals_client: AsyncClient,
+    seeded_db: Database,
+    seeded_users,
+    tiered_tools,
+) -> None:
+    """The route passes the app's model and storage; a refusal is a consumed, failed run."""
+    request_id = await _create(
+        seeded_db,
+        tiered_tools,
+        seeded_users["owner@acme.test"],
+        approve_at=datetime.now(UTC),
+        tool="route_note",
+    )
+    tiered_tools.precheck.refusal = "note already routed"
+    headers = await _owner(approvals_client)
+
+    executed = await approvals_client.post(f"{BASE}/{request_id}/execute", headers=headers)
+    replayed = await approvals_client.post(f"{BASE}/{request_id}/execute", headers=headers)
+
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "failed"
+    assert executed.json()["execution_error"] == "precheck_failed: note already routed"
+    assert replayed.status_code == 409
+    assert tiered_tools.spy.calls == []
+    [context] = tiered_tools.precheck.contexts
+    assert context.llm is approvals_app.state.llm
+    assert context.storage is approvals_app.state.storage

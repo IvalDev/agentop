@@ -1,9 +1,10 @@
 """Tool registry tests: registration invariants and lookup errors.
 
 Covers the T6 registration contract: valid specs register and round-trip;
-duplicate names, invalid names, missing input models, and the
-ACTION-must-require-approval invariant all raise ``ToolRegistrationError``;
-unknown lookups raise ``ToolNotFoundError``.
+duplicate names, invalid names, missing input models, the
+ACTION-must-require-approval invariant, and the T11 hook invariants
+(``approval_role`` only on ``REQUIRE_APPROVAL`` tools, callable hooks) all
+raise ``ToolRegistrationError``; unknown lookups raise ``ToolNotFoundError``.
 """
 
 import pytest
@@ -35,6 +36,8 @@ def build_spec(
     required_role: UserRole = UserRole.OPERATOR,
     input_model: type[BaseModel] | None = DemoInput,
     handler=stub_handler,
+    approval_role=None,
+    precheck=None,
 ) -> ToolSpec:
     """Build a ToolSpec with test defaults; individual fields can be overridden."""
     return ToolSpec(
@@ -45,7 +48,18 @@ def build_spec(
         required_role=required_role,
         handler=handler,
         input_model=input_model,
+        approval_role=approval_role,
+        precheck=precheck,
     )
+
+
+def owner_approves(validated_input) -> UserRole:
+    """Approver-role resolver used by the hook invariant tests."""
+    return UserRole.OWNER
+
+
+async def stub_precheck(context, validated_input) -> None:
+    """Precheck that always lets the call through."""
 
 
 def test_register_and_get_round_trip() -> None:
@@ -133,6 +147,54 @@ def test_non_callable_handler_raises() -> None:
     spec = build_spec(handler="not-a-callable")
 
     with pytest.raises(ToolRegistrationError, match="handler"):
+        registry.register(spec)
+
+
+def test_approval_role_on_an_auto_tool_raises() -> None:
+    """A per-request approver only makes sense on a tool that needs approval."""
+    registry = ToolRegistry()
+    spec = build_spec(approval_policy=ApprovalPolicy.AUTO, approval_role=owner_approves)
+
+    with pytest.raises(ToolRegistrationError, match="approval_role"):
+        registry.register(spec)
+
+
+def test_approval_role_and_precheck_register_on_an_approval_tool() -> None:
+    """Both hooks are accepted on a REQUIRE_APPROVAL tool and kept on the spec."""
+    registry = ToolRegistry()
+    spec = build_spec(
+        kind=ToolKind.ACTION,
+        approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+        approval_role=owner_approves,
+        precheck=stub_precheck,
+    )
+
+    registry.register(spec)
+
+    stored = registry.get(spec.name)
+    assert (stored.approval_role, stored.precheck) == (owner_approves, stub_precheck)
+
+
+def test_precheck_registers_on_an_auto_tool() -> None:
+    """A precheck needs no approval policy: AUTO tools may verify state too."""
+    registry = ToolRegistry()
+
+    registry.register(build_spec(precheck=stub_precheck))
+
+    assert registry.get("demo_tool").precheck is stub_precheck
+
+
+@pytest.mark.parametrize("hook", ["approval_role", "precheck"])
+def test_non_callable_hook_raises(hook: str) -> None:
+    """Hooks are checked at registration, not at the first call."""
+    registry = ToolRegistry()
+    spec = build_spec(
+        kind=ToolKind.ACTION,
+        approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+        **{hook: "not-a-callable"},
+    )
+
+    with pytest.raises(ToolRegistrationError, match=hook):
         registry.register(spec)
 
 

@@ -10,15 +10,18 @@ the audit correlation id of everything the run does):
 2. A reply without tool calls is the final answer. Otherwise each call (at
    most :data:`MAX_TOOL_CALLS_PER_STEP` per reply) runs through
    :func:`~app.modules.tools.executor.execute_tool` as actor ``agent`` with
-   the run id as correlation id, its result goes back as a ``tool`` message,
+   the run id as correlation id (tools get the run's ``llm`` and document
+   ``storage`` in their context), its result goes back as a ``tool`` message,
    and the model is asked again — at most ``Settings.agent_max_steps`` model
    calls per run. When that budget is spent the run stops with
    :data:`STEP_LIMIT_ANSWER`; calls requested on the last step never run.
 3. Outcomes the model sees: ``ok`` → delimited output (search hits become
    numbered passages to cite); refusals and failures → a short error code
-   (validation errors also name the failing fields); ``approval_required``
-   → an approval request is created through the approvals service (once per
-   action key per run) and the model is told it is pending. The loop never
+   (validation errors also name the failing fields, and ``precheck_failed``
+   carries the tool's user-safe reason so the model can explain it);
+   ``approval_required`` → an approval request is created through the
+   approvals service (once per action key per run, with the call's resolved
+   approver role) and the model is told it is pending. The loop never
    passes a grant or ``dry_run``: the model cannot approve or rehearse
    anything (decision A7).
 4. ``citations`` are the passages whose ``[n]`` markers appear in the
@@ -71,9 +74,10 @@ from app.modules.approvals.exceptions import ApprovalError
 from app.modules.approvals.service import create_approval_request
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
+from app.modules.documents.storage import DocumentStorage
 from app.modules.retrieval.embeddings import EmbeddingProvider
 from app.modules.tools.builtin import SearchDocumentsOutput
-from app.modules.tools.exceptions import ToolNotFoundError
+from app.modules.tools.exceptions import ToolError
 from app.modules.tools.executor import (
     ApprovalRequestPayload,
     ToolExecutionResult,
@@ -97,8 +101,12 @@ _ERROR_CODES = {
     "not_found": "unknown_tool",
     "forbidden": "forbidden",
     "validation": "invalid_input",
+    "precheck": "precheck_failed",
     "execution": "tool_failed",
 }
+#: Codes whose executor message is safe and useful to the model (field errors,
+#: a precheck's reason); every other code is shown without details.
+_DETAILED_CODES = frozenset({"invalid_input", "precheck_failed"})
 
 EventType = Literal[
     "run_started", "tool_call", "tool_result", "approval_required", "token", "citations", "done"
@@ -121,6 +129,7 @@ class AgentDeps:
     llm: LLMProvider
     embeddings: EmbeddingProvider | None
     settings: Settings
+    storage: DocumentStorage | None = None
 
 
 def new_run_id() -> str:
@@ -290,6 +299,8 @@ class AgentRun:
                 actor_type=ActorType.AGENT,
                 correlation_id=self.run_id,
                 embeddings=self._deps.embeddings,
+                llm=self._deps.llm,
+                storage=self._deps.storage,
             )
             summary, content, new_approval = await self._handle(call_id, name, result)
         self._summaries.append(summary)
@@ -321,7 +332,7 @@ class AgentRun:
             code, detail = "approval_unavailable", None
         else:
             code = _ERROR_CODES.get(result.error_kind or "", "tool_failed")
-            detail = result.error if code == "invalid_input" else None
+            detail = result.error if code in _DETAILED_CODES else None
         summary = ToolCallSummary(call_id=call_id, tool_name=name, status="error", error=code)
         return summary, render_tool_error(name, code, detail), None
 
@@ -351,7 +362,7 @@ class AgentRun:
                 approval_id=request.id, tool_name=request.tool_name, expires_at=request.expires_at
             )
             await self._session.commit()
-        except (ApprovalError, ToolNotFoundError, ValidationError):
+        except (ApprovalError, ToolError, ValidationError):
             logger.exception("agent could not create an approval request for %s", payload.tool_name)
             await self._session.rollback()
             return None, False

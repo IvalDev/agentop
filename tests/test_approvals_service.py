@@ -2,7 +2,8 @@
 
 Every test drives a test-only ``send_note`` ACTION tool on a local registry
 (see ``approval_tools`` in conftest) and an injected clock, so TTL behavior
-is deterministic and no production tool is involved.
+is deterministic and no production tool is involved. Per-request approver
+roles and prechecks use the test-only ``route_note`` (``tiered_tools``).
 """
 
 import asyncio
@@ -11,10 +12,11 @@ from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from app.core.config import Settings
 from app.core.db import Database
+from app.modules.agent.llm import FakeLLMProvider
 from app.modules.approvals.exceptions import (
     ApprovalBindingError,
     ApprovalExpiredError,
@@ -32,8 +34,10 @@ from app.modules.approvals.service import (
     list_approval_requests,
     reject_request,
 )
+from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import UserRole
+from app.modules.tools.exceptions import ToolApprovalRoleError
 from app.modules.tools.executor import compute_action_key
 
 T0 = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
@@ -41,6 +45,12 @@ TTL_SECONDS = 3600
 EXPIRY = T0 + timedelta(seconds=TTL_SECONDS)
 SETTINGS = Settings(approval_ttl_seconds=TTL_SECONDS)
 NOTE = {"to": "ops@acme.test", "body": "Quarterly report is ready"}
+#: ``route_note`` inputs per approver tier (see ``note_approver`` in conftest).
+TIER_NOTES = {
+    "operator": {**NOTE, "priority": 1},
+    "admin": {**NOTE, "priority": 3},
+    "owner": {**NOTE, "priority": 5},
+}
 
 ADMIN = "admin@acme.test"
 OWNER = "owner@acme.test"
@@ -460,3 +470,132 @@ async def test_unknown_id_is_not_found_before_the_role_check(
     """An insufficient role never turns a missing id into forbidden."""
     with pytest.raises(ApprovalNotFoundError):
         await _reload(seeded_db, seeded_users[VIEWER], uuid4())
+
+
+# --- Per-request approver role and precheck (T11.a) ------------------------------
+
+
+async def test_create_stores_the_resolved_approver_role_and_reads_honor_it(
+    seeded_db: Database, seeded_users, tiered_tools
+) -> None:
+    """The stored role follows the input's tier; the read filter and decisions use it."""
+    operator = replace(seeded_users[VIEWER], role=UserRole.OPERATOR)
+    admin, owner = seeded_users[ADMIN], seeded_users[OWNER]
+    ids = {
+        tier: await _create(seeded_db, tiered_tools, operator, note, tool="route_note")
+        for tier, note in TIER_NOTES.items()
+    }
+
+    for tier, request_id in ids.items():
+        assert (await _reload(seeded_db, owner, request_id)).required_role == tier
+    assert await _visible(seeded_db, operator) == {ids["operator"]}
+    for tier in ("admin", "owner"):
+        with pytest.raises(ApprovalForbiddenError):
+            await _reload(seeded_db, operator, ids[tier])
+    assert await _visible(seeded_db, admin) == {ids["operator"], ids["admin"]}
+    assert await _visible(seeded_db, owner) == set(ids.values())
+    with pytest.raises(ApprovalForbiddenError):
+        await _approve(seeded_db, admin, ids["owner"])
+    assert (await _approve(seeded_db, owner, ids["owner"])).status is ApprovalStatus.APPROVED
+
+
+async def test_create_with_a_failing_resolver_stores_nothing(
+    seeded_db: Database, seeded_users, tiered_tools
+) -> None:
+    """A request is never persisted with a guessed approver role."""
+
+    def broken(validated_input) -> UserRole:
+        raise LookupError("tier table missing")
+
+    spec = tiered_tools.registry.get("route_note")
+    tiered_tools.registry.register(replace(spec, name="broken_note", approval_role=broken))
+
+    with pytest.raises(ToolApprovalRoleError):
+        await _create(seeded_db, tiered_tools, seeded_users[OWNER], tool="broken_note")
+
+    async with seeded_db.sessionmaker() as session:
+        assert (await session.execute(select(ApprovalRequest))).scalars().all() == []
+
+
+@pytest.mark.parametrize(
+    ("tier", "tampered_role", "executor"),
+    [("owner", "admin", ADMIN), ("operator", "owner", OWNER)],
+    ids=["role-lowered", "role-raised"],
+)
+async def test_execute_refuses_a_stored_role_that_no_longer_matches_the_input(
+    tier: str,
+    tampered_role: str,
+    executor: str,
+    seeded_db: Database,
+    seeded_users,
+    tiered_tools,
+    audit_log,
+) -> None:
+    """The approver role re-derived from the payload must equal the stored one."""
+    owner = seeded_users[OWNER]
+    request_id = await _create(seeded_db, tiered_tools, owner, TIER_NOTES[tier], tool="route_note")
+    await _approve(seeded_db, owner, request_id)
+    async with seeded_db.sessionmaker() as session:
+        await session.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == request_id)
+            .values(required_role=tampered_role)
+        )
+        await session.commit()
+
+    with pytest.raises(ApprovalBindingError):
+        await _execute(seeded_db, tiered_tools, seeded_users[executor], request_id)
+    with pytest.raises(ApprovalStateError):
+        await _execute(seeded_db, tiered_tools, owner, request_id)
+
+    assert tiered_tools.spy.calls == []
+    assert tiered_tools.precheck.contexts == []
+    assert (await _reload(seeded_db, owner, request_id)).status is ApprovalStatus.FAILED
+    [mismatch] = await audit_log(seeded_db, action="approval.binding_mismatch")
+    assert mismatch.resource_id == str(request_id)
+
+
+async def test_precheck_refusal_at_execution_fails_the_request_once(
+    seeded_db: Database, seeded_users, tiered_tools, audit_log
+) -> None:
+    """A refused approved call ends ``failed`` like a handler failure, never re-runnable."""
+    owner = seeded_users[OWNER]
+    request_id = await _create(seeded_db, tiered_tools, owner, tool="route_note")
+    await _approve(seeded_db, owner, request_id)
+    tiered_tools.precheck.refusal = "note already routed"
+
+    outcome = await _execute(seeded_db, tiered_tools, owner, request_id)
+    with pytest.raises(ApprovalStateError):
+        await _execute(seeded_db, tiered_tools, owner, request_id)
+
+    assert (outcome.result.status, outcome.result.error_kind) == ("error", "precheck")
+    assert outcome.request.status is ApprovalStatus.FAILED
+    assert outcome.request.execution_error == "precheck_failed: note already routed"
+    assert len(tiered_tools.precheck.contexts) == 1
+    assert tiered_tools.spy.calls == []
+    [refused] = await audit_log(seeded_db, action="tool.precheck_failed")
+    assert refused.correlation_id == str(request_id)
+    [failed] = await audit_log(seeded_db, action="approval.failed")
+    assert failed.result == {"error": "precheck_failed: note already routed"}
+
+
+async def test_approved_execution_gives_the_tool_the_llm_and_storage(
+    seeded_db: Database, seeded_users, tiered_tools, tmp_path
+) -> None:
+    """The precheck and the handler of an approved call see the injected services."""
+    llm, storage = FakeLLMProvider(), LocalDocumentStorage(tmp_path)
+    owner = seeded_users[OWNER]
+    request_id = await _create(seeded_db, tiered_tools, owner, tool="route_note")
+    await _approve(seeded_db, owner, request_id)
+
+    async with seeded_db.sessionmaker() as session:
+        outcome = await execute_approved_action(
+            session, tiered_tools.registry, owner, request_id, now=T0, llm=llm, storage=storage
+        )
+
+    assert outcome.request.status is ApprovalStatus.EXECUTED
+    [precheck_context] = tiered_tools.precheck.contexts
+    [handler_context] = tiered_tools.spy.contexts
+    for context in (precheck_context, handler_context):
+        assert context.llm is llm
+        assert context.storage is storage

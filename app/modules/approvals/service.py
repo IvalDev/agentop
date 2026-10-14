@@ -9,10 +9,20 @@ Product policy:
   one raises :class:`ApprovalForbiddenError`.
 - Requests of other tenants are indistinguishable from missing ones
   (:class:`ApprovalNotFoundError`), which is checked before the role.
+- Who may *create* a request is the tool's invocation role
+  (``ToolSpec.required_role``). The stored ``required_role`` is the approver
+  role of that exact call: :func:`~app.modules.tools.executor.resolve_approval_role`
+  — the tool's role unless its ``approval_role`` resolver asks for a more
+  privileged one (e.g. by amount). Every read and decision uses the stored
+  value; a resolver that fails stores nothing.
 - The approval binds the exact tool + canonical input (decision A7):
   ``action_key`` is computed here with ``compute_action_key`` (never accepted
-  from a caller); execution re-derives it from the stored payload, refuses on
-  any mismatch, and runs exactly the stored payload.
+  from a caller); execution re-derives it and the approver role from the
+  stored payload, refuses on any mismatch (a tampered ``required_role`` is
+  caught like a tampered payload), and runs exactly the stored payload.
+- Execution runs the tool's precheck again right before its handler (inside
+  ``execute_tool``); a refusal is a failed run like a handler error: the
+  request ends ``failed`` with ``precheck_failed: <reason>``.
 - Requests expire ``Settings.approval_ttl_seconds`` after creation. Expiry
   is enforced on approve, reject, and execute: the first such call at or
   after ``expires_at`` marks a pending/approved request ``expired``. Listing
@@ -54,6 +64,7 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
+from app.modules.agent.llm import LLMProvider
 from app.modules.approvals.exceptions import (
     ApprovalBindingError,
     ApprovalExpiredError,
@@ -66,14 +77,16 @@ from app.modules.approvals.grants import mint_grant
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event, stage_event
+from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.deps import TenantContext
 from app.modules.identity.models import UserRole
 from app.modules.identity.service import scoped_query
-from app.modules.tools.exceptions import ToolNotFoundError
+from app.modules.tools.exceptions import ToolApprovalRoleError, ToolNotFoundError
 from app.modules.tools.executor import (
     ToolExecutionResult,
     compute_action_key,
     execute_tool,
+    resolve_approval_role,
     role_satisfies,
 )
 from app.modules.tools.registry import ApprovalPolicy, ToolRegistry, ToolSpec, ToolUser
@@ -253,19 +266,23 @@ def _verify_binding(registry: ToolRegistry, request: ApprovalRequest) -> ToolSpe
     """Return the tool spec iff the stored call still hashes to the approved key.
 
     The stored payload must be the canonical validated input (no extra or
-    coerced fields) and ``compute_action_key`` over it must equal the stored
-    ``action_key``.
+    coerced fields), ``compute_action_key`` over it must equal the stored
+    ``action_key``, and the approver role re-derived from it must equal the
+    stored ``required_role`` (a resolver that now fails cannot confirm it).
     """
     mismatch = ApprovalBindingError("approval binding mismatch")
     try:
         spec = registry.get(request.tool_name)
         assert spec.input_model is not None  # registration invariant
         validated = spec.input_model.model_validate(request.input_payload)
-    except (ToolNotFoundError, ValidationError) as exc:
+        approver = resolve_approval_role(spec, validated)
+    except (ToolNotFoundError, ValidationError, ToolApprovalRoleError) as exc:
         raise mismatch from exc
     expected_key = compute_action_key(spec.name, validated)
-    if validated.model_dump(mode="json") != request.input_payload or not hmac.compare_digest(
-        expected_key, request.action_key
+    if (
+        validated.model_dump(mode="json") != request.input_payload
+        or not hmac.compare_digest(expected_key, request.action_key)
+        or approver.value != request.required_role
     ):
         raise mismatch
     return spec
@@ -285,15 +302,18 @@ async def create_approval_request(
 ) -> ApprovalRequest:
     """Persist a pending request to run ``tool_name`` with ``raw_input`` (caller commits).
 
-    ``user`` is always the requester. ``actor_type`` and ``correlation_id``
-    (default: the new request's id) apply to the ``approval.created`` event
-    only; every later event of the request is correlated by its id.
+    ``user`` is always the requester and must satisfy the tool's invocation
+    role; the stored ``required_role`` is the call's resolved approver role.
+    ``actor_type`` and ``correlation_id`` (default: the new request's id)
+    apply to the ``approval.created`` event only; every later event of the
+    request is correlated by its id.
 
     Raises:
         ToolNotFoundError: unknown tool.
         pydantic.ValidationError: ``raw_input`` fails the tool's input model.
         ApprovalNotRequiredError: the tool is not ``REQUIRE_APPROVAL``.
         ApprovalForbiddenError: ``user`` may not invoke the tool at all.
+        ToolApprovalRoleError: the tool's approver-role resolver failed.
     """
     now = _utc(now)
     spec = registry.get(tool_name)
@@ -303,13 +323,14 @@ async def create_approval_request(
         await _deny(session, user, "create", spec.name)
     assert spec.input_model is not None  # registration invariant
     validated = spec.input_model.model_validate(raw_input)
+    approver = resolve_approval_role(spec, validated)
     request = ApprovalRequest(
         tenant_id=user.tenant_id,
         requested_by=user.id,
         tool_name=spec.name,
         input_payload=validated.model_dump(mode="json"),
         action_key=compute_action_key(spec.name, validated),
-        required_role=spec.required_role.value,
+        required_role=approver.value,
         status=ApprovalStatus.PENDING,
         created_at=now,
         expires_at=now + timedelta(seconds=settings.approval_ttl_seconds),
@@ -437,21 +458,25 @@ async def execute_approved_action(
     request_id: UUID,
     *,
     now: datetime | None = None,
+    llm: LLMProvider | None = None,
+    storage: DocumentStorage | None = None,
 ) -> ApprovalExecution:
     """Run an approved request's stored call at most once (commits).
 
     Check order: tenant-scoped load (not-found) → stored required role
     (forbidden) → TTL (expired, marked) → status ``approved`` (state) →
-    binding (a mismatch marks the request ``failed`` and raises
-    :class:`ApprovalBindingError`) → the tool's *current* required role
-    (forbidden). Every refusal above leaves a valid approval usable.
+    binding, approver role included (a mismatch marks the request ``failed``
+    and raises :class:`ApprovalBindingError`) → the tool's *current* required
+    role (forbidden). Every refusal above leaves a valid approval usable.
 
     Then an atomic ``approved → executing`` claim is committed (a loser of a
     race gets :class:`ApprovalStateError`), ``execute_tool`` runs the stored
-    payload with a freshly minted single-use grant, and the request ends
-    ``executed`` (with the JSON-encoded output) or ``failed`` (with the error;
-    the handler's uncommitted writes are rolled back first). A crash after
-    the claim leaves ``executing``: never re-runnable, visible for operators.
+    payload with a freshly minted single-use grant (and ``llm``/``storage``
+    in the tool context), and the request ends ``executed`` (with the
+    JSON-encoded output) or ``failed`` (with the error — a precheck refusal
+    included; the handler's uncommitted writes are rolled back first). A
+    crash after the claim leaves ``executing``: never re-runnable, visible
+    for operators.
     """
     now = _utc(now)
     request = await _load(session, user, request_id)
@@ -493,6 +518,8 @@ async def execute_approved_action(
         payload,
         approval_grant=mint_grant(request_id, action_key),
         correlation_id=str(request_id),
+        llm=llm,
+        storage=storage,
     )
     if result.status == "ok":
         outcome = {

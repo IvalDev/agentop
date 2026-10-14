@@ -15,6 +15,7 @@ from app.modules.audit.models import AuditEvent
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, User, UserRole
 from app.modules.identity.security import hash_password
+from app.modules.tools.exceptions import ToolPrecheckError
 from app.modules.tools.registry import (
     ApprovalPolicy,
     ToolContext,
@@ -170,12 +171,39 @@ class ActionSpy:
 
     error: Exception | None = None
     calls: list[tuple[int, CurrentUser, BaseModel]] = field(default_factory=list)
+    contexts: list[ToolContext] = field(default_factory=list)
 
     async def __call__(self, context: ToolContext, validated_input: BaseModel) -> dict:
         self.calls.append((context.tenant_id, context.user, validated_input))
+        self.contexts.append(context)
         if self.error is not None:
             raise self.error
         return {"delivered": True, "to": validated_input.to}
+
+
+@dataclass
+class PrecheckSpy:
+    """Async precheck double: records every context, then passes, refuses, or raises."""
+
+    refusal: str | None = None
+    error: Exception | None = None
+    contexts: list[ToolContext] = field(default_factory=list)
+
+    async def __call__(self, context: ToolContext, validated_input: BaseModel) -> None:
+        self.contexts.append(context)
+        if self.error is not None:
+            raise self.error
+        if self.refusal is not None:
+            raise ToolPrecheckError(self.refusal)
+
+
+def note_approver(note: SendNoteInput) -> UserRole:
+    """Test-only approver tiers by priority: 1-2 operator, 3-4 admin, 5 owner."""
+    if note.priority >= 5:
+        return UserRole.OWNER
+    if note.priority >= 3:
+        return UserRole.ADMIN
+    return UserRole.OPERATOR
 
 
 @dataclass
@@ -184,6 +212,7 @@ class ApprovalTools:
 
     registry: ToolRegistry
     spy: ActionSpy
+    precheck: PrecheckSpy = field(default_factory=PrecheckSpy)
 
 
 @pytest.fixture
@@ -225,6 +254,29 @@ def approval_tools() -> ApprovalTools:
         )
     )
     return ApprovalTools(registry=registry, spy=spy)
+
+
+@pytest.fixture
+def tiered_tools(approval_tools: ApprovalTools) -> ApprovalTools:
+    """``approval_tools`` plus ``route_note``: an operator ACTION approved by priority tier.
+
+    Its approver role comes from :func:`note_approver` and its precheck is
+    ``approval_tools.precheck`` (passes unless a test sets a refusal or error).
+    """
+    approval_tools.registry.register(
+        ToolSpec(
+            name="route_note",
+            description="test-only operator action whose approver depends on priority",
+            kind=ToolKind.ACTION,
+            approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+            required_role=UserRole.OPERATOR,
+            handler=approval_tools.spy,
+            input_model=SendNoteInput,
+            approval_role=note_approver,
+            precheck=approval_tools.precheck,
+        )
+    )
+    return approval_tools
 
 
 @pytest.fixture

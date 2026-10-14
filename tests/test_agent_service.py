@@ -35,6 +35,7 @@ from app.modules.agent.service import (
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
+from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.retrieval.embeddings import FakeEmbeddingProvider
 from app.modules.tools import builtin
 from app.modules.tools.registry import ToolRegistry
@@ -62,12 +63,13 @@ def answer(text: str) -> AssistantMessage:
     return AssistantMessage(content=text)
 
 
-def deps(registry: ToolRegistry, llm, **settings) -> AgentDeps:
+def deps(registry: ToolRegistry, llm, storage=None, **settings) -> AgentDeps:
     return AgentDeps(
         registry=registry,
         llm=llm,
         embeddings=FakeEmbeddingProvider(dimension=DIM),
         settings=Settings(approval_ttl_seconds=3600, **settings),
+        storage=storage,
     )
 
 
@@ -244,6 +246,65 @@ async def test_agent_created_approval_is_attributed_to_the_run(
         "approval.created",
         "agent.run_completed",
     ]
+
+
+async def test_agent_submits_the_per_request_approver_role(
+    seeded_db: Database, seeded_users, registry, tiered_tools, audit_log
+) -> None:
+    """An approval the run creates stores the role resolved from the call's input."""
+    admin = seeded_users[ADMIN]
+    owner_tier = {**NOTE, "priority": 5}
+    llm = FakeLLMProvider([call("route_note", owner_tier), answer("Submitted for approval.")])
+
+    response = await run(seeded_db, admin, deps(registry, llm))
+
+    async with seeded_db.sessionmaker() as session:
+        [request] = (await session.execute(select(ApprovalRequest))).scalars().all()
+    assert request.required_role == "owner"
+    assert [approval.approval_id for approval in response.pending_approvals] == [request.id]
+    [required] = await audit_log(seeded_db, action="tool.approval_required")
+    [created] = await audit_log(seeded_db, action="approval.created")
+    assert required.result["required_role"] == created.result["required_role"] == "owner"
+    assert len(tiered_tools.precheck.contexts) == 1
+    assert tiered_tools.spy.calls == []
+
+
+async def test_precheck_refusal_reaches_the_model_and_submits_nothing(
+    seeded_db: Database, seeded_users, registry, tiered_tools, audit_log
+) -> None:
+    """The model sees ``precheck_failed`` with the safe reason; no request is created."""
+    tiered_tools.precheck.refusal = "note already routed"
+    llm = FakeLLMProvider([call("route_note", NOTE), answer("It was already routed.")])
+
+    response = await run(seeded_db, seeded_users[ADMIN], deps(registry, llm))
+
+    assert [(item.status, item.error) for item in response.tool_calls] == [
+        ("error", "precheck_failed")
+    ]
+    content = tool_message(llm, 1).content
+    assert "precheck_failed" in content
+    assert "note already routed" in content
+    assert response.pending_approvals == []
+    assert tiered_tools.spy.calls == []
+    async with seeded_db.sessionmaker() as session:
+        assert (await session.execute(select(ApprovalRequest))).scalars().all() == []
+    [refused] = await audit_log(seeded_db, action="tool.precheck_failed")
+    assert (refused.actor_type, refused.correlation_id) == (ActorType.AGENT, response.run_id)
+    assert await audit_log(seeded_db, action="approval.created") == []
+
+
+async def test_tools_receive_the_runs_llm_and_storage(
+    seeded_db: Database, seeded_users, registry, approval_tools, tmp_path
+) -> None:
+    """Every tool call of a run gets the run's model adapter and document storage."""
+    storage = LocalDocumentStorage(tmp_path)
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+
+    await run(seeded_db, seeded_users[VIEWER], deps(registry, llm, storage=storage))
+
+    [context] = approval_tools.spy.contexts
+    assert context.llm is llm
+    assert context.storage is storage
 
 
 # --- Robustness: malformed calls, errors, limits ------------------------------------

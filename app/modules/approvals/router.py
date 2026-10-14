@@ -13,15 +13,20 @@ service error                           HTTP
 ``ApprovalNotFoundError``               404 (unknown *and* other-tenant ids)
 ``ApprovalForbiddenError``              403 (role below the tool's requirement)
 ``ApprovalStateError``                  409 (already decided/executed, not approved)
-``ApprovalBindingError``                409 (stored call no longer matches its key)
+``ApprovalBindingError``                409 (stored call or approver role no longer matches)
 ``ApprovalExpiredError``                410 Gone (TTL elapsed; request is ``expired``)
 ====================================== ====================================
 
-Every route needs a role satisfying the request's stored required role
-(requester included): list silently omits the other requests, while get,
-approve, reject, and execute answer 403 (404 still wins for unknown and
-other-tenant ids). A tool that ran but failed still answers 200 with status
-``failed`` and ``execution_error`` — the approval was consumed either way.
+Every route needs a role satisfying the request's stored required role —
+the approver role resolved for that exact call, which a tool may raise per
+request (requester included): list silently omits the other requests, while
+get, approve, reject, and execute answer 403 (404 still wins for unknown and
+other-tenant ids). A tool that ran but failed — a precheck refusal included
+(``execution_error`` ``precheck_failed: <reason>``) — still answers 200 with
+status ``failed`` and ``execution_error``: the approval was consumed either
+way. Execution gives the tool the app's chat model (``app.state.llm``) and
+document storage (``app.state.storage``), the same objects the chat and
+documents routes use.
 """
 
 from typing import Annotated
@@ -31,6 +36,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_session
+from app.modules.agent.llm import LLMProvider
 from app.modules.approvals.exceptions import (
     ApprovalBindingError,
     ApprovalError,
@@ -47,6 +53,7 @@ from app.modules.approvals.service import (
     list_approval_requests,
     reject_request,
 )
+from app.modules.documents.router import StorageDep
 from app.modules.identity.deps import CurrentUser, get_current_user
 from app.modules.tools.registry import ToolRegistry
 from packages.contracts.schemas import (
@@ -67,6 +74,14 @@ def get_tool_registry(request: Request) -> ToolRegistry:
 
 
 ToolRegistryDep = Annotated[ToolRegistry, Depends(get_tool_registry)]
+
+
+def get_llm(request: Request) -> LLMProvider:
+    """Return the chat model adapter attached to ``app.state.llm``."""
+    return request.app.state.llm
+
+
+LLMDep = Annotated[LLMProvider, Depends(get_llm)]
 
 _HTTP_STATUS: dict[type[ApprovalError], tuple[int, str]] = {
     ApprovalNotFoundError: (404, "approval request not found"),
@@ -157,10 +172,14 @@ async def execute(
     session: SessionDep,
     registry: ToolRegistryDep,
     user: CurrentUserDep,
+    llm: LLMDep,
+    storage: StorageDep,
 ) -> ApprovalResponse:
     """Run an approved request's stored call exactly once."""
     try:
-        execution = await execute_approved_action(session, registry, user, approval_id)
+        execution = await execute_approved_action(
+            session, registry, user, approval_id, llm=llm, storage=storage
+        )
     except ApprovalError as exc:
         raise _http_error(exc) from exc
     return _response(execution.request)

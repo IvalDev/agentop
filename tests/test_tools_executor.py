@@ -6,6 +6,7 @@ the bottom of this file.
 """
 
 from dataclasses import dataclass
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,13 +14,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.core.db import Database
+from app.modules.agent.llm import FakeLLMProvider
 from app.modules.approvals.grants import ApprovalGrant, mint_grant
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
+from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, UserRole
 from app.modules.retrieval.embeddings import EmbeddingError, FakeEmbeddingProvider
 from app.modules.tools import builtin
-from app.modules.tools.executor import compute_action_key, execute_tool
+from app.modules.tools.exceptions import ToolApprovalRoleError, ToolPrecheckError
+from app.modules.tools.executor import compute_action_key, execute_tool, resolve_approval_role
 from app.modules.tools.registry import (
     ApprovalPolicy,
     ToolContext,
@@ -186,10 +190,11 @@ async def test_auto_extract_executes_and_returns_ok(
 
 
 async def test_handler_receives_a_context_with_session_and_services(
-    tools: ToolBundle, identity_db: Database
+    tools: ToolBundle, identity_db: Database, tmp_path: Path
 ) -> None:
     """The ``ToolContext`` carries the caller's session, principal, and providers."""
     embeddings = FakeEmbeddingProvider(dimension=8)
+    llm, storage = FakeLLMProvider(), LocalDocumentStorage(tmp_path)
     async with identity_db.sessionmaker() as session:
         await execute_tool(
             tools.registry,
@@ -199,13 +204,20 @@ async def test_handler_receives_a_context_with_session_and_services(
             {"value": 2},
             correlation_id="run-1",
             embeddings=embeddings,
+            llm=llm,
+            storage=storage,
         )
-        [context] = tools.extract_spy.contexts
+        await execute_tool(tools.registry, session, make_user(), "spy_extract", {"value": 2})
+        context, bare = tools.extract_spy.contexts
         assert context.session is session
 
     assert (context.tenant_id, context.user.tenant_id) == (3, 3)
     assert context.embeddings is embeddings
     assert context.correlation_id == "run-1"
+    assert context.llm is llm
+    assert context.storage is storage
+    # Services are optional: a caller that wires none gives handlers None.
+    assert (bare.embeddings, bare.llm, bare.storage) == (None, None, None)
 
 
 async def test_invalid_input_returns_validation_error_and_skips_handler(
@@ -481,6 +493,195 @@ async def test_unknown_tool_returns_not_found_error(
     assert result.status == "error"
     assert result.error_kind == "not_found"
     assert "ghost_tool" in (result.error or "")
+
+
+# --- Per-request approver role and precheck (T11.a) ------------------------------
+
+
+class PrecheckSpy:
+    """Async precheck double: records contexts and inputs, then passes or raises."""
+
+    def __init__(self, error: Exception | None = None) -> None:
+        self.error = error
+        self.contexts: list[ToolContext] = []
+        self.inputs: list[DemoInput] = []
+
+    async def __call__(self, context: ToolContext, validated_input: DemoInput) -> None:
+        self.contexts.append(context)
+        self.inputs.append(validated_input)
+        if self.error is not None:
+            raise self.error
+
+
+def tier_by_value(validated_input: DemoInput) -> UserRole:
+    """Owner approves values above 100; anything else asks for a mere viewer."""
+    return UserRole.OWNER if validated_input.value > 100 else UserRole.VIEWER
+
+
+def gated_registry(**overrides) -> ToolRegistry:
+    """Registry with one operator-invoked ``gated_action`` ACTION (fields overridable)."""
+    fields = {
+        "name": "gated_action",
+        "description": "operator action with optional approver resolver and precheck",
+        "kind": ToolKind.ACTION,
+        "approval_policy": ApprovalPolicy.REQUIRE_APPROVAL,
+        "required_role": UserRole.OPERATOR,
+        "handler": SpyHandler({"sent": True}),
+        "input_model": DemoInput,
+    }
+    registry = ToolRegistry()
+    registry.register(ToolSpec(**{**fields, **overrides}))
+    return registry
+
+
+@pytest.mark.parametrize(
+    ("approval_role", "value", "expected"),
+    [
+        (None, 500, UserRole.OPERATOR),
+        (tier_by_value, 500, UserRole.OWNER),
+        (tier_by_value, 5, UserRole.OPERATOR),
+    ],
+    ids=["no-resolver", "resolver-more-privileged", "resolver-below-invocation-role"],
+)
+def test_resolved_approver_is_never_below_the_invocation_role(
+    approval_role, value: int, expected: UserRole
+) -> None:
+    """The approver is the more privileged of the resolver's role and ``required_role``."""
+    spec = gated_registry(approval_role=approval_role).get("gated_action")
+
+    assert resolve_approval_role(spec, DemoInput(value=value)) is expected
+
+
+def _broken_resolver(validated_input: DemoInput) -> UserRole:
+    raise LookupError("tier table missing")
+
+
+@pytest.mark.parametrize(
+    "approval_role",
+    [_broken_resolver, lambda validated_input: "superuser"],
+    ids=["raises", "not-a-role"],
+)
+def test_failing_resolver_never_yields_a_guessed_role(approval_role) -> None:
+    """A resolver that raises or returns a non-role is a typed tool error."""
+    spec = gated_registry(approval_role=approval_role).get("gated_action")
+
+    with pytest.raises(ToolApprovalRoleError):
+        resolve_approval_role(spec, DemoInput(value=1))
+
+
+async def test_approval_required_carries_the_resolved_approver_role(
+    identity_db: Database, audit_log
+) -> None:
+    """The approval payload and its audit record name the per-request approver."""
+    registry = gated_registry(approval_role=tier_by_value)
+    operator = make_user(UserRole.OPERATOR)
+    async with identity_db.sessionmaker() as session:
+        high = await execute_tool(registry, session, operator, "gated_action", {"value": 500})
+        low = await execute_tool(registry, session, operator, "gated_action", {"value": 5})
+
+    assert high.approval_request.required_role == "owner"
+    assert low.approval_request.required_role == "operator"
+    events = await audit_log(identity_db, action="tool.approval_required")
+    assert [event.result["required_role"] for event in events] == ["owner", "operator"]
+
+
+async def test_failing_resolver_is_a_masked_tool_failure_without_a_request(
+    identity_db: Database, audit_log
+) -> None:
+    """No approval payload is produced with a guessed role; the detail is audited."""
+    handler = SpyHandler({"sent": True})
+    registry = gated_registry(approval_role=_broken_resolver, handler=handler)
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(registry, session, make_user(), "gated_action", {"value": 1})
+
+    assert (result.status, result.error_kind, result.error) == ("error", "execution", "tool_failed")
+    assert result.approval_request is None
+    assert "tier table" not in result.model_dump_json()
+    assert handler.calls == []
+    [failed] = await audit_log(identity_db, action="tool.failed")
+    assert "tier table missing" in failed.result["error"]
+    assert await audit_log(identity_db, action="tool.approval_required") == []
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["approval-gate", "dry-run"])
+async def test_precheck_refusal_stops_the_call_before_the_approval_gate(
+    dry_run: bool, identity_db: Database, audit_log
+) -> None:
+    """A refusal returns ``precheck_failed`` with the safe reason and is audited."""
+    precheck = PrecheckSpy(ToolPrecheckError("invoice already registered"))
+    handler = SpyHandler({"sent": True})
+    registry = gated_registry(handler=handler, precheck=precheck)
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry,
+            session,
+            make_user(UserRole.OPERATOR),
+            "gated_action",
+            {"value": 3},
+            dry_run=dry_run,
+        )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == "precheck_failed: invoice already registered"
+    assert (result.approval_request, result.output) == (None, None)
+    assert precheck.inputs == [DemoInput(value=3)]
+    assert handler.calls == []
+    [refused] = await audit_log(identity_db, action="tool.precheck_failed")
+    assert (refused.actor_user_id, refused.tool_name) == (7, "gated_action")
+    assert refused.payload == {"value": 3}
+    assert refused.result == {"error": "precheck_failed", "reason": "invoice already registered"}
+    assert await audit_log(identity_db, action="tool.approval_required") == []
+
+
+async def test_precheck_runs_again_on_approved_calls_before_the_handler(
+    identity_db: Database,
+) -> None:
+    """With a grant the precheck still decides; it sees the handler's own context."""
+    precheck = PrecheckSpy(ToolPrecheckError("state changed since approval"))
+    handler = SpyHandler({"sent": True})
+    registry = gated_registry(handler=handler, precheck=precheck)
+    key = compute_action_key("gated_action", DemoInput(value=3))
+    async with identity_db.sessionmaker() as session:
+        refused = await execute_tool(
+            registry,
+            session,
+            make_user(),
+            "gated_action",
+            {"value": 3},
+            approval_grant=mint_grant(uuid4(), key),
+        )
+        precheck.error = None
+        executed = await execute_tool(
+            registry,
+            session,
+            make_user(),
+            "gated_action",
+            {"value": 3},
+            approval_grant=mint_grant(uuid4(), key),
+        )
+
+    assert (refused.status, refused.error_kind) == ("error", "precheck")
+    assert executed.status == "ok"
+    assert len(handler.calls) == 1
+    assert precheck.contexts[-1] is handler.contexts[0]
+
+
+async def test_unexpected_precheck_exception_is_masked_as_tool_failed(
+    identity_db: Database, audit_log
+) -> None:
+    """Only ``ToolPrecheckError`` is a refusal; anything else hides its detail."""
+    handler = SpyHandler({"sent": True})
+    precheck = PrecheckSpy(RuntimeError("database at 10.0.0.5 unreachable"))
+    registry = gated_registry(handler=handler, precheck=precheck)
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(registry, session, make_user(), "gated_action", {"value": 3})
+
+    assert (result.status, result.error_kind, result.error) == ("error", "execution", "tool_failed")
+    assert "10.0.0.5" not in result.model_dump_json()
+    assert handler.calls == []
+    [failed] = await audit_log(identity_db, action="tool.failed")
+    assert failed.result == {"error": "database at 10.0.0.5 unreachable"}
+    assert await audit_log(identity_db, action="tool.precheck_failed") == []
 
 
 # --- Builtin tools wired on the default registry -----------------------------

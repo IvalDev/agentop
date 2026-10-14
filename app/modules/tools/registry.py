@@ -20,11 +20,29 @@ Handler contract (exact signature)::
 :class:`ToolContext` is built by the executor for every call: the caller's
 ``session``, the ``tenant_id`` and ``user`` of the authenticated principal,
 and the optional services a handler may need (the ``embeddings`` provider for
-semantic search, the run's ``correlation_id``). ``tenant_id`` is the isolation
-key (decision A8): handlers MUST scope every query with it. ``ToolUser`` is a
-structural protocol satisfied by both the ORM ``User`` and the request-scoped
+semantic search, the chat model ``llm``, the document blob ``storage``, the
+run's ``correlation_id``). ``tenant_id`` is the isolation key (decision A8):
+handlers MUST scope every query with it. ``ToolUser`` is a structural
+protocol satisfied by both the ORM ``User`` and the request-scoped
 ``CurrentUser`` value object, so handlers stay decoupled from either. New
 services are added as context fields, never as extra positional arguments.
+
+Optional hooks (T11)::
+
+    def approval_role(validated_input: BaseModel) -> UserRole
+    async def precheck(context: ToolContext, validated_input: BaseModel) -> None
+
+- ``approval_role`` (``REQUIRE_APPROVAL`` tools only) chooses who must approve
+  *this* call, e.g. by invoice amount. It must be pure and deterministic: the
+  approvals service stores its result as the request's ``required_role`` and
+  re-derives it from the stored payload before execution. The effective
+  approver is never less privileged than ``required_role`` (see
+  :func:`~app.modules.tools.executor.resolve_approval_role`).
+- ``precheck`` verifies the call against current tenant state (duplicates,
+  references that must exist) before the approval gate, and again right
+  before the handler of an approved call. It refuses by raising
+  :class:`~app.modules.tools.exceptions.ToolPrecheckError` with a short,
+  user-safe reason; it must not change state.
 
 Registration invariants are enforced by :meth:`ToolRegistry.register` and
 raise :class:`ToolRegistrationError`; lookups raise
@@ -40,6 +58,8 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.agent.llm import LLMProvider
+from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.models import UserRole
 from app.modules.retrieval.embeddings import EmbeddingProvider
 from app.modules.tools.exceptions import ToolNotFoundError, ToolRegistrationError
@@ -73,9 +93,9 @@ class ToolContext:
     """Everything a handler may use besides its validated input.
 
     ``tenant_id`` always equals ``user.tenant_id`` (the executor builds it
-    from the authenticated principal, never from tool input). ``embeddings``
-    is ``None`` when the caller wired no provider; handlers must degrade or
-    fail closed instead of assuming one.
+    from the authenticated principal, never from tool input). ``embeddings``,
+    ``llm``, and ``storage`` are ``None`` when the caller wired no such
+    service; handlers must degrade or fail closed instead of assuming one.
     """
 
     session: AsyncSession
@@ -83,9 +103,15 @@ class ToolContext:
     user: ToolUser
     embeddings: EmbeddingProvider | None = None
     correlation_id: str | None = None
+    llm: LLMProvider | None = None
+    storage: DocumentStorage | None = None
 
 
 ToolHandler = Callable[[ToolContext, BaseModel], Awaitable[Any]]
+#: Per-request approver choice: a pure function of the validated input.
+ApprovalRoleResolver = Callable[[BaseModel], UserRole]
+#: State verification run before the approval gate and before the handler.
+ToolPrecheck = Callable[[ToolContext, BaseModel], Awaitable[None]]
 
 # Lowercase identifier-ish names such as ``extract_invoice`` / ``send_email``.
 _NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
@@ -100,7 +126,9 @@ class ToolSpec:
     checks in :meth:`ToolRegistry.register` must surface as
     ``ToolRegistrationError`` (not a wrapped ``ValidationError``).
     ``input_model`` may be ``None`` on a bare construction but is required
-    at registration time.
+    at registration time. ``required_role`` is who may *invoke* the tool;
+    ``approval_role`` and ``precheck`` are the optional hooks described in
+    the module docstring.
     """
 
     name: str
@@ -111,6 +139,8 @@ class ToolSpec:
     handler: ToolHandler
     input_model: type[BaseModel] | None = None
     output_model: type[BaseModel] | None = None
+    approval_role: ApprovalRoleResolver | None = None
+    precheck: ToolPrecheck | None = None
 
 
 class ToolRegistry:
@@ -124,8 +154,9 @@ class ToolRegistry:
 
         Raises:
             ToolRegistrationError: duplicate or invalid name, missing or
-                non-Pydantic ``input_model``, non-callable handler, or an
-                ``ACTION`` tool that is not ``REQUIRE_APPROVAL``.
+                non-Pydantic ``input_model``, non-callable handler or hook,
+                an ``ACTION`` tool that is not ``REQUIRE_APPROVAL``, or an
+                ``approval_role`` on a tool that is not ``REQUIRE_APPROVAL``.
         """
         if not isinstance(spec.name, str) or not _NAME_PATTERN.fullmatch(spec.name):
             raise ToolRegistrationError(
@@ -148,6 +179,16 @@ class ToolRegistry:
         ):
             raise ToolRegistrationError(
                 f"tool {spec.name!r}: ACTION tools must use approval_policy=REQUIRE_APPROVAL"
+            )
+        for hook in ("approval_role", "precheck"):
+            if getattr(spec, hook) is not None and not callable(getattr(spec, hook)):
+                raise ToolRegistrationError(f"tool {spec.name!r}: {hook} must be callable")
+        if (
+            spec.approval_role is not None
+            and spec.approval_policy is not ApprovalPolicy.REQUIRE_APPROVAL
+        ):
+            raise ToolRegistrationError(
+                f"tool {spec.name!r}: approval_role needs approval_policy=REQUIRE_APPROVAL"
             )
         self._specs[spec.name] = spec
 

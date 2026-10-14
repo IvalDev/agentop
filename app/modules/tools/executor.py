@@ -15,13 +15,17 @@ result                        HTTP                 ``error_kind``
 ``error`` (handler/output)    400                  ``execution``
 ``error`` (insufficient role) 403                  ``forbidden``
 ``error`` (rejected grant)    403                  ``forbidden``
+``error`` (precheck refused)  409                  ``precheck``
 ============================ ==================== ==================
 
 Error messages are safe to show to API clients and to the model: a handler
-exception is reported as :data:`TOOL_FAILED` and an output-schema violation
+exception — or an unexpected exception from a precheck or an approver-role
+resolver — is reported as :data:`TOOL_FAILED` and an output-schema violation
 as :data:`INVALID_OUTPUT` (the detail goes to the server log and the
-``tool.failed`` audit event only), and validation errors list field
-locations and messages without echoing input values.
+``tool.failed`` audit event only), validation errors list field locations
+and messages without echoing input values, and a precheck refusal is
+``precheck_failed: <reason>`` with the tool's own user-safe reason
+(:class:`~app.modules.tools.exceptions.ToolPrecheckError`).
 
 Role checks compare an explicit rank map (lower = more privileged), mirroring
 the declaration order of :class:`~app.modules.identity.models.UserRole`:
@@ -42,9 +46,13 @@ Approval gate (decision A7: the model never authorizes)
   ``error``/``forbidden`` and the handler is never called. The HTTP layer
   never accepts a grant from clients.
 - ``approval_request`` payload (``ApprovalRequestPayload``): ``tool_name``,
-  the validated input as a plain dict, ``required_role`` (its string value),
-  and ``action_key`` — ``"<tool_name>:<sha256(tool_name + canonical input
-  JSON)>"`` — the stable identifier an approval is bound to.
+  the validated input as a plain dict, ``required_role`` — the approver role
+  of *this* call from :func:`resolve_approval_role` (the tool's
+  ``required_role`` unless its ``approval_role`` resolver asks for a more
+  privileged one) as its string value — and ``action_key`` —
+  ``"<tool_name>:<sha256(tool_name + canonical input JSON)>"`` — the stable
+  identifier an approval is bound to. A resolver that fails is a
+  ``tool_failed`` error: no payload is produced with a guessed role.
 
 Audit (T8)
 ----------
@@ -58,10 +66,11 @@ outcome                     action                         payload / result
 unknown tool                ``tool.not_found``             input field names / error
 insufficient role           ``tool.denied``                input field names / error
 invalid input               ``tool.invalid_input``         input field names / error locs+types
-no grant (approval needed)  ``tool.approval_required``     canonical input / key + role
+precheck refused            ``tool.precheck_failed``       canonical input / error + reason
+no grant (approval needed)  ``tool.approval_required``     canonical input / key + approver
 rejected grant              ``tool.denied``                canonical input / error
 dry run                     ``tool.dry_run``               canonical input / approval needed
-handler or output failure   ``tool.failed``                canonical input / error
+handler/hook/output failure ``tool.failed``                canonical input / error
 success                     ``tool.executed``              canonical input / output
 ========================== ============================== ===============================
 
@@ -79,22 +88,36 @@ from typing import Any, Literal, NamedTuple
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.modules.agent.llm import LLMProvider
 from app.modules.approvals.grants import ApprovalGrant, consume_grant
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
+from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.models import UserRole
 from app.modules.retrieval.embeddings import EmbeddingProvider
-from app.modules.tools.exceptions import ToolNotFoundError
-from app.modules.tools.registry import ApprovalPolicy, ToolContext, ToolRegistry, ToolUser
+from app.modules.tools.exceptions import (
+    ToolApprovalRoleError,
+    ToolNotFoundError,
+    ToolPrecheckError,
+)
+from app.modules.tools.registry import (
+    ApprovalPolicy,
+    ToolContext,
+    ToolRegistry,
+    ToolSpec,
+    ToolUser,
+)
 
 logger = logging.getLogger(__name__)
 
-ErrorKind = Literal["not_found", "forbidden", "validation", "execution"]
+ErrorKind = Literal["not_found", "forbidden", "validation", "precheck", "execution"]
 
 #: Caller-facing message of a handler exception (the detail is audited only).
 TOOL_FAILED = "tool_failed"
 #: Caller-facing message of a handler return that violates ``output_model``.
 INVALID_OUTPUT = "invalid tool output"
+#: Code of a precheck refusal; the caller-facing message is ``"<code>: <reason>"``.
+PRECHECK_FAILED = "precheck_failed"
 
 #: Role precedence: lower number = more privileged. Mirrors UserRole's
 #: declaration order ("ordered from most to least privileged").
@@ -155,6 +178,18 @@ class _AuditRecord(NamedTuple):
     result: dict[str, Any]
 
 
+def _tool_failed(
+    tool_name: str, canonical: dict[str, Any], exc: Exception
+) -> tuple[ToolExecutionResult, _AuditRecord]:
+    """Masked failure: callers get :data:`TOOL_FAILED`, the detail is audited only."""
+    return ToolExecutionResult(
+        tool_name=tool_name,
+        status="error",
+        error=TOOL_FAILED,
+        error_kind="execution",
+    ), _AuditRecord("tool.failed", canonical, {"error": str(exc) or type(exc).__name__})
+
+
 def _input_fields(raw_input: Any) -> dict[str, Any]:
     """Field names of unvalidated input: never its values."""
     names = sorted(map(str, raw_input)) if isinstance(raw_input, dict) else []
@@ -203,6 +238,27 @@ def role_satisfies(user: ToolUser, required_role: UserRole) -> bool:
     return _ROLE_RANK[user.role] <= _ROLE_RANK[required_role]
 
 
+def resolve_approval_role(spec: ToolSpec, validated_input: BaseModel) -> UserRole:
+    """Role that must approve this call of ``spec`` with ``validated_input``.
+
+    The more privileged of ``spec.approval_role(validated_input)`` and
+    ``spec.required_role``: an approver is never less privileged than who may
+    invoke the tool. Without a resolver this is ``spec.required_role``.
+
+    Raises:
+        ToolApprovalRoleError: the resolver raised or returned a value that
+            is not a :class:`UserRole` (callers never guess a role instead).
+    """
+    if spec.approval_role is None:
+        return spec.required_role
+    try:
+        resolved = UserRole(spec.approval_role(validated_input))
+    except Exception as exc:
+        detail = str(exc) or type(exc).__name__
+        raise ToolApprovalRoleError(f"approval role resolution failed: {detail}") from exc
+    return min(resolved, spec.required_role, key=_ROLE_RANK.__getitem__)
+
+
 async def execute_tool(
     registry: ToolRegistry,
     session: AsyncSession,
@@ -215,6 +271,8 @@ async def execute_tool(
     actor_type: ActorType = ActorType.USER,
     correlation_id: str | None = None,
     embeddings: EmbeddingProvider | None = None,
+    llm: LLMProvider | None = None,
+    storage: DocumentStorage | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
 
@@ -227,16 +285,24 @@ async def execute_tool(
     3. Validation — ``spec.input_model`` rejects ``raw_input`` ⇒
        ``error``/``validation`` listing each failing field (no input
        values); handler not called.
-    4. Approval gate (``REQUIRE_APPROVAL`` and not ``dry_run``) — no
+    4. Precheck (when the tool has one), with the same context the handler
+       gets — :class:`ToolPrecheckError` ⇒ ``error``/``precheck`` with
+       ``precheck_failed: <reason>``; any other exception ⇒
+       ``error``/``execution`` with :data:`TOOL_FAILED`. It runs on every
+       path below, so an approved call is re-checked right before its
+       handler and a refused call never reaches the approval gate.
+    5. Approval gate (``REQUIRE_APPROVAL`` and not ``dry_run``) — no
        ``approval_grant`` ⇒ ``approval_required`` carrying the payload to
-       approve; a grant that ``consume_grant`` rejects for this call's
-       action key ⇒ ``error``/``forbidden``.
-    5. Dry run ⇒ ``dry_run`` describing the call; handler not called.
-    6. Handler run with a :class:`ToolContext` (``session``, the user's
-       tenant, ``embeddings``, ``correlation_id``) — exceptions ⇒
-       ``error``/``execution`` with the generic :data:`TOOL_FAILED`; the
-       exception text goes to the server log and the audit event only.
-    7. Output validation — ``spec.output_model`` rejects the return ⇒
+       approve with the role from :func:`resolve_approval_role` (a failing
+       resolver ⇒ ``error``/``execution``); a grant that ``consume_grant``
+       rejects for this call's action key ⇒ ``error``/``forbidden``.
+    6. Dry run ⇒ ``dry_run`` describing the call; handler not called.
+    7. Handler run with a :class:`ToolContext` (``session``, the user's
+       tenant, ``embeddings``, ``llm``, ``storage``, ``correlation_id``) —
+       exceptions ⇒ ``error``/``execution`` with the generic
+       :data:`TOOL_FAILED`; the exception text goes to the server log and
+       the audit event only.
+    8. Output validation — ``spec.output_model`` rejects the return ⇒
        ``error``/``execution`` with :data:`INVALID_OUTPUT`.
 
     Handlers own their own transaction: the executor neither commits nor
@@ -249,6 +315,8 @@ async def execute_tool(
         user=user,
         embeddings=embeddings,
         correlation_id=correlation_id,
+        llm=llm,
+        storage=storage,
     )
     result, record = await _evaluate(
         registry, context, tool_name, raw_input, dry_run, approval_grant
@@ -311,13 +379,36 @@ async def _evaluate(
         )
 
     canonical = validated_input.model_dump(mode="json")
+    if spec.precheck is not None:
+        try:
+            await spec.precheck(context, validated_input)
+        except ToolPrecheckError as exc:
+            return ToolExecutionResult(
+                tool_name=spec.name,
+                status="error",
+                error=f"{PRECHECK_FAILED}: {exc.reason}",
+                error_kind="precheck",
+            ), _AuditRecord(
+                "tool.precheck_failed",
+                canonical,
+                {"error": PRECHECK_FAILED, "reason": exc.reason},
+            )
+        except Exception as exc:
+            logger.exception("tool %s precheck failed", spec.name)
+            return _tool_failed(spec.name, canonical, exc)
+
     if spec.approval_policy is ApprovalPolicy.REQUIRE_APPROVAL and not dry_run:
         action_key = compute_action_key(spec.name, validated_input)
         if approval_grant is None:
+            try:
+                approver = resolve_approval_role(spec, validated_input)
+            except ToolApprovalRoleError as exc:
+                logger.exception("tool %s could not resolve its approver role", spec.name)
+                return _tool_failed(spec.name, canonical, exc)
             payload = ApprovalRequestPayload(
                 tool_name=spec.name,
                 input=canonical,
-                required_role=spec.required_role.value,
+                required_role=approver.value,
                 action_key=action_key,
             )
             return ToolExecutionResult(
@@ -327,7 +418,7 @@ async def _evaluate(
             ), _AuditRecord(
                 "tool.approval_required",
                 canonical,
-                {"action_key": action_key, "required_role": spec.required_role.value},
+                {"action_key": action_key, "required_role": approver.value},
             )
         if not consume_grant(approval_grant, action_key):
             logger.warning("tool %s refused an invalid approval grant", spec.name)
@@ -355,13 +446,7 @@ async def _evaluate(
         output = await spec.handler(context, validated_input)
     except Exception as exc:
         logger.exception("tool %s failed", spec.name)
-        detail = str(exc) or type(exc).__name__
-        return ToolExecutionResult(
-            tool_name=spec.name,
-            status="error",
-            error=TOOL_FAILED,
-            error_kind="execution",
-        ), _AuditRecord("tool.failed", canonical, {"error": detail})
+        return _tool_failed(spec.name, canonical, exc)
 
     if spec.output_model is not None:
         try:
