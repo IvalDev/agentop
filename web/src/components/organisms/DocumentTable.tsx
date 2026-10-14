@@ -1,8 +1,8 @@
 import type { DocumentSummary } from '../../api/documents';
 import { formatDate, t } from '../../i18n';
 import { documentTypeLabel, failureSummary, formatFileSize } from '../../knowledge/documents';
-import { Button } from '../atoms/Button';
 import { DocumentStatusBadge } from '../molecules/DocumentStatusBadge';
+import { RowActionButton } from '../molecules/RowActionButton';
 
 export interface DocumentTableProps {
   documents: DocumentSummary[];
@@ -11,15 +11,6 @@ export interface DocumentTableProps {
   /** Ids being ingested again; their button waits. */
   ingesting: ReadonlySet<string>;
   onIngest: (document: DocumentSummary) => void;
-}
-
-function IngestButton({ document, busy, onIngest }: { document: DocumentSummary; busy: boolean; onIngest: () => void }) {
-  return (
-    <Button variant="secondary" aria-disabled={busy || undefined} onClick={busy ? undefined : onIngest}>
-      {t(document.status === 'failed' ? 'knowledge.list.retry' : 'knowledge.list.process')}{' '}
-      <span className="visually-hidden">{t('knowledge.list.actionTarget', { name: document.filename })}</span>
-    </Button>
-  );
 }
 
 /**
@@ -82,10 +73,11 @@ export function DocumentTable({ documents, canIngest, ingesting, onIngest }: Doc
               {canIngest && (
                 <td data-label={labels.actions}>
                   {canRun && (
-                    <IngestButton
-                      document={document}
+                    <RowActionButton
+                      label={t(document.status === 'failed' ? 'knowledge.list.retry' : 'knowledge.list.process')}
+                      target={t('knowledge.list.actionTarget', { name: document.filename })}
                       busy={ingesting.has(document.id)}
-                      onIngest={() => onIngest(document)}
+                      onClick={() => onIngest(document)}
                     />
                   )}
                 </td>

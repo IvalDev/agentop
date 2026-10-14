@@ -207,7 +207,7 @@ with company `demo` and any user of [the demo team](#the-demo-team), for example
 | `/login` | Iniciar sesión | Everyone | Done: company, email, password |
 | `/chat` | Chat | Every role | Done: streamed answers, sources, history, stop, and reset ([below](#chat)) |
 | `/conocimiento` | Base de conocimiento | Every role; uploads and ingest for operator and up | Done: document list, multi-file upload with automatic ingest, retry ([below](#knowledge-base)) |
-| `/configuracion/equipo` | Configuración → Equipo | Owner and admin; other roles are sent to `/chat` | Placeholder; user management comes in L5 |
+| `/configuracion/equipo` | Configuración → Equipo | Owner and admin; other roles are sent to `/chat` | Done: members, add, change role, deactivate, reactivate ([below](#team)) |
 
 The header shows your name and role and has **Cerrar sesión**. On a phone-width screen the
 navigation collapses behind a **Menú** button.
@@ -267,6 +267,27 @@ The Base de conocimiento section uses the documents API (`GET /api/v1/documents/
   the browser reports for them (some report Markdown as `text/x-markdown`).
 - Screen readers: a polite status announces each step and a summary of the batch.
 
+### Team
+
+Configuración → Equipo is the UI for the [team API](#manage-the-team-owner-and-admin); only owners
+and admins reach it, and the API enforces every rule again.
+
+- **Personas** lists everyone in the company, oldest first: name, email, role (Propietario,
+  Administrador, Operador, Lector), state (Activo or Inactivo, with a symbol), and date added.
+  Your own row says "(tú)".
+- **Cambiar rol** and **Desactivar** open an inline confirmation under the heading, which takes
+  focus; **Cancelar** sends nothing and returns focus to the button. **Reactivar** applies at once.
+- Controls the rules forbid are not offered: your own row has none, and for an admin neither do
+  owners' rows (each says why). An admin is never offered the Propietario role, in the form or
+  when changing a role.
+- **Dar de alta a una persona** takes a full name, an email (trimmed and lowercased before
+  sending), a role (Lector by default), and an initial password of 8 characters to 72 UTF-8
+  bytes, checked before sending. Share the password with the person through a safe channel; there
+  is no password reset yet (P2).
+- Refusals are shown in Spanish, never the API's text: 403 (owner-only change), 404 (no longer
+  in the company; the list reloads), each 409 rule (email taken, your own role or account, the
+  last active owner), and 422.
+
 ### Develop with hot reload
 
 ```bash
@@ -318,10 +339,11 @@ suite work as before.
 | Path in `web/src` | Holds |
 | --- | --- |
 | `i18n/` | `es-ES.ts` catalog (every visible string) and `t()`, `formatDate()`, `formatNumber()` |
-| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling), auth calls, `chat.ts` (SSE parser, typed chat events), and `documents.ts` |
+| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling), auth calls, `chat.ts` (SSE parser, typed chat events), `documents.ts`, and `team.ts` |
 | `session/` | `SessionProvider`, `useSession()`, roles, token storage |
 | `chat/` | `ChatProvider` and `useChat()` (the conversation, mounted by the dashboard shell), its reducer, history, and message texts |
 | `knowledge/` | The document list and upload queue hooks, file checks, error mapping, and size and type labels |
+| `team/` | The member list hook, role rules (assignable roles, locked rows), password checks, and error mapping |
 | `components/` | Presentational atoms, molecules, organisms, and templates |
 | `pages/`, `routes/` | Route containers, guards (`RequireAuth`, `RequireRole`), and `paths` |
 | `test/` | Fake API (with `createGate()` to hold a request open), `renderApp()`, the axe helper, and `fakeChat.ts` (scripted SSE streams cut mid-line and mid-character) |

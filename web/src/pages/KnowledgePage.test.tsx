@@ -1,7 +1,7 @@
 import { fireEvent, screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import type { Role } from '../session/roles';
-import { expectNoAxeViolations } from '../test/axe';
+import { AXE_TEST_TIMEOUT_MS, expectNoAxeViolations } from '../test/axe';
 import { createGate, installFakeApi, routesCalled, signedInRoutes, type FakeRoutes } from '../test/fakeApi';
 import { renderApp } from '../test/renderApp';
 
@@ -114,7 +114,7 @@ async function releaseNext(gate: ReturnType<typeof createGate>) {
 }
 
 describe('KnowledgePage: the document list', () => {
-  it('lists every document with its type, size, date, and status', async () => {
+  it('lists every document with its type, size, date, and status', { timeout: AXE_TEST_TIMEOUT_MS }, async () => {
     await openKnowledge('viewer', { [LIST]: listReply(LISTED) });
 
     const table = await screen.findByRole('table', { name: TABLE_NAME });
@@ -284,7 +284,7 @@ describe('KnowledgePage: uploads', () => {
     ]);
   });
 
-  it('explains 413, 422, and 502 in Spanish, never with the server text', async () => {
+  it('explains 413, 422, and 502 in Spanish, never with the server text', { timeout: AXE_TEST_TIMEOUT_MS }, async () => {
     const { user } = await openKnowledge('operator', {
       [LIST]: listReply([]),
       [UPLOAD]: (init) => {

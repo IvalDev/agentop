@@ -604,6 +604,46 @@ main:focus {
   color: var(--color-text-muted);
 }
 
+.status--active {
+  color: var(--color-success);
+}
+
+.status--inactive {
+  border-style: dashed;
+  color: var(--color-text-muted);
+}
+
+.data-table__note {
+  color: var(--color-text-muted);
+  font-size: 0.875rem;
+}
+
+/* Team: the inline confirmation step and the form to add someone */
+.confirm-panel {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 2px solid var(--color-primary);
+  border-radius: var(--radius);
+  background: var(--color-info-bg);
+}
+
+.confirm-panel__title {
+  font-size: 1.125rem;
+}
+
+/* Programmatic focus target when the panel opens; not interactive, so no ring. */
+.confirm-panel__title:focus {
+  outline: none;
+}
+
+.confirm-panel__form,
+.member-form {
+  display: grid;
+  gap: var(--space-4);
+  max-width: 32rem;
+}
+
 .failure {
   display: grid;
   gap: var(--space-1);
