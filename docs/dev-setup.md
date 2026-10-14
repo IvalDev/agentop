@@ -126,8 +126,8 @@ Every role logs in with tenant slug `demo`.
 
 | Role | Email | Default password | Can do |
 | --- | --- | --- | --- |
-| owner | `owner@demo.test` | `demo-owner-pass` | Everything below, plus read the audit log (`GET /api/v1/audit`) |
-| admin | `admin@demo.test` | `demo-admin-pass` | Same as owner in this milestone |
+| owner | `owner@demo.test` | `demo-owner-pass` | Everything below, plus manage owners and read the audit log (`GET /api/v1/audit`) |
+| admin | `admin@demo.test` | `demo-admin-pass` | Everything below, plus [manage the team](#manage-the-team-owner-and-admin) except owners |
 | operator | `operator@demo.test` | `demo-operator-pass` | Chat, search, upload and ingest documents; review approvals for operator-level tools |
 | viewer | `viewer@demo.test` | `demo-viewer-pass` | Chat, search, list documents (read-only) |
 
@@ -135,6 +135,45 @@ The agent only offers the tools a role may run, and an approval request can only
 and decided by a role that satisfies the tool's required role. Today the only built-in
 tool is `search_documents` (viewer and up), so no chat run produces an approval request
 yet; the client already renders them for the action tools that come later.
+
+## Manage the team (owner and admin)
+
+Owners and admins manage the users of their own company; every other role gets 403. The
+company always comes from the token, never from the request.
+
+| Method and path | Body | Success |
+| --- | --- | --- |
+| `GET /api/v1/users` | none | 200 `{"users": [user, ...]}`, oldest first |
+| `POST /api/v1/users` | `email`, `full_name`, `role`, `password` | 201 user |
+| `PUT /api/v1/users/{id}/role` | `role` | 200 user |
+| `POST /api/v1/users/{id}/deactivate` | none | 200 user |
+| `POST /api/v1/users/{id}/reactivate` | none | 200 user |
+
+A user is `{"id", "email", "full_name", "role", "is_active", "created_at"}`; `role` is
+`owner`, `admin`, `operator`, or `viewer`. New emails are trimmed and stored lowercase,
+and an initial password needs 8 characters to 72 bytes.
+
+| Answer | When |
+| --- | --- |
+| 403 `forbidden` | Caller is operator or viewer; or an admin creates an owner, promotes to `owner`, or changes, deactivates, or reactivates an owner |
+| 404 `user not found` | The id is unknown or belongs to another company (both answer the same) |
+| 409 with the rule as `detail` | `email already registered`, `cannot change your own role`, `cannot deactivate yourself`, `tenant must keep at least one active owner` |
+| 422 | Invalid body, or any extra field such as `tenant_id` |
+
+A deactivated user cannot log in, and their tokens stop working on the next request; a
+role change also applies on the next request. Setting the role or state a user already
+has changes nothing. Every change is audited (`user.created`, `user.role_changed`,
+`user.deactivated`, `user.reactivated`) without the password, and refusals by the rules
+above are audited as `user.denied`.
+
+```bash
+TOKEN=$(curl -s localhost:8000/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"admin@demo.test","password":"demo-admin-pass","tenant_slug":"demo"}' \
+  | jq -r .access_token)
+curl -s localhost:8000/api/v1/users -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"new@demo.test","full_name":"New Hire","role":"viewer","password":"change-me-now"}' | jq .
+```
 
 ## Embeddings on a weak machine
 

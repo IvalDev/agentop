@@ -20,6 +20,7 @@ from app.modules.audit.service import configure_audit
 from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.router import router as auth_router
+from app.modules.identity.users_router import router as users_router
 from app.modules.retrieval.embeddings import build_embedding_provider
 from app.modules.retrieval.router import router as search_router
 from app.modules.tools import builtin  # noqa: F401  (registers the production tools)
@@ -79,6 +80,7 @@ def create_app() -> FastAPI:
     application.state.tool_registry = default_registry
     application.include_router(health_router)
     application.include_router(auth_router)
+    application.include_router(users_router)
     application.include_router(documents_router)
     application.include_router(search_router)
     application.include_router(approvals_router)
