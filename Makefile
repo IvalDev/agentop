@@ -7,50 +7,67 @@
 ENV_FILE ?= .env
 ENV_FILE_FLAG = $(if $(wildcard $(ENV_FILE)),--env-file $(ENV_FILE))
 
+# Python tools run from .venv when it exists (no shell activation needed); otherwise
+# fall back to whatever is on PATH (e.g. a system-wide `pip install -e ".[dev]"`).
+VENV ?= .venv
+ifneq ($(wildcard $(VENV)/bin),)
+PY = $(VENV)/bin/python
+UVICORN = $(VENV)/bin/uvicorn
+RUFF = $(VENV)/bin/ruff
+PYTEST = $(VENV)/bin/pytest
+ALEMBIC = $(VENV)/bin/alembic
+else
+PY = python
+UVICORN = uvicorn
+RUFF = ruff
+PYTEST = pytest
+ALEMBIC = alembic
+endif
+
 # React web app (web/): Node 22.22+ and npm. FastAPI serves web/dist at / once built.
 WEB_DIR = web
 # npm writes this file on install: (re)install whenever package-lock.json is newer.
 WEB_DEPS = $(WEB_DIR)/node_modules/.package-lock.json
 
 install:
-	pip install -e ".[dev]"
+	$(PY) -m pip install -e ".[dev]"
 
 lint:
-	ruff check . && ruff format --check .
+	$(RUFF) check . && $(RUFF) format --check .
 
 format:
-	ruff format . && ruff check --fix .
+	$(RUFF) format . && $(RUFF) check --fix .
 
 test:
-	pytest
+	$(PYTEST)
 
 run:
-	uvicorn app.main:app --reload
+	$(UVICORN) app.main:app --reload
 
 migrate:
-	alembic upgrade head
+	$(ALEMBIC) upgrade head
 
 migrate-revision:
-	alembic revision --autogenerate -m "$(m)"
+	$(ALEMBIC) revision --autogenerate -m "$(m)"
 
 bootstrap:
-	python -m app.modules.identity.seed
+	$(PY) -m app.modules.identity.seed
 
 demo:
-	python -m app.demo.seed --create-schema $(ENV_FILE_FLAG)
+	$(PY) -m app.demo.seed --create-schema $(ENV_FILE_FLAG)
 
 dev:
-	uvicorn app.main:app --reload $(ENV_FILE_FLAG)
+	$(UVICORN) app.main:app --reload $(ENV_FILE_FLAG)
 
 chat:
-	python -m app.demo.chat --user $(or $(user),owner)
+	$(PY) -m app.demo.chat --user $(or $(user),owner)
 
 $(WEB_DEPS): $(WEB_DIR)/package-lock.json
 	npm --prefix $(WEB_DIR) ci
 
 # Build the web app, then serve it and the API on localhost:8000 (like `make dev`).
 app: web-build
-	uvicorn app.main:app --reload $(ENV_FILE_FLAG)
+	$(UVICORN) app.main:app --reload $(ENV_FILE_FLAG)
 
 web-build: $(WEB_DEPS)
 	npm --prefix $(WEB_DIR) run build
