@@ -5,6 +5,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.crypto import validate_credentials_key
+
 #: ``environment`` values that enable development-only features (the ``/ui``
 #: console). Matched exactly, like the demo seed: ``PRODUCTION`` is not ``dev``.
 DEVELOPMENT_ENVIRONMENTS = frozenset({"dev", "development", "local", "test"})
@@ -74,6 +76,11 @@ class Settings(BaseSettings):
     web_dist_dir: str = str(DEFAULT_WEB_DIST_DIR)
     bootstrap_email: str = ""
     bootstrap_password: str = ""
+    # Connections (T3): Fernet key encrypting per-user connection credentials
+    # at rest (``AA_CREDENTIALS_KEY``). Required in production (validated
+    # below), optional elsewhere — without it the connections service fails
+    # closed and refuses to store credentials. Key lives outside the database.
+    credentials_key: SecretStr | None = None
 
     @property
     def is_development(self) -> bool:
@@ -85,4 +92,25 @@ class Settings(BaseSettings):
         """Refuse to run in production when no JWT signing secret is configured."""
         if self.environment == "production" and not self.jwt_secret:
             raise ValueError("jwt_secret must be non-empty when environment is 'production'")
+        return self
+
+    @model_validator(mode="after")
+    def require_credentials_key_in_production(self) -> "Settings":
+        """Fail fast when production lacks a credentials key; validate its shape.
+
+        Production without a key raises the usual ``ValidationError`` (nothing
+        secret exists in that case). A key that *is* present is format-checked
+        here so a bad value explodes at startup, not on first write — the
+        format check raises :class:`CredentialsKeyFormatError`, deliberately
+        not a ``ValueError``: pydantic wraps validator ``ValueError``s into a
+        ``ValidationError`` whose rendering echoes the raw input, i.e. the key
+        itself. See that exception's docstring for the full reasoning.
+        """
+        if not self.credentials_key or not self.credentials_key.get_secret_value():
+            if self.environment == "production":
+                raise ValueError(
+                    "credentials_key must be non-empty when environment is 'production'"
+                )
+            return self
+        validate_credentials_key(self.credentials_key.get_secret_value())
         return self

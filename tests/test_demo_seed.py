@@ -235,6 +235,7 @@ def _cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, environment: str =
     monkeypatch.setenv("AA_STORAGE_BASE_DIR", str(tmp_path / "storage"))
     monkeypatch.setenv("AA_ENVIRONMENT", environment)
     monkeypatch.setenv("AA_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setenv("AA_CREDENTIALS_KEY", "cqsp933navSzGBmyUEnO6EKloifkQMdohIhgjgTQ3iE=")
     monkeypatch.delenv("AA_DEMO_PASSWORD", raising=False)
     return db_file
 

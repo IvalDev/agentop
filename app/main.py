@@ -22,6 +22,7 @@ from app.modules.audit.router import router as audit_router
 from app.modules.audit.service import configure_audit
 from app.modules.catalog.registry import default_catalog
 from app.modules.catalog.router import router as modules_router
+from app.modules.connections.router import router as connections_router
 from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.router import router as auth_router
@@ -196,6 +197,7 @@ def create_app() -> FastAPI:
     application.include_router(approvals_router)
     application.include_router(audit_router)
     application.include_router(modules_router)
+    application.include_router(connections_router)
     application.include_router(chat_router)
     if settings.is_development:
         # Static dev console over the public API; any other environment answers 404.

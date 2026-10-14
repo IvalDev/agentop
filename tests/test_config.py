@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.core.crypto import CredentialsKeyFormatError, generate_credentials_key
 
 
 def test_default_settings_load_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -31,9 +32,10 @@ def test_production_with_empty_jwt_secret_raises(monkeypatch: pytest.MonkeyPatch
 
 
 def test_production_with_jwt_secret_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Production environment accepts a non-empty jwt_secret."""
+    """Production environment accepts a non-empty jwt_secret and a valid key."""
     monkeypatch.setenv("AA_ENVIRONMENT", "production")
     monkeypatch.setenv("AA_JWT_SECRET", "non-empty-secret")
+    monkeypatch.setenv("AA_CREDENTIALS_KEY", generate_credentials_key())
 
     settings = Settings()
 
@@ -50,3 +52,55 @@ def test_dev_environment_allows_empty_jwt_secret(monkeypatch: pytest.MonkeyPatch
 
     assert settings.environment == "dev"
     assert settings.jwt_secret == ""
+
+
+def test_production_without_credentials_key_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Production refuses to start with no Fernet key for connection credentials."""
+    monkeypatch.setenv("AA_ENVIRONMENT", "production")
+    monkeypatch.setenv("AA_JWT_SECRET", "non-empty-secret")
+    monkeypatch.delenv("AA_CREDENTIALS_KEY", raising=False)
+
+    with pytest.raises(ValidationError, match="credentials_key"):
+        Settings()
+
+
+def test_credentials_key_is_a_secret_never_shown_in_repr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key round-trips through SecretStr and never appears in repr/str."""
+    key = generate_credentials_key()
+    monkeypatch.setenv("AA_ENVIRONMENT", "production")
+    monkeypatch.setenv("AA_JWT_SECRET", "non-empty-secret")
+    monkeypatch.setenv("AA_CREDENTIALS_KEY", key)
+
+    settings = Settings()
+
+    assert settings.credentials_key is not None
+    assert settings.credentials_key.get_secret_value() == key
+    assert key not in repr(settings)
+    assert key not in str(settings)
+
+
+def test_malformed_credentials_key_fails_eagerly_without_echoing_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-Fernet key explodes at construction with a clear, leak-free error."""
+    monkeypatch.setenv("AA_CREDENTIALS_KEY", "definitely-not-a-fernet-key")
+
+    with pytest.raises(CredentialsKeyFormatError, match="urlsafe base64") as excinfo:
+        Settings()
+
+    assert "definitely-not-a-fernet-key" not in str(excinfo.value)
+
+
+def test_dev_environment_keeps_credentials_key_optional(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Outside production the key may be absent; services must then fail closed."""
+    monkeypatch.delenv("AA_ENVIRONMENT", raising=False)
+    monkeypatch.delenv("AA_CREDENTIALS_KEY", raising=False)
+
+    settings = Settings()
+
+    assert settings.environment == "dev"
+    assert settings.credentials_key is None

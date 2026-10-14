@@ -37,6 +37,7 @@ async def _request(
 ) -> Response:
     monkeypatch.setenv("AA_ENVIRONMENT", environment)
     monkeypatch.setenv("AA_JWT_SECRET", "test-secret-0123456789-abcdefghijklmnop")
+    monkeypatch.setenv("AA_CREDENTIALS_KEY", "cqsp933navSzGBmyUEnO6EKloifkQMdohIhgjgTQ3iE=")
     monkeypatch.setenv("AA_WEB_DIST_DIR", str(dist))
     application = create_app()
     application.state.db = None
