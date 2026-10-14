@@ -142,6 +142,65 @@ yet; the client already renders them for the action tools that come later.
 Changing the embedding provider or model after seeding mixes incompatible vectors: delete
 `dev.db` and `var/storage` and run `make demo` again.
 
+## Walk through the RAG pipeline by hand
+
+Upload a document of your own and follow it through extraction, chunking, embedding,
+search, and chat, against the API started by `make dev`. A browser console for this flow
+is planned (task T9.4 in `odd/tasks/admin-agent-core.md`); until it lands, use `curl` and
+`jq`.
+
+> Write facts that appear in no other document (a made-up policy with names and dates),
+> so a chat answer about them can only come from your file.
+
+1. Log in as operator or higher (upload and ingest are operator+):
+
+   ```bash
+   TOKEN=$(curl -s localhost:8000/api/v1/auth/login -H 'Content-Type: application/json' \
+     -d '{"email":"operator@demo.test","password":"demo-operator-pass","tenant_slug":"demo"}' \
+     | jq -r .access_token)
+   ```
+
+2. Upload. The trailing slash is required, and so is the explicit type: ingest picks the
+   extractor from the type the client sent, and `curl` sends `.md` as
+   `application/octet-stream`, which ingest rejects with 422 `unsupported content type`.
+
+   ```bash
+   DOC_ID=$(curl -s localhost:8000/api/v1/documents/ -H "Authorization: Bearer $TOKEN" \
+     -F "file=@my_document.md;type=text/markdown" | jq -r .id)
+   ```
+
+   | Extension | `type=` |
+   | --- | --- |
+   | `.md` | `text/markdown` |
+   | `.txt` | `text/plain` |
+   | `.pdf` | `application/pdf` |
+   | `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
+
+3. Ingest: extract the text, chunk it, embed the chunks, and store them (synchronous):
+
+   ```bash
+   curl -s -X POST localhost:8000/api/v1/documents/$DOC_ID/ingest \
+     -H "Authorization: Bearer $TOKEN" | jq .
+   ```
+
+   Expect `"status": "processed"`. A 422 means an unsupported or unreadable file; a 502
+   means the embedding backend (Ollama) is unavailable. Both leave the document `failed`.
+
+4. Inspect retrieval without the chat. These are the passages the agent would receive:
+
+   ```bash
+   curl -s localhost:8000/api/v1/search -H "Authorization: Bearer $TOKEN" \
+     -H 'Content-Type: application/json' \
+     -d '{"query":"words from your document","mode":"semantic","top_k":5}' \
+     | jq '.hits[] | {score, document_filename, content}'
+   ```
+
+   Compare `semantic`, `keyword`, and `hybrid`. Keyword scoring counts substring matches,
+   so a long document that repeats a common word can outrank yours.
+
+5. Ask the chat: run `make chat` and ask something only your document answers. The cited
+   passages are listed after the answer.
+
 ## SQLite or Postgres
 
 The app runs on both; the test suite runs on SQLite.
