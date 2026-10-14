@@ -46,7 +46,12 @@ Hoy la empresa y sus usuarios solo se crean con el seed de demo, no existe API d
 
 ### Fase 0 — Decisiones (antes de implementar)
 
-- [ ] D1 — **Canal de chat.** Recomendación: aplicación web progresiva (PWA) como canal principal: una sola base de código, se abre con una dirección en el navegador y se instala en el móvil y en el escritorio, sin tiendas de aplicaciones. Accesibilidad WCAG 2.2 AA como requisito (teclado, lector de pantalla, contraste, zoom, movimiento reducido, diseño adaptable a móvil). Complementos: widget embebible para integrar el chat en la intranet o el sistema de la empresa ("nativo en el sistema"), y canales de mensajería (WhatsApp Business, Telegram, Teams) como módulos más adelante. Aplicación nativa solo si la PWA se queda corta (p. ej. notificaciones o integración con el sistema operativo). **Pendiente de decisión del humano**
+- [x] D1 — **Canal de chat. Decidido por el humano 2026-10-14:** una sola interfaz web de chat (WCAG 2.2 AA: teclado, lector de pantalla, contraste, zoom, movimiento reducido, adaptable a móvil) entregada de tres formas:
+  - **Móvil:** PWA instalada en la pantalla de inicio (Android e iOS), con notificaciones push web. Si más adelante hace falta estar en las tiendas, se envuelve la misma web (p. ej. Capacitor)
+  - **Escritorio, "widget":** aplicación ligera que envuelve la misma web y vive en la bandeja del sistema, con atajo de teclado global que abre una ventana flotante de chat, opción de "siempre visible", arranque con el sistema y notificaciones nativas. Propuesta: Tauri (usa el navegador del sistema, instalador de pocos MB) frente a Electron (más pesado). Alternativa mínima: la PWA instalada en el escritorio, que abre en su propia ventana pero sin atajo global ni bandeja. **Tecnología pendiente de confirmar**
+  - **Navegador:** la misma web en una dirección
+  - Complementos posteriores: chat embebible en la intranet o sistema de la empresa, y canales de mensajería (WhatsApp Business, Telegram, Teams) como módulos
+  - Restricción derivada: PWA y notificaciones exigen HTTPS con certificado válido, y el móvil fuera de la oficina necesita llegar al servidor de la empresa (dirección pública con HTTPS o VPN). Afecta a T12 (deployment) de `admin-agent-core`
 - [ ] D2 — **Stack del frontend de producción.** La consola `/ui` (HTML + JS sin build) es solo de desarrollo. Opciones: React + Vite + TypeScript con atomic design y container/presentational (encaja con la experiencia del equipo), u otra. Depende de D1. **Pendiente**
 - [ ] D3 — **Conectores de correo y calendario.** Los proveedores varían por empresa: interfaz de conector común con adaptadores (Google Workspace, Microsoft 365 / Graph, IMAP/SMTP, CalDAV). Decidir el orden de los adaptadores. **Pendiente**
 - [ ] D4 — **Estrategia de entrega** de la feature (la previsión supera con mucho ~400 líneas): `ask-on-risk`; la estrategia de cadena (`stacked-to-main` o `feature-branch-chain`) se pregunta antes del primer commit de implementación
@@ -64,7 +69,8 @@ Hoy la empresa y sus usuarios solo se crean con el seed de demo, no existe API d
 ### Fase 2 — Canal de chat (tras D1 y D2)
 
 - [ ] C1 — Aplicación de producción: login, chat con citas, documentos, panel de aprobaciones y administración (usuarios, módulos, onboarding). Adaptable a móvil, instalable si D1 confirma PWA, WCAG 2.2 AA verificada. Resolver al pasar de la consola: estáticos como package data, y no montar UI de desarrollo si falta `AA_ENVIRONMENT`
-- [ ] C2 — Widget de chat embebible en sistemas de la empresa (si D1 lo confirma)
+- [ ] C2 — Widget de escritorio (según D1): envoltorio ligero de la misma web con bandeja del sistema, atajo global, ventana flotante, arranque con el sistema y notificaciones nativas; instaladores para Windows, macOS y Linux
+- [ ] C2.b — Chat embebible en la intranet o sistema de la empresa (posterior)
 - [ ] C3 — Canales de mensajería como módulos (WhatsApp Business, Telegram, Teams), con el mismo contrato de módulo
 
 ### Fase 3 — Módulos
@@ -102,4 +108,4 @@ Solo planificación (pedido del humano 2026-10-14: "añádelo a las tareas"). Ni
 
 ## Next step
 
-Decidir D1 (canal de chat) y D3 (orden de conectores); después, autorizar la Fase 1 (P1–P3 como primer bloque).
+D1 decidido (web accesible + PWA en móvil + widget de escritorio). Falta confirmar la tecnología del widget (Tauri propuesto), decidir D2 (stack del frontend) y D3 (orden de conectores), y autorizar la Fase 1 (P1–P3 como primer bloque).
