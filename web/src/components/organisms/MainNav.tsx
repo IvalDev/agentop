@@ -4,8 +4,8 @@ import { t } from '../../i18n';
 import { paths } from '../../routes/paths';
 
 export interface MainNavProps {
-  /** Settings → Team; only owners and admins get it. */
-  showTeam: boolean;
+  /** Settings (Team and Tools); only owners and admins get the group. */
+  showSettings: boolean;
 }
 
 const MENU_ID = 'main-nav-menu';
@@ -14,7 +14,7 @@ const MENU_ID = 'main-nav-menu';
  * Section links. On narrow screens the list collapses behind a "Menú" toggle
  * (`aria-expanded`); Escape closes it and returns focus to the toggle.
  */
-export function MainNav({ showTeam }: MainNavProps) {
+export function MainNav({ showSettings }: MainNavProps) {
   const [open, setOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
@@ -57,7 +57,7 @@ export function MainNav({ showTeam }: MainNavProps) {
             {t('nav.knowledge')}
           </NavLink>
         </li>
-        {showTeam && (
+        {showSettings && (
           <li className="main-nav__group">
             <span id="main-nav-settings" className="main-nav__group-label">
               {t('nav.settings')}
@@ -66,6 +66,11 @@ export function MainNav({ showTeam }: MainNavProps) {
               <li>
                 <NavLink className="main-nav__link" to={paths.team} onClick={close}>
                   {t('nav.team')}
+                </NavLink>
+              </li>
+              <li>
+                <NavLink className="main-nav__link" to={paths.tools} onClick={close}>
+                  {t('nav.tools')}
                 </NavLink>
               </li>
             </ul>
