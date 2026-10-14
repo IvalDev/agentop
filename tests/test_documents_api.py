@@ -13,7 +13,9 @@ from app.core.config import Settings
 from app.core.db import Database
 from app.main import create_app
 from app.modules.documents.models import DocumentChunk, DocumentStatus
+from app.modules.documents.service import create_document
 from app.modules.documents.storage import LocalDocumentStorage
+from app.modules.identity.models import Tenant
 
 DOCX_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 
@@ -282,6 +284,75 @@ async def test_ingest_docx_extracts_text(
     assert response.status_code == 200, response.text
     chunks = await _chunk_meta(seeded_db, document_id)
     assert any("Reporte trimestral" in content for _, content in chunks)
+
+
+async def test_generic_markdown_upload_is_stored_as_markdown_and_ingests(
+    documents_client: AsyncClient,
+) -> None:
+    """``curl -F file=@x.md`` sends octet-stream; the type comes from the extension instead."""
+    headers = await _headers(documents_client)
+    upload = await _upload(
+        documents_client,
+        headers,
+        filename="policy.md",
+        content=b"# Leave policy\n\nRequest leave 15 days in advance.",
+        content_type="application/octet-stream",
+    )
+    assert upload.status_code == 201, upload.text
+    assert upload.json()["content_type"] == "text/markdown"
+
+    response = await documents_client.post(
+        f"/api/v1/documents/{upload.json()['id']}/ingest", headers=headers
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == DocumentStatus.PROCESSED.value
+    assert response.json()["content_type"] == "text/markdown"
+
+
+async def test_upload_keeps_explicit_client_type(documents_client: AsyncClient) -> None:
+    """A specific type sent by the client wins over the filename extension."""
+    headers = await _headers(documents_client)
+    upload = await _upload(
+        documents_client, headers, filename="notes.md", content_type="text/plain"
+    )
+    assert upload.status_code == 201, upload.text
+    assert upload.json()["content_type"] == "text/plain"
+
+
+@pytest.mark.parametrize(
+    ("filename", "sent_type", "stored_type"),
+    [
+        ("notes.md", "", "text/markdown"),
+        ("NOTES.MARKDOWN", "application/octet-stream", "text/markdown"),
+        ("notes.txt", "", "text/plain"),
+        ("scan.pdf", "application/octet-stream", "application/pdf"),
+        ("report.docx", "", DOCX_CONTENT_TYPE),
+        ("bundle.zip", "application/octet-stream", "application/octet-stream"),
+        ("README", "", ""),
+        ("notes.md", "text/plain", "text/plain"),
+    ],
+)
+async def test_create_document_infers_generic_type_from_extension(
+    seeded_db: Database,
+    documents_settings: Settings,
+    tmp_path,
+    filename: str,
+    sent_type: str,
+    stored_type: str,
+) -> None:
+    """Only an empty or octet-stream type is replaced, and only for extensions ingest reads."""
+    async with seeded_db.sessionmaker() as session:
+        tenant = (await session.execute(select(Tenant).where(Tenant.slug == "acme"))).scalar_one()
+        document = await create_document(
+            session,
+            tenant.id,
+            filename,
+            sent_type,
+            b"content",
+            LocalDocumentStorage(tmp_path),
+            settings=documents_settings,
+        )
+    assert document.content_type == stored_type
 
 
 async def test_ingest_forbids_viewer_role(documents_client: AsyncClient) -> None:

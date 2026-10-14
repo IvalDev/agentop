@@ -12,6 +12,7 @@ is the acting user; ``None`` records a ``system`` actor (the ingest worker).
 """
 
 import logging
+import os
 from uuid import UUID, uuid4
 
 from sqlalchemy import delete, select
@@ -20,7 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.modules.audit.service import persist_event, stage_event
 from app.modules.documents.chunking import chunk_text
-from app.modules.documents.extract import extract_text
+from app.modules.documents.extract import DOCX_CONTENT_TYPE, extract_text
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.storage import DocumentStorage
 from app.modules.retrieval.embeddings import EmbeddingError, EmbeddingProvider
@@ -29,6 +30,16 @@ logger = logging.getLogger(__name__)
 
 MAX_FILENAME_LENGTH = 255
 _RESOURCE = "document"
+#: Types a client sends when it does not know the file's real type.
+_GENERIC_CONTENT_TYPES = frozenset({"", "application/octet-stream"})
+#: Extensions ingest can read, mapped to the type its extractor expects.
+_CONTENT_TYPES_BY_EXTENSION = {
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".txt": "text/plain",
+    ".pdf": "application/pdf",
+    ".docx": DOCX_CONTENT_TYPE,
+}
 
 
 class DocumentNotFoundError(Exception):
@@ -60,6 +71,21 @@ def validate_filename(filename: str) -> str:
     return name
 
 
+def resolve_content_type(filename: str, content_type: str) -> str:
+    """Return the client's content type, or one inferred from the extension when generic.
+
+    Ingest picks its extractor from the stored type, but clients that do not
+    know a file's type send ``application/octet-stream`` (``curl -F``) or no
+    type at all, and browsers do not guarantee ``text/markdown`` for ``.md``.
+    Only those generic types are replaced, and only for the extensions ingest
+    can read; any explicit type is kept exactly as sent.
+    """
+    if content_type.split(";")[0].strip().lower() not in _GENERIC_CONTENT_TYPES:
+        return content_type
+    extension = os.path.splitext(filename)[1].lower()
+    return _CONTENT_TYPES_BY_EXTENSION.get(extension, content_type)
+
+
 def storage_key_for(tenant_id: int, document_id: UUID, filename: str) -> str:
     """Build the storage key for a document (A4: tenant prefix first)."""
     return f"{tenant_id}/{document_id}/{filename}"
@@ -77,6 +103,9 @@ async def create_document(
     actor_user_id: int | None = None,
 ) -> Document:
     """Validate, store, and register a new document in ``uploaded`` state.
+
+    A generic ``content_type`` is replaced by :func:`resolve_content_type`
+    before it is stored.
 
     The caller owns the transaction and must commit. Bytes reach storage
     before the row exists: a failed commit can orphan a blob, which the
@@ -100,6 +129,7 @@ async def create_document(
             result={"error": str(exc)},
         )
         raise
+    content_type = resolve_content_type(name, content_type)
     document_id = uuid4()
     key = storage_key_for(tenant_id, document_id, name)
     await storage.put(key, data)
