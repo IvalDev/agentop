@@ -262,6 +262,36 @@ class AuditEventListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ModuleResponse(BaseModel):
+    """One catalog module with the caller tenant's activation flag.
+
+    The manifest's public identity only: onboarding steps stay server-side
+    until the onboarding API (T4) exposes them per user, and ``tenant_id``
+    never leaves the server.
+    """
+
+    key: str
+    name: str
+    description: str
+    version: str
+    permissions: list[str]
+    tools: list[str]
+    active: bool
+
+
+class ModuleListResponse(BaseModel):
+    """The catalog in registration order with this tenant's activation flags."""
+
+    modules: list[ModuleResponse]
+
+
+class ModuleActivationResponse(BaseModel):
+    """Resulting state of ``POST``/``DELETE`` ``/api/v1/modules/{key}/activate``."""
+
+    key: str
+    active: bool
+
+
 #: Longest chat message (and history turn) the API accepts, in characters.
 CHAT_MESSAGE_MAX_CHARS = 4000
 #: Most prior turns a client may replay as ``history``.
