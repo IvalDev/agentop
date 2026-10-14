@@ -5,8 +5,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.routing import Match, Route
+from starlette.types import Scope
 
 from app.api.health import router as health_router
 from app.core.config import Settings
@@ -30,6 +33,73 @@ logger = logging.getLogger(__name__)
 
 #: HTML + JavaScript of the development console (no build step).
 UI_STATIC_DIR = Path(__file__).parent / "ui" / "static"
+
+#: First path segments the web app never answers, so its client-side routes
+#: cannot shadow the API, the dev console, health, or the API docs.
+WEB_APP_RESERVED_SEGMENTS = frozenset({"api", "ui", "healthz", "docs", "redoc", "openapi.json"})
+
+#: Vite puts content-hashed files under ``assets/``: safe to cache for a year.
+_IMMUTABLE_CACHE = {"Cache-Control": "public, max-age=31536000, immutable"}
+
+
+class _WebAppRoute(Route):
+    """GET/HEAD catch-all for the web app that never matches reserved paths.
+
+    Answering ``Match.NONE`` (instead of a partial match) leaves every other
+    request to the router as before: 404 for unknown API paths, 405 only for
+    real routes, and the trailing-slash redirects (``/ui`` → ``/ui/``).
+    """
+
+    def matches(self, scope: Scope) -> tuple[Match, Scope]:
+        if scope["type"] != "http" or scope["method"] not in ("GET", "HEAD"):
+            return Match.NONE, {}
+        match, child_scope = super().matches(scope)
+        if match is Match.NONE:
+            return Match.NONE, {}
+        first_segment = child_scope["path_params"]["path"].split("/", 1)[0]
+        if first_segment in WEB_APP_RESERVED_SEGMENTS:
+            return Match.NONE, {}
+        return match, child_scope
+
+
+def _web_app_endpoint(dist_dir: Path):
+    """Serve files from the build, else ``index.html`` for client-side routes."""
+    root = dist_dir.resolve()
+    index = root / "index.html"
+
+    async def serve(request: Request) -> Response:
+        relative: str = request.path_params["path"]
+        if relative:
+            candidate = (root / relative).resolve()
+            if candidate.is_relative_to(root) and candidate.is_file():
+                headers = _IMMUTABLE_CACHE if relative.startswith("assets/") else None
+                return FileResponse(candidate, headers=headers)
+            # A missing file (an asset or anything with an extension) is a 404,
+            # never the HTML page: client routes look like /chat, not /x.png.
+            if relative.startswith("assets/") or "." in relative.rsplit("/", 1)[-1]:
+                return JSONResponse({"detail": "Not Found"}, status_code=404)
+        # Always revalidate the page so a new build's asset names are picked up.
+        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+
+    return serve
+
+
+def _mount_web_app(application: FastAPI, dist_dir: Path) -> None:
+    """Serve the built web app at ``/`` when ``dist_dir/index.html`` exists.
+
+    Registered last, so every API route and mount keeps priority. Without a
+    build (backend-only development, the test suite) nothing is mounted.
+    """
+    if not (dist_dir / "index.html").is_file():
+        return
+    application.router.routes.append(
+        _WebAppRoute(
+            "/{path:path}",
+            _web_app_endpoint(dist_dir),
+            methods=["GET"],
+            include_in_schema=False,
+        )
+    )
 
 
 def _log_level(name: str) -> int:
@@ -89,6 +159,7 @@ def create_app() -> FastAPI:
     if settings.is_development:
         # Static dev console over the public API; any other environment answers 404.
         application.mount("/ui", StaticFiles(directory=UI_STATIC_DIR, html=True), name="ui")
+    _mount_web_app(application, Path(settings.web_dist_dir))
     return application
 
 
