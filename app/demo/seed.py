@@ -38,11 +38,14 @@ from app.core.db import Base, Database
 from app.demo.team import DEMO_TENANT_NAME, DEMO_TENANT_SLUG, DEMO_USERS, PASSWORD_ENV_VAR, DemoUser
 from app.modules.approvals import models as _approval_models  # noqa: F401  (registers tables)
 from app.modules.audit import models as _audit_models  # noqa: F401  (registers tables)
+from app.modules.catalog import models as _catalog_models  # noqa: F401  (registers tables)
+from app.modules.connections import models as _connections_models  # noqa: F401  (registers tables)
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.service import create_document, ingest_document
 from app.modules.documents.storage import DocumentStorage, LocalDocumentStorage
 from app.modules.identity.models import Tenant, User, UserRole
 from app.modules.identity.security import hash_password
+from app.modules.onboarding import models as _onboarding_models  # noqa: F401  (registers tables)
 from app.modules.retrieval.embeddings import EmbeddingProvider, build_embedding_provider
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
