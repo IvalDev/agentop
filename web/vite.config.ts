@@ -19,5 +19,7 @@ export default defineConfig({
     setupFiles: ['./src/test/setup.ts'],
     restoreMocks: true,
     unstubGlobals: true,
+    // Full-page axe checks take ~0.5 s idle but can exceed 5 s under heavy CPU load.
+    testTimeout: 15_000,
   },
 });
