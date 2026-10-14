@@ -3,8 +3,8 @@
 Run the whole agent on a modest laptop against a **fictional demo company**: one SQLite
 file instead of Postgres, the chat model hosted by xAI (Grok) instead of local inference,
 and no embedding model at all (or a single small one). You get a seeded team with one user
-per role, 29 synthetic Spanish business documents about the company and its staff, and a
-console chat client.
+per role, 29 synthetic Spanish business documents about the company and its staff, a
+console chat client, and a browser console.
 
 > **Privacy warning — read before using an external model.**
 > With the Grok profile every chat message, the conversation history, and every document
@@ -55,6 +55,9 @@ Prerequisites: Python 3.12+, an xAI API key. Run everything from the repository 
    make chat              # as the owner
    make chat user=viewer  # as any other role
    ```
+
+   Or use the [browser console](#browser-console-development-only) at
+   <http://localhost:8000/ui/>.
 
 Questions to try (the documents are in Spanish):
 
@@ -142,12 +145,29 @@ yet; the client already renders them for the action tools that come later.
 Changing the embedding provider or model after seeding mixes incompatible vectors: delete
 `dev.db` and `var/storage` and run `make demo` again.
 
+## Browser console (development only)
+
+With `make dev` running, open <http://localhost:8000/ui/> and log in with tenant `demo`:
+as `operator@demo.test` / `demo-operator-pass` to upload, or any user to read and chat.
+It is plain HTML + JavaScript over the same API, mounted only when `AA_ENVIRONMENT` is
+`dev`, `development`, `local`, or `test`; any other environment answers 404 on `/ui`.
+
+| Panel | What it does |
+| --- | --- |
+| Login | Tenant slug, email, password; shows the user and role, and logs out |
+| Documents | Lists filename, status, type, size, and error message; **Upload & ingest** uploads a file and ingests it in one click, showing the outcome or the API error (upload is hidden for viewers) |
+| Search | Runs a search with a mode (`hybrid`, `semantic`, `keyword`) and `top_k`; shows each passage with its document, score, and character offsets |
+| Chat | Streams the answer with tool calls, tool results, approval notices, and expandable citations; replays the last 10 messages as history until **Reset conversation** |
+
+The access token lives only in the page's memory: reloading logs you out, and after
+`AA_ACCESS_TOKEN_EXPIRE_MINUTES` (30 by default) requests answer HTTP 401 — log in again.
+
 ## Walk through the RAG pipeline by hand
 
 Upload a document of your own and follow it through extraction, chunking, embedding,
-search, and chat, against the API started by `make dev`. A browser console for this flow
-is planned (task T9.4 in `odd/tasks/admin-agent-core.md`); until it lands, use `curl` and
-`jq`.
+search, and chat, against the API started by `make dev`. The
+[browser console](#browser-console-development-only) does the same with one panel per
+step; the commands below use `curl` and `jq`.
 
 > Write facts that appear in no other document (a made-up policy with names and dates),
 > so a chat answer about them can only come from your file.
@@ -160,21 +180,16 @@ is planned (task T9.4 in `odd/tasks/admin-agent-core.md`); until it lands, use `
      | jq -r .access_token)
    ```
 
-2. Upload. The trailing slash is required, and so is the explicit type: ingest picks the
-   extractor from the type the client sent, and `curl` sends `.md` as
-   `application/octet-stream`, which ingest rejects with 422 `unsupported content type`.
+2. Upload (the trailing slash is required):
 
    ```bash
    DOC_ID=$(curl -s localhost:8000/api/v1/documents/ -H "Authorization: Bearer $TOKEN" \
-     -F "file=@my_document.md;type=text/markdown" | jq -r .id)
+     -F "file=@my_document.md" | jq -r .id)
    ```
 
-   | Extension | `type=` |
-   | --- | --- |
-   | `.md` | `text/markdown` |
-   | `.txt` | `text/plain` |
-   | `.pdf` | `application/pdf` |
-   | `.docx` | `application/vnd.openxmlformats-officedocument.wordprocessingml.document` |
+   `curl` sends no real type (`application/octet-stream`), so the API takes it from the
+   extension: `.md`, `.markdown`, `.txt`, `.pdf`, and `.docx` are readable. A type the
+   client sends explicitly (`;type=...`) is kept as sent.
 
 3. Ingest: extract the text, chunk it, embed the chunks, and store them (synchronous):
 
@@ -198,8 +213,8 @@ is planned (task T9.4 in `odd/tasks/admin-agent-core.md`); until it lands, use `
    Compare `semantic`, `keyword`, and `hybrid`. Keyword scoring counts substring matches,
    so a long document that repeats a common word can outrank yours.
 
-5. Ask the chat: run `make chat` and ask something only your document answers. The cited
-   passages are listed after the answer.
+5. Ask the chat: run `make chat` (or use the console's Chat panel) and ask something only
+   your document answers. The cited passages are listed after the answer.
 
 ## SQLite or Postgres
 
@@ -259,3 +274,4 @@ Keep `dev.db`, `var/`, and `.env` out of commits.
 | Chat prints `[error] language model unavailable` | Wrong key or model name, or the provider is unreachable; the API log says which |
 | Documents `failed` with `ollama embeddings request failed` | Start Ollama and pull the embedding model, or use `AA_EMBEDDING_PROVIDER=fake`; re-run `make demo` |
 | `login failed ... invalid credentials` | Use tenant `demo` and the password printed by the first seed run |
+| `http://localhost:8000/ui/` answers 404 | `AA_ENVIRONMENT` is not `dev`, `development`, `local`, or `test`; the console exists only there |

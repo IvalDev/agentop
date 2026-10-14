@@ -3,8 +3,10 @@
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from app.api.health import router as health_router
 from app.core.config import Settings
@@ -24,6 +26,9 @@ from app.modules.tools import builtin  # noqa: F401  (registers the production t
 from app.modules.tools.registry import default_registry
 
 logger = logging.getLogger(__name__)
+
+#: HTML + JavaScript of the development console (no build step).
+UI_STATIC_DIR = Path(__file__).parent / "ui" / "static"
 
 
 def _log_level(name: str) -> int:
@@ -79,6 +84,9 @@ def create_app() -> FastAPI:
     application.include_router(approvals_router)
     application.include_router(audit_router)
     application.include_router(chat_router)
+    if settings.is_development:
+        # Static dev console over the public API; any other environment answers 404.
+        application.mount("/ui", StaticFiles(directory=UI_STATIC_DIR, html=True), name="ui")
     return application
 
 

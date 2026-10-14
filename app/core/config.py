@@ -3,6 +3,10 @@
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+#: ``environment`` values that enable development-only features (the ``/ui``
+#: console). Matched exactly, like the demo seed: ``PRODUCTION`` is not ``dev``.
+DEVELOPMENT_ENVIRONMENTS = frozenset({"dev", "development", "local", "test"})
+
 
 class Settings(BaseSettings):
     """Application settings.
@@ -63,6 +67,11 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     bootstrap_email: str = ""
     bootstrap_password: str = ""
+
+    @property
+    def is_development(self) -> bool:
+        """Whether ``environment`` is one of :data:`DEVELOPMENT_ENVIRONMENTS`."""
+        return self.environment in DEVELOPMENT_ENVIRONMENTS
 
     @model_validator(mode="after")
     def require_jwt_secret_in_production(self) -> "Settings":

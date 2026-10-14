@@ -1,0 +1,71 @@
+body {
+  font-family: system-ui, sans-serif;
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 0 16px 48px;
+  line-height: 1.4;
+}
+
+section {
+  border-top: 1px solid #ccc;
+  padding: 8px 0 16px;
+}
+
+form, label {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+
+th, td {
+  border: 1px solid #ddd;
+  padding: 4px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+
+pre, .answer {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+pre {
+  background: #f5f5f5;
+  padding: 6px;
+  margin: 4px 0;
+}
+
+textarea {
+  width: 100%;
+}
+
+.note, .meta, .event {
+  color: #555;
+  font-size: 0.9em;
+}
+
+.error {
+  color: #b00020;
+}
+
+.turn {
+  border-left: 3px solid #ccc;
+  margin: 12px 0;
+  padding-left: 8px;
+}
+
+.you {
+  font-weight: bold;
+}
+
+.events {
+  list-style: none;
+  padding: 0;
+  margin: 4px 0;
+}

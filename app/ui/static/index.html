@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>admin-agent dev console</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <h1>admin-agent dev console</h1>
+  <p class="note">Development only. The session lives in this page: reloading logs you out.</p>
+
+  <section>
+    <h2>1. Login</h2>
+    <form id="login-form">
+      <label>Tenant slug <input name="tenant_slug" value="demo" required></label>
+      <label>Email <input name="email" type="email" autocomplete="username" required></label>
+      <label>Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit">Log in</button>
+    </form>
+    <p id="session" hidden>
+      <span id="session-info"></span>
+      <button type="button" id="logout">Log out</button>
+    </p>
+    <p id="login-status" class="status"></p>
+  </section>
+
+  <main id="panels" hidden>
+    <section>
+      <h2>2. Documents</h2>
+      <form id="upload-form">
+        <input name="file" type="file" accept=".md,.markdown,.txt,.pdf,.docx" required>
+        <button type="submit">Upload &amp; ingest</button>
+      </form>
+      <p id="upload-status" class="status"></p>
+      <p>
+        <button type="button" id="refresh-documents">Refresh</button>
+        <span id="documents-status" class="status"></span>
+      </p>
+      <table>
+        <thead>
+          <tr><th>Filename</th><th>Status</th><th>Type</th><th>Bytes</th><th>Error</th></tr>
+        </thead>
+        <tbody id="documents"></tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>3. Search</h2>
+      <form id="search-form">
+        <input name="query" placeholder="Query" required>
+        <select name="mode">
+          <option>hybrid</option>
+          <option>semantic</option>
+          <option>keyword</option>
+        </select>
+        <label>top_k <input name="top_k" type="number" min="1" max="50" value="5"></label>
+        <button type="submit">Search</button>
+      </form>
+      <p id="search-status" class="status"></p>
+      <ol id="hits"></ol>
+    </section>
+
+    <section>
+      <h2>4. Chat</h2>
+      <div id="chat-log"></div>
+      <form id="chat-form">
+        <textarea name="message" rows="3" maxlength="4000" required></textarea>
+        <button type="submit">Send</button>
+        <button type="button" id="chat-reset">Reset conversation</button>
+      </form>
+      <p id="chat-status" class="status"></p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
