@@ -230,7 +230,15 @@ the running API serves the new files without a restart.
 | `/api/...`, `/healthz`, `/docs`, `/redoc`, `/openapi.json`, `/ui` | As before; never the web app |
 | A file in `web/dist`, such as `/assets/index-<hash>.js` | The file; hashed assets are cached for a year |
 | A missing file (`/assets/...`, or a name with an extension) | 404 JSON, never the page |
+| A path the filesystem rejects, such as `/%00` | 404 JSON |
 | Any other `GET` (`/`, `/chat`, ...) | `index.html`, and the app routes on the client |
+
+Every web-app response carries `Content-Security-Policy` (`default-src 'self'`, no inline
+scripts or styles, `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`),
+`X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff`. The Vite build has no inline
+code, so it needs nothing more; adding inline scripts, `style` attributes in HTML, or `data:`
+assets means changing `WEB_APP_CSP` in `app/main.py`. The API, `/docs`, and the dev console
+`/ui` do not get these headers.
 
 The app is mounted in every environment, but only when `web/dist/index.html` exists
 (`AA_WEB_DIST_DIR` points elsewhere). Without a build, backend-only development and the test
@@ -243,6 +251,10 @@ suite work as before.
 - The API has no refresh token. After `AA_ACCESS_TOKEN_EXPIRE_MINUTES` (30 by default) any
   request answers 401 and the app returns to the login page with "Tu sesión ha caducado".
   Planned: an httpOnly refresh cookie.
+- On reload, only a 401 from `GET /api/v1/auth/me` ends the session. A network error, 408,
+  429, or 5xx keeps the token and shows **Reintentar** (and **Cerrar sesión** to leave).
+- The API client only calls same-origin paths that start with `/api/`; any other path or URL
+  throws, so the token never leaves the API.
 - The email is trimmed and lowercased before login, because the API compares it exactly.
 - Server text is always rendered as text, and the app loads no external scripts, fonts, or CDNs.
 

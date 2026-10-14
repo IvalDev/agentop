@@ -1,6 +1,9 @@
 /**
  * Typed fetch wrapper for the same-origin API (`/api/...`).
  *
+ * - Only calls same-origin paths starting with `/api/`: an absolute URL, a
+ *   protocol-relative `//host`, or any other path is a programming error, so the
+ *   token can never reach another origin or a non-API page.
  * - Adds `Authorization: Bearer <token>` with the session token (or an explicit one).
  * - Turns every non-2xx reply into an `ApiError` carrying FastAPI's `detail`.
  * - A 401 on the session token means the session is over: `onUnauthorized` runs
@@ -54,8 +57,18 @@ async function readDetail(response: Response): Promise<unknown> {
   }
 }
 
+/** `/api/` followed by a path: never `//host`, `/\host`, or a URL with a scheme. */
+const API_PATH = /^\/api\/(?![/\\])/;
+
+function assertApiPath(path: string): void {
+  if (!API_PATH.test(path)) {
+    throw new TypeError(`The API client only calls same-origin /api/ paths, not "${path}".`);
+  }
+}
+
 export function createApiClient({ getToken, onUnauthorized }: ApiClientConfig): ApiClient {
   async function send(path: string, options: RequestOptions = {}): Promise<Response> {
+    assertApiPath(path);
     const { body, auth = true, token, headers, ...init } = options;
     const finalHeaders = new Headers(headers);
     let payload: BodyInit | undefined;

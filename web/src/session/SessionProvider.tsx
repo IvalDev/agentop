@@ -8,6 +8,8 @@ export type SessionNotice = 'expired' | 'loggedOut';
 
 type SessionState =
   | { status: 'restoring'; user: null; notice: null }
+  /** The stored token could not be checked (network or server failure): kept for a retry. */
+  | { status: 'unavailable'; user: null; notice: null }
   | { status: 'anonymous'; user: null; notice: SessionNotice | null }
   | { status: 'authenticated'; user: CurrentUser; notice: null };
 
@@ -17,11 +19,22 @@ export type SessionValue = SessionState & {
   /** Throws `ApiError` (401 for bad credentials, 0 when the server is unreachable). */
   login(credentials: Credentials): Promise<void>;
   logout(): void;
+  /** Check the stored token again after an `unavailable` restore. */
+  retryRestore(): void;
 };
 
 const SessionContext = createContext<SessionValue | null>(null);
 
 const ANONYMOUS: SessionState = { status: 'anonymous', user: null, notice: null };
+const RESTORING: SessionState = { status: 'restoring', user: null, notice: null };
+
+/** No answer, a timeout, rate limiting, or a server error: worth retrying with the same token. */
+function isTransient(error: unknown): boolean {
+  if (!(error instanceof ApiError)) {
+    return false;
+  }
+  return error.status === 0 || error.status === 408 || error.status === 429 || error.status >= 500;
+}
 
 /** The access token in memory, mirrored in `storage` so a reload can restore it. */
 function createTokenHolder(storage: TokenStorage) {
@@ -50,9 +63,8 @@ export interface SessionProviderProps {
  */
 export function SessionProvider({ children, storage = sessionTokenStorage }: SessionProviderProps) {
   const [tokens] = useState(() => createTokenHolder(storage));
-  const [state, setState] = useState<SessionState>(() =>
-    storage.read() ? { status: 'restoring', user: null, notice: null } : ANONYMOUS,
-  );
+  const [state, setState] = useState<SessionState>(() => (storage.read() ? RESTORING : ANONYMOUS));
+  const [restoreAttempt, setRestoreAttempt] = useState(0);
 
   const end = useCallback(
     (notice: SessionNotice | null) => {
@@ -81,15 +93,28 @@ export function SessionProvider({ children, storage = sessionTokenStorage }: Ses
         }
       },
       (error: unknown) => {
-        if (active) {
-          end(error instanceof ApiError && error.status === 401 ? 'expired' : null);
+        if (!active) {
+          return;
+        }
+        if (error instanceof ApiError && error.status === 401) {
+          end('expired');
+        } else if (isTransient(error)) {
+          // The token may still be valid: keep it and let the user retry.
+          setState({ status: 'unavailable', user: null, notice: null });
+        } else {
+          end(null);
         }
       },
     );
     return () => {
       active = false;
     };
-  }, [api, end, storage, tokens]);
+  }, [api, end, storage, tokens, restoreAttempt]);
+
+  const retryRestore = useCallback(() => {
+    setState(RESTORING);
+    setRestoreAttempt((attempt) => attempt + 1);
+  }, []);
 
   const login = useCallback(
     async (credentials: Credentials) => {
@@ -103,7 +128,10 @@ export function SessionProvider({ children, storage = sessionTokenStorage }: Ses
 
   const logout = useCallback(() => end('loggedOut'), [end]);
 
-  const value = useMemo<SessionValue>(() => ({ ...state, api, login, logout }), [state, api, login, logout]);
+  const value = useMemo<SessionValue>(
+    () => ({ ...state, api, login, logout, retryRestore }),
+    [state, api, login, logout, retryRestore],
+  );
   return <SessionContext.Provider value={value}>{children}</SessionContext.Provider>;
 }
 

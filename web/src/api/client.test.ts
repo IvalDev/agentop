@@ -94,6 +94,21 @@ describe('createApiClient', () => {
     await expect(api.get('/api/v1/things')).rejects.toMatchObject({ status: 0, detail: null });
   });
 
+  it.each([
+    'https://evil.example/api/v1/things',
+    '//evil.example/api/v1/things',
+    '/\\evil.example/api/v1/things',
+    '/healthz',
+    'api/v1/things',
+  ])('refuses %s: the token only ever goes to same-origin /api/ paths', async (path) => {
+    const fetchMock = installFakeApi({});
+    const { api } = clientWith('session-token');
+
+    await expect(api.get(path)).rejects.toThrow(TypeError);
+    await expect(api.post(path, {}, { auth: false })).rejects.toThrow(TypeError);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('returns the raw response from `send` for streaming bodies', async () => {
     installFakeApi({ 'POST /api/v1/chat/stream': { status: 200, body: { streamed: true } } });
     const { api } = clientWith('session-token');

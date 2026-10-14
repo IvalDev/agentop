@@ -41,6 +41,30 @@ WEB_APP_RESERVED_SEGMENTS = frozenset({"api", "ui", "healthz", "docs", "redoc", 
 #: Vite puts content-hashed files under ``assets/``: safe to cache for a year.
 _IMMUTABLE_CACHE = {"Cache-Control": "public, max-age=31536000, immutable"}
 
+#: Content Security Policy of the built web app. The Vite build is one external
+#: module script plus one stylesheet, with no inline code, so nothing needs
+#: ``'unsafe-inline'``; the app only talks to its own origin. Only the web app's
+#: responses carry it: the dev console and the API docs keep their own pages.
+WEB_APP_CSP = "; ".join(
+    (
+        "default-src 'self'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "connect-src 'self'",
+        "object-src 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
+    )
+)
+
+#: Sent with every response of the web app, including its 404s.
+WEB_APP_SECURITY_HEADERS = {
+    "Content-Security-Policy": WEB_APP_CSP,
+    "X-Frame-Options": "DENY",
+    "X-Content-Type-Options": "nosniff",
+}
+
 
 class _WebAppRoute(Route):
     """GET/HEAD catch-all for the web app that never matches reserved paths.
@@ -67,19 +91,32 @@ def _web_app_endpoint(dist_dir: Path):
     root = dist_dir.resolve()
     index = root / "index.html"
 
+    def not_found() -> Response:
+        return JSONResponse(
+            {"detail": "Not Found"}, status_code=404, headers=WEB_APP_SECURITY_HEADERS
+        )
+
     async def serve(request: Request) -> Response:
         relative: str = request.path_params["path"]
         if relative:
-            candidate = (root / relative).resolve()
-            if candidate.is_relative_to(root) and candidate.is_file():
-                headers = _IMMUTABLE_CACHE if relative.startswith("assets/") else None
-                return FileResponse(candidate, headers=headers)
+            try:
+                candidate = (root / relative).resolve()
+                is_file = candidate.is_relative_to(root) and candidate.is_file()
+            except (OSError, ValueError):
+                # A null byte or a name the filesystem rejects: neither a file
+                # nor a client route.
+                return not_found()
+            if is_file:
+                cache = _IMMUTABLE_CACHE if relative.startswith("assets/") else {}
+                return FileResponse(candidate, headers={**WEB_APP_SECURITY_HEADERS, **cache})
             # A missing file (an asset or anything with an extension) is a 404,
             # never the HTML page: client routes look like /chat, not /x.png.
             if relative.startswith("assets/") or "." in relative.rsplit("/", 1)[-1]:
-                return JSONResponse({"detail": "Not Found"}, status_code=404)
+                return not_found()
         # Always revalidate the page so a new build's asset names are picked up.
-        return FileResponse(index, headers={"Cache-Control": "no-cache"})
+        return FileResponse(
+            index, headers={**WEB_APP_SECURITY_HEADERS, "Cache-Control": "no-cache"}
+        )
 
     return serve
 

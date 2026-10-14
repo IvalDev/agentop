@@ -39,6 +39,13 @@ export const esES = {
       loggedOut: 'Has cerrado la sesión.',
     },
   },
+  session: {
+    unavailable: {
+      title: 'No se ha podido recuperar tu sesión',
+      message: 'No se ha podido comprobar tu sesión con el servidor. Comprueba la conexión e inténtalo de nuevo.',
+      retry: 'Reintentar',
+    },
+  },
   header: {
     signedInAs: 'Sesión iniciada como',
     logout: 'Cerrar sesión',

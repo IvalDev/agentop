@@ -98,6 +98,50 @@ async def test_paths_cannot_escape_the_dist_directory(
     assert response.status_code == 404
 
 
+@pytest.mark.parametrize("path", ["/%00", "/a%00b", "/assets/%00.js", "/chat/%00"])
+async def test_paths_the_filesystem_rejects_are_404(
+    monkeypatch: pytest.MonkeyPatch, web_dist: Path, path: str
+) -> None:
+    response = await _request(monkeypatch, web_dist, "GET", path)
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Not Found"}
+
+
+def _csp_directives(response: Response) -> dict[str, list[str]]:
+    policy = response.headers["content-security-policy"]
+    directives = [part.split() for part in policy.split(";") if part.strip()]
+    return {name: sources for name, *sources in directives}
+
+
+@pytest.mark.parametrize("path", ["/", "/chat", "/assets/index-abc123.js", "/missing.png", "/%00"])
+async def test_web_app_responses_carry_security_headers(
+    monkeypatch: pytest.MonkeyPatch, web_dist: Path, path: str
+) -> None:
+    response = await _request(monkeypatch, web_dist, "GET", path)
+    directives = _csp_directives(response)
+    assert directives["default-src"] == ["'self'"]
+    assert directives["script-src"] == ["'self'"]
+    assert directives["style-src"] == ["'self'"]
+    assert directives["object-src"] == ["'none'"]
+    assert directives["base-uri"] == ["'self'"]
+    assert directives["frame-ancestors"] == ["'none'"]
+    policy = response.headers["content-security-policy"]
+    assert "unsafe-inline" not in policy
+    assert "unsafe-eval" not in policy
+    assert response.headers["x-frame-options"] == "DENY"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.parametrize("path", ["/api/v1/auth/me", "/healthz", "/ui/", "/docs"])
+async def test_security_headers_are_only_for_the_web_app(
+    monkeypatch: pytest.MonkeyPatch, web_dist: Path, path: str
+) -> None:
+    # The dev console and the Swagger UI keep their own (inline-script) pages working.
+    response = await _request(monkeypatch, web_dist, "GET", path)
+    assert "content-security-policy" not in response.headers
+    assert "x-frame-options" not in response.headers
+
+
 async def test_api_errors_stay_json(monkeypatch: pytest.MonkeyPatch, web_dist: Path) -> None:
     response = await _request(monkeypatch, web_dist, "GET", "/api/v1/auth/me")
     assert response.status_code == 401

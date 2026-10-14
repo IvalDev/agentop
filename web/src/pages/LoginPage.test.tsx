@@ -82,6 +82,31 @@ describe('LoginPage', () => {
     expect(window.sessionStorage.length).toBe(1);
   });
 
+  async function logInFrom(from: unknown) {
+    installFakeApi({ [LOGIN]: loginOk(), [ME]: { status: 200, body: meBody('admin') } });
+    const { user } = renderApp({ route: '/login', state: { from } });
+    await user.type(screen.getByLabelText('Correo electrónico'), 'admin@demo.test');
+    await user.type(screen.getByLabelText('Contraseña'), 'demo-admin-pass');
+    await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }));
+  }
+
+  it('returns to the protected page that sent you to the login', async () => {
+    await logInFrom('/conocimiento');
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Base de conocimiento' })).toBeInTheDocument();
+    expect(screen.getByTestId('location').textContent).toBe('/conocimiento');
+  });
+
+  it.each(['/\\evil.example', '/\\/evil.example', '//evil.example', 'https://evil.example', '/login'])(
+    'never returns to %s: it opens the chat instead',
+    async (from) => {
+      await logInFrom(from);
+
+      expect(await screen.findByRole('heading', { level: 1, name: 'Chat' })).toBeInTheDocument();
+      expect(screen.getByTestId('location').textContent).toBe('/chat');
+    },
+  );
+
   it('announces invalid credentials and stays on the login page', async () => {
     installFakeApi({ [LOGIN]: { status: 401, body: { detail: 'invalid credentials' } } });
     const { user } = renderApp({ route: '/login' });

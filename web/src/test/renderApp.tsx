@@ -17,18 +17,20 @@ export function LocationProbe() {
 export interface RenderAppOptions {
   /** Initial URL. */
   route?: string;
+  /** History state of the initial URL, e.g. `{ from }` as set by the auth guard. */
+  state?: unknown;
   /** Token already stored in this tab, as after a reload. */
   storedToken?: string;
 }
 
 /** Render the real app inside a memory router, optionally with a stored session. */
-export function renderApp({ route = '/', storedToken }: RenderAppOptions = {}) {
+export function renderApp({ route = '/', state, storedToken }: RenderAppOptions = {}) {
   if (storedToken !== undefined) {
     window.sessionStorage.setItem(TOKEN_STORAGE_KEY, storedToken);
   }
   const user = userEvent.setup();
   const view = render(
-    <MemoryRouter initialEntries={[route]}>
+    <MemoryRouter initialEntries={[state === undefined ? route : { pathname: route, state }]}>
       <App />
       <LocationProbe />
     </MemoryRouter>,

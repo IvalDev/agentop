@@ -5,6 +5,7 @@ import { ApiError } from '../api/client';
 import { LoginForm } from '../components/organisms/LoginForm';
 import { AuthLayout } from '../components/templates/AuthLayout';
 import { LoadingScreen } from '../components/templates/LoadingScreen';
+import { SessionUnavailableScreen } from '../components/templates/SessionUnavailableScreen';
 import { usePageTitle } from '../hooks/usePageTitle';
 import { t } from '../i18n';
 import { paths } from '../routes/paths';
@@ -23,10 +24,13 @@ function loginErrorMessage(error: unknown): string {
   return t('login.errors.unexpected');
 }
 
-/** Where to go after login: the protected page that sent us here, else the chat. */
+/**
+ * Where to go after login: the protected page that sent us here, else the chat.
+ * Browsers read `\` as `/`, so `/\host` is as foreign as `//host`.
+ */
 function returnPath(state: unknown): string {
   const from = (state as { from?: unknown } | null)?.from;
-  const isLocalPath = typeof from === 'string' && from.startsWith('/') && !from.startsWith('//');
+  const isLocalPath = typeof from === 'string' && /^\/(?![/\\])/.test(from);
   return isLocalPath && from !== paths.login ? from : paths.chat;
 }
 
@@ -39,6 +43,9 @@ export function LoginPage() {
 
   if (session.status === 'restoring') {
     return <LoadingScreen />;
+  }
+  if (session.status === 'unavailable') {
+    return <SessionUnavailableScreen onRetry={session.retryRestore} onLogout={session.logout} />;
   }
   if (session.status === 'authenticated') {
     return <Navigate to={returnPath(location.state)} replace />;
