@@ -91,6 +91,16 @@ Hoy la empresa y sus usuarios solo se crean con el seed de demo, no existe API d
 - [x] D8 — **Modelo de lenguaje en producción. Decidido por el humano 2026-10-14: local por defecto, externo opcional por cliente.** Cada instalación usa por defecto inferencia local (A5, Ollama) y nada sale de la empresa; un proveedor externo más potente solo se activa con el consentimiento explícito del cliente (el interruptor `allow_external_llm` ya existe). Los datos sensibles no pasan por ningún modelo (principio 6). Consecuencias: la instalación incluye el dimensionado del hardware (GPU recomendada para el modelo de chat) y la Configuración debe mostrar al administrador qué proveedor está activo y qué datos salen de la empresa
 - [x] D4 — **Estrategia de entrega. Decidido por el humano 2026-10-14:** `ask-on-risk` con cadena `stacked-to-main`. PRs de ≤400 líneas (revisables en ~60 min) que entran a `main` por separado y en orden (P1 → P2 → P3…), porque cada pieza de la Fase 1 funciona sola. Cada PR declara inicio, fin, dependencias previas, trabajo posterior y lo que queda fuera, con diagrama de dependencias marcando el PR actual (📍). Las fronteras de cada slice (qué commits lleva cada PR) se registran en este documento
 
+### Fase 0.5 — App local funcional (prioridad del humano 2026-10-14; autorizada)
+
+Objetivo: una aplicación React + Vite + TypeScript (D2) corriendo en la máquina del humano con un solo comando, en `localhost:8000`: login y dashboard con **Chat**, **Base de conocimiento** y **Configuración → Equipo**, visibles según el rol. La sección de herramientas queda fuera (depende de P3–P5). Adelanta P2 y parte de C1. Rama `feat/local-app`, apilada sobre `feat/admin-agent-core` (D4). Previsión: ~1.900 líneas en 5 work units.
+
+- [ ] L1 — Backend de equipo (adelanta P2): API de administración (admin+) para listar, crear, cambiar el rol, desactivar y reactivar usuarios de la empresa; un usuario desactivado no puede iniciar sesión; nadie se desactiva ni se quita el rol a sí mismo y la empresa nunca se queda sin owner; auditado; tests de aislamiento entre empresas. Ruta: delegated direct (writer)
+- [ ] L2 — Base del frontend: proyecto `web/` (Vite + React + TS, Vitest + Testing Library), cliente de la API, login y sesión, layout del dashboard con navegación por rol, accesibilidad base (HTML semántico, etiquetas, teclado, foco, contraste), FastAPI sirve la app compilada y un comando único para levantar todo; guía en `docs/`. Ruta: delegated direct (writer)
+- [ ] L3 — Sección Chat: streaming, citas, historial y reinicio. Ruta: delegated direct (writer)
+- [ ] L4 — Sección Base de conocimiento: listado con estado y error, subida de varios archivos con ingesta automática, reintento de ingesta de documentos `failed`. Ruta: delegated direct (writer)
+- [ ] L5 — Sección Configuración → Equipo: listado, alta con rol, cambio de rol, desactivar y reactivar (solo owner/admin). Ruta: delegated direct (writer)
+
 ### Fase 1 — Plataforma
 
 - [ ] P1 — Alta de empresa y administrador: comando de instalación (primer arranque) que crea el tenant y su administrador; sin depender del seed de demo
