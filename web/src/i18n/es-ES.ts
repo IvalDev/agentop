@@ -67,6 +67,7 @@ export const esES = {
     knowledge: {
       title: 'Base de conocimiento',
       description: 'Consulta los documentos que el asistente utiliza para responder y añade otros nuevos.',
+      descriptionReadOnly: 'Consulta los documentos que el asistente utiliza para responder.',
     },
     team: {
       title: 'Equipo',
@@ -109,6 +110,83 @@ export const esES = {
       interrupted: 'La respuesta se ha interrumpido. Inténtalo de nuevo.',
       invalidMessage: 'No se ha podido enviar el mensaje. Revisa su longitud e inténtalo de nuevo.',
       unexpected: 'Se ha producido un error inesperado. Inténtalo de nuevo.',
+    },
+  },
+  knowledge: {
+    upload: {
+      title: 'Añadir documentos',
+      filesLabel: 'Archivos',
+      filesHint:
+        'Formatos admitidos: .md, .txt, .pdf y .docx, de hasta 20 MB cada uno. ' +
+        'También puedes arrastrar los archivos a esta zona.',
+      filesRequired: 'Selecciona al menos un archivo.',
+      submit: 'Subir y procesar',
+      progressTitle: 'Progreso de la subida',
+      progress: '{name}: {state}',
+      finished: 'Subida terminada. Archivos listos: {done}. Con errores: {failed}.',
+      state: {
+        pending: 'En espera',
+        uploading: 'Subiendo…',
+        processing: 'Procesando…',
+        done: 'Listo',
+        failed: 'Error: {reason}',
+      },
+    },
+    /** Why a file could not be added; shown after "Error:" or a colon, so lowercase. */
+    errors: {
+      tooLarge: 'el archivo supera el límite de 20 MB.',
+      unsupportedType: 'el formato no está admitido. Usa archivos .md, .txt, .pdf o .docx.',
+      invalidName: 'el nombre del archivo no es válido.',
+      unreadable: 'no se ha podido leer el contenido del archivo o su formato no está admitido.',
+      processingUnavailable:
+        'el servicio que procesa los documentos no está disponible. Inténtalo de nuevo más tarde.',
+      forbidden: 'no tienes permiso para añadir o procesar documentos.',
+      notFound: 'el documento ya no existe.',
+      network: 'no se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
+      unexpected: 'se ha producido un error inesperado. Inténtalo de nuevo.',
+    },
+    list: {
+      title: 'Documentos',
+      caption: 'Documentos de la base de conocimiento',
+      refresh: 'Actualizar',
+      loading: 'Cargando documentos…',
+      loadError: 'No se han podido cargar los documentos. Comprueba la conexión y pulsa «Actualizar».',
+      empty: 'Todavía no hay documentos en la base de conocimiento.',
+      columns: {
+        name: 'Nombre',
+        type: 'Tipo',
+        size: 'Tamaño',
+        date: 'Fecha',
+        status: 'Estado',
+        actions: 'Acciones',
+      },
+      retry: 'Reintentar',
+      process: 'Procesar',
+      actionTarget: '«{name}»',
+      technicalDetail: 'Detalle técnico',
+    },
+    status: {
+      uploaded: 'Sin procesar',
+      processing: 'Procesando',
+      processed: 'Procesado',
+      failed: 'Error',
+    },
+    failure: {
+      unsupported: 'El formato del archivo no está admitido.',
+      embeddings: 'El servicio que prepara los documentos para las búsquedas no estaba disponible.',
+      generic: 'No se ha podido procesar el documento.',
+    },
+    types: {
+      markdown: 'Markdown',
+      text: 'Texto',
+      pdf: 'PDF',
+      word: 'Word',
+      other: 'Otro',
+    },
+    ingest: {
+      started: 'Procesando «{name}»…',
+      done: '«{name}» se ha procesado correctamente.',
+      failed: 'No se ha podido procesar «{name}»: {reason}',
     },
   },
   notFound: {

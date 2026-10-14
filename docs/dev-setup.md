@@ -206,7 +206,7 @@ with company `demo` and any user of [the demo team](#the-demo-team), for example
 | --- | --- | --- | --- |
 | `/login` | Iniciar sesión | Everyone | Done: company, email, password |
 | `/chat` | Chat | Every role | Done: streamed answers, sources, history, stop, and reset ([below](#chat)) |
-| `/conocimiento` | Base de conocimiento | Every role | Placeholder; documents and uploads come in L4 |
+| `/conocimiento` | Base de conocimiento | Every role; uploads and ingest for operator and up | Done: document list, multi-file upload with automatic ingest, retry ([below](#knowledge-base)) |
 | `/configuracion/equipo` | Configuración → Equipo | Owner and admin; other roles are sent to `/chat` | Placeholder; user management comes in L5 |
 
 The header shows your name and role and has **Cerrar sesión**. On a phone-width screen the
@@ -237,6 +237,35 @@ console and `python -m app.demo.chat`.
   memory: it survives visiting other sections, and a reload or **Cerrar sesión** clears it.
 - Screen readers: the conversation is a `log` that does not read tokens as they arrive; a
   polite status announces the agent's activity and then the finished answer once.
+
+### Knowledge base
+
+The Base de conocimiento section uses the documents API (`GET /api/v1/documents/`, `POST
+/api/v1/documents/`, and `POST /api/v1/documents/{id}/ingest`).
+
+| What | Viewer | Operator, admin, owner |
+| --- | --- | --- |
+| Document list: name, type, size, date, and status | Yes | Yes |
+| **Añadir documentos**: upload with automatic ingest | No | Yes |
+| **Reintentar** on failed documents, **Procesar** on unprocessed ones | No | Yes |
+
+- The list is a table (caption and column headers) that stacks into one card per document on a
+  phone. Sizes and dates follow the locale. Each status has a word and a symbol, so it never
+  depends on colour: ✓ Procesado, ○ Sin procesar, ◔ Procesando, ✕ Error.
+- A failed document shows a Spanish summary. The server's own `error_message` (for example,
+  a missing embedding model) is under a collapsed **Detalle técnico**, as plain text.
+- **Archivos** takes several `.md`, `.txt`, `.pdf`, or `.docx` files; you can also drop them on
+  the form, which sends them at once. Files over 20 MB or in other formats are refused before
+  sending. The server still enforces its own limit, `AA_MAX_UPLOAD_BYTES` (20 MB by default);
+  if you raise it, the app's 20 MB check stays in `web/src/knowledge/documents.ts`.
+- Each file is uploaded and then ingested, one after another, with its progress: "En espera",
+  "Subiendo…", "Procesando…", "Listo", or "Error: …". A 413 (too large), 422 (unreadable or
+  unsupported), or 502 (embedding backend unavailable) becomes a Spanish message; the list
+  refreshes when the batch ends. Leaving the section lets the current file finish and starts no
+  other.
+- `.md`, `.txt`, `.pdf`, and `.docx` files are sent with the content type ingest reads, whatever
+  the browser reports for them (some report Markdown as `text/x-markdown`).
+- Screen readers: a polite status announces each step and a summary of the batch.
 
 ### Develop with hot reload
 
@@ -289,12 +318,13 @@ suite work as before.
 | Path in `web/src` | Holds |
 | --- | --- |
 | `i18n/` | `es-ES.ts` catalog (every visible string) and `t()`, `formatDate()`, `formatNumber()` |
-| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling), auth calls, and `chat.ts` (SSE parser, typed chat events) |
+| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling), auth calls, `chat.ts` (SSE parser, typed chat events), and `documents.ts` |
 | `session/` | `SessionProvider`, `useSession()`, roles, token storage |
 | `chat/` | `ChatProvider` and `useChat()` (the conversation, mounted by the dashboard shell), its reducer, history, and message texts |
+| `knowledge/` | The document list and upload queue hooks, file checks, error mapping, and size and type labels |
 | `components/` | Presentational atoms, molecules, organisms, and templates |
 | `pages/`, `routes/` | Route containers, guards (`RequireAuth`, `RequireRole`), and `paths` |
-| `test/` | Fake API, `renderApp()`, the axe helper, and `fakeChat.ts` (scripted SSE streams cut mid-line and mid-character) |
+| `test/` | Fake API (with `createGate()` to hold a request open), `renderApp()`, the axe helper, and `fakeChat.ts` (scripted SSE streams cut mid-line and mid-character) |
 
 ## Browser console (development only)
 

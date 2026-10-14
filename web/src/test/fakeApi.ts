@@ -7,8 +7,11 @@ export interface FakeReply {
   body?: unknown;
 }
 
-/** Handlers keyed by `"<METHOD> <path>"`, e.g. `"GET /api/v1/auth/me"`. */
-export type FakeRoutes = Record<string, FakeReply | ((init: RequestInit) => FakeReply)>;
+/**
+ * Handlers keyed by `"<METHOD> <path>"`, e.g. `"GET /api/v1/auth/me"`. A handler may return a
+ * promise, so a test can hold a request open and check what the page shows meanwhile.
+ */
+export type FakeRoutes = Record<string, FakeReply | ((init: RequestInit) => FakeReply | Promise<FakeReply>)>;
 
 export function jsonResponse({ status, body }: FakeReply): Response {
   return new Response(body === undefined ? null : JSON.stringify(body), {
@@ -28,7 +31,7 @@ export function installFakeApi(routes: FakeRoutes) {
     if (handler === undefined) {
       return jsonResponse({ status: 404, body: { detail: 'Not Found' } });
     }
-    return jsonResponse(typeof handler === 'function' ? handler(init) : handler);
+    return jsonResponse(typeof handler === 'function' ? await handler(init) : handler);
   });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
@@ -48,6 +51,36 @@ export function meBody(role: Role) {
 /** Routes for a valid stored token belonging to a user of `role`. */
 export function signedInRoutes(role: Role): FakeRoutes {
   return { 'GET /api/v1/auth/me': { status: 200, body: meBody(role) } };
+}
+
+/** `"<METHOD> <path>"` of every recorded fetch call, in order. */
+export function routesCalled(fetchMock: ReturnType<typeof installFakeApi>): string[] {
+  return fetchMock.mock.calls.map(([input, init]) => `${(init?.method ?? 'GET').toUpperCase()} ${String(input)}`);
+}
+
+/**
+ * Replies that wait until the test releases them, one at a time and in arrival order, to
+ * check what the page shows while a request is in flight.
+ */
+export function createGate() {
+  const waiting: Array<() => void> = [];
+  return {
+    hold(reply: () => FakeReply): Promise<FakeReply> {
+      return new Promise((resolve) => waiting.push(() => resolve(reply())));
+    },
+    /** How many requests are waiting. */
+    get pending(): number {
+      return waiting.length;
+    },
+    /** Answer the oldest waiting request. */
+    release(): void {
+      const next = waiting.shift();
+      if (next === undefined) {
+        throw new Error('No request is waiting at the gate.');
+      }
+      next();
+    },
+  };
 }
 
 /** Header names and values of one recorded fetch call. */
