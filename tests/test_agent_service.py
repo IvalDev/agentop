@@ -34,11 +34,13 @@ from app.modules.agent.service import (
 )
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
+from app.modules.catalog.models import ModuleActivation
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.storage import LocalDocumentStorage
+from app.modules.identity.models import UserRole
 from app.modules.retrieval.embeddings import FakeEmbeddingProvider
 from app.modules.tools import builtin
-from app.modules.tools.registry import ToolRegistry
+from app.modules.tools.registry import ApprovalPolicy, ToolKind, ToolRegistry, ToolSpec
 
 DIM = 64
 NOTE = {"to": "ops@acme.test", "body": "Quarterly report is ready"}
@@ -118,6 +120,36 @@ def tool_message(llm: FakeLLMProvider, call_index: int) -> ChatMessage:
     return message
 
 
+def register_calendar_tool(registry: ToolRegistry, handler) -> None:
+    """Install a test-only extract tool owned by the (initially inactive) calendar module."""
+    registry.register(
+        ToolSpec(
+            name="check_calendar",
+            description="test-only tool owned by the calendar module",
+            kind=ToolKind.EXTRACT,
+            approval_policy=ApprovalPolicy.AUTO,
+            required_role=UserRole.VIEWER,
+            handler=handler,
+            input_model=registry.get("peek_note").input_model,
+            module="calendar",
+        )
+    )
+
+
+async def activate_module(db: Database, tenant_id: int, user_id: int, key: str) -> None:
+    """Turn a catalog module on for one tenant (what the admin panel's POST does)."""
+    async with db.sessionmaker() as session:
+        session.add(
+            ModuleActivation(
+                tenant_id=tenant_id,
+                module_key=key,
+                active=True,
+                activated_by_user_id=user_id,
+            )
+        )
+        await session.commit()
+
+
 # --- Tool exposure and executor routing ----------------------------------------
 
 
@@ -187,6 +219,52 @@ async def test_model_cannot_reach_tools_above_the_users_role(
     assert (denied.actor_type, denied.correlation_id) == (ActorType.AGENT, response.run_id)
     async with seeded_db.sessionmaker() as session:
         assert (await session.execute(select(ApprovalRequest))).scalars().all() == []
+
+
+async def test_module_tools_are_offered_only_when_the_tenant_activated_the_module(
+    seeded_db: Database, seeded_users, registry, approval_tools
+) -> None:
+    """The offer filter follows tenant activation: hidden while off, shown once on."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+
+    hidden_llm = FakeLLMProvider([answer("Hello")])
+    await run(seeded_db, viewer, deps(registry, hidden_llm))
+    hidden = {tool["function"]["name"] for tool in hidden_llm.calls[0].tools}
+    assert "check_calendar" not in hidden
+    assert {"peek_note", "search_documents"} <= hidden
+
+    await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
+    shown_llm = FakeLLMProvider([answer("Hello")])
+    await run(seeded_db, viewer, deps(registry, shown_llm))
+    shown = {tool["function"]["name"] for tool in shown_llm.calls[0].tools}
+    assert "check_calendar" in shown
+
+
+async def test_calling_an_inactive_module_tool_is_refused_until_the_module_is_active(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """The loop passes the tenant's active set to the executor; activation flips the result."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    refused_llm = FakeLLMProvider([call("check_calendar", NOTE), answer("Not available.")])
+
+    response = await run(seeded_db, viewer, deps(registry, refused_llm))
+
+    assert [(i.tool_name, i.status, i.error) for i in response.tool_calls] == [
+        ("check_calendar", "error", "inactive_module")
+    ]
+    assert approval_tools.spy.calls == []
+    assert "inactive_module" in tool_message(refused_llm, 1).content
+    [refused] = await audit_log(seeded_db, action="tool.inactive_module")
+    assert (refused.actor_type, refused.correlation_id) == (ActorType.AGENT, response.run_id)
+
+    await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
+    allowed_llm = FakeLLMProvider([call("check_calendar", NOTE), answer("Done.")])
+    allowed = await run(seeded_db, viewer, deps(registry, allowed_llm))
+
+    assert [(i.tool_name, i.status) for i in allowed.tool_calls] == [("check_calendar", "ok")]
+    assert len(approval_tools.spy.calls) == 1
 
 
 # --- Approvals -------------------------------------------------------------------

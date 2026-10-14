@@ -14,6 +14,7 @@ result                        HTTP                 ``error_kind``
 ``error`` (unknown tool)      400                  ``not_found``
 ``error`` (handler/output)    400                  ``execution``
 ``error`` (insufficient role) 403                  ``forbidden``
+``error`` (inactive module)   403                  ``inactive_module``
 ``error`` (rejected grant)    403                  ``forbidden``
 ``error`` (precheck refused)  409                  ``precheck``
 ============================ ==================== ==================
@@ -65,6 +66,7 @@ outcome                     action                         payload / result
 ========================== ============================== ===============================
 unknown tool                ``tool.not_found``             input field names / error
 insufficient role           ``tool.denied``                input field names / error
+inactive module             ``tool.inactive_module``       input field names / error + module
 invalid input               ``tool.invalid_input``         input field names / error locs+types
 precheck refused            ``tool.precheck_failed``       canonical input / error + reason
 no grant (approval needed)  ``tool.approval_required``     canonical input / key + approver
@@ -110,7 +112,14 @@ from app.modules.tools.registry import (
 
 logger = logging.getLogger(__name__)
 
-ErrorKind = Literal["not_found", "forbidden", "validation", "precheck", "execution"]
+ErrorKind = Literal[
+    "not_found",
+    "forbidden",
+    "inactive_module",
+    "validation",
+    "precheck",
+    "execution",
+]
 
 #: Caller-facing message of a handler exception (the detail is audited only).
 TOOL_FAILED = "tool_failed"
@@ -273,8 +282,17 @@ async def execute_tool(
     embeddings: EmbeddingProvider | None = None,
     llm: LLMProvider | None = None,
     storage: DocumentStorage | None = None,
+    active_modules: set[str] | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
+
+    ``active_modules`` is the tenant's activated catalog module keys (the
+    agent loop and the approvals execution read them once per run with
+    :func:`app.modules.catalog.service.active_module_keys`): a tool whose
+    ``spec.module`` is not in the set is refused as ``inactive_module``,
+    while core tools (``spec.module is None``) always run. ``None`` — the
+    default — disables the gate entirely, preserving pre-module behavior
+    for callers that do not gate.
 
     Check order (each failure returns immediately, handler is only reached by
     the last step):
@@ -282,27 +300,32 @@ async def execute_tool(
     1. Lookup — unknown name ⇒ ``error``/``not_found``.
     2. Authorization — insufficient role ⇒ ``error``/``forbidden`` with a
        generic message that reveals neither the requirement nor internals.
-    3. Validation — ``spec.input_model`` rejects ``raw_input`` ⇒
+    3. Module gate (only when ``active_modules`` is a set) — a tool whose
+       ``spec.module`` is not in it ⇒ ``error``/``inactive_module`` before
+       validation, approval, and the handler; core tools (``module=None``)
+       never gate, and ``active_modules=None`` skips the gate entirely
+       (pre-T2 callers keep their behavior).
+    4. Validation — ``spec.input_model`` rejects ``raw_input`` ⇒
        ``error``/``validation`` listing each failing field (no input
        values); handler not called.
-    4. Precheck (when the tool has one), with the same context the handler
+    5. Precheck (when the tool has one), with the same context the handler
        gets — :class:`ToolPrecheckError` ⇒ ``error``/``precheck`` with
        ``precheck_failed: <reason>``; any other exception ⇒
        ``error``/``execution`` with :data:`TOOL_FAILED`. It runs on every
        path below, so an approved call is re-checked right before its
        handler and a refused call never reaches the approval gate.
-    5. Approval gate (``REQUIRE_APPROVAL`` and not ``dry_run``) — no
+    6. Approval gate (``REQUIRE_APPROVAL`` and not ``dry_run``) — no
        ``approval_grant`` ⇒ ``approval_required`` carrying the payload to
        approve with the role from :func:`resolve_approval_role` (a failing
        resolver ⇒ ``error``/``execution``); a grant that ``consume_grant``
        rejects for this call's action key ⇒ ``error``/``forbidden``.
-    6. Dry run ⇒ ``dry_run`` describing the call; handler not called.
-    7. Handler run with a :class:`ToolContext` (``session``, the user's
+    7. Dry run ⇒ ``dry_run`` describing the call; handler not called.
+    8. Handler run with a :class:`ToolContext` (``session``, the user's
        tenant, ``embeddings``, ``llm``, ``storage``, ``correlation_id``) —
        exceptions ⇒ ``error``/``execution`` with the generic
        :data:`TOOL_FAILED`; the exception text goes to the server log and
        the audit event only.
-    8. Output validation — ``spec.output_model`` rejects the return ⇒
+    9. Output validation — ``spec.output_model`` rejects the return ⇒
        ``error``/``execution`` with :data:`INVALID_OUTPUT`.
 
     Handlers own their own transaction: the executor neither commits nor
@@ -319,7 +342,7 @@ async def execute_tool(
         storage=storage,
     )
     result, record = await _evaluate(
-        registry, context, tool_name, raw_input, dry_run, approval_grant
+        registry, context, tool_name, raw_input, dry_run, approval_grant, active_modules
     )
     await persist_event(
         session,
@@ -342,6 +365,7 @@ async def _evaluate(
     raw_input: dict[str, Any],
     dry_run: bool,
     approval_grant: ApprovalGrant | None,
+    active_modules: set[str] | None,
 ) -> tuple[ToolExecutionResult, _AuditRecord]:
     """Run the gates of :func:`execute_tool`; return its result and audit record."""
     user = context.user
@@ -362,6 +386,18 @@ async def _evaluate(
             error="forbidden",
             error_kind="forbidden",
         ), _AuditRecord("tool.denied", _input_fields(raw_input), {"error": "forbidden"})
+
+    if active_modules is not None and spec.module is not None and spec.module not in active_modules:
+        return ToolExecutionResult(
+            tool_name=spec.name,
+            status="error",
+            error="inactive_module",
+            error_kind="inactive_module",
+        ), _AuditRecord(
+            "tool.inactive_module",
+            _input_fields(raw_input),
+            {"error": "inactive_module", "module": spec.module},
+        )
 
     # ToolRegistry.register guarantees input_model is a BaseModel subclass.
     input_model = spec.input_model
