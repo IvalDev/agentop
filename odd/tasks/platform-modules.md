@@ -79,7 +79,13 @@ Hoy la empresa y sus usuarios solo se crean con el seed de demo, no existe API d
   - Las herramientas reciben la conexión sobre la que actúan y el backend valida que el usuario puede usarla; el agente solo ve las conexiones permitidas al usuario actual
   - Aprobaciones: una acción sobre una conexión personal (p. ej. enviar desde mi buzón) la aprueba su titular, no un rol. El modelo actual de aprobaciones (A7) resuelve por rol; hace falta aprobador = usuario concreto
   - Automatismos: los de empresa actúan en nombre de la empresa con aprobación por rol; los personales, en nombre del titular y con su aprobación
-- [ ] D6 — **Acceso desde fuera de la oficina.** ¿El móvil y el widget se usan fuera de la red de la empresa? Si es así: dirección pública con HTTPS o VPN (afecta a T12). **Pendiente**
+- [x] D6 — **Acceso desde fuera de la oficina. Decidido por el humano 2026-10-14; implementación diferida (sin lógica ni esfuerzo por ahora).** La aplicación es idéntica en todos los casos (dirección HTTPS + login); solo cambia la capa de acceso, que es infraestructura (T12):
+  - **Servidor en VPS:** acceso directo por HTTPS
+  - **Servidor en la red local del cliente:** por defecto, túnel saliente desde el servidor a un relay operado por nosotros, con TLS de extremo a extremo (el relay reenvía por SNI sin poder leer el tráfico); sin puertos abiertos en la oficina y sin trabajo para el cliente. Alternativa para empresas cuyo IT lo exija: VPN (WireGuard, Tailscale)
+  - Descartados: túnel de terceros que termina TLS (p. ej. Cloudflare Tunnel: el tercero ve las conversaciones) y abrir puertos en el router
+  - Cuando se aborde: el acceso desde Internet exige endurecer la autenticación (segundo factor, sesiones por dispositivo revocables, límite de intentos). El relay es el inicio del plano de control multi-instalación. Las notificaciones push no necesitan VPN (viajan cifradas por el servicio de push del navegador)
+- [ ] D7 — **Modo de despliegue inicial:** VPS gestionado, servidor en la oficina del cliente o ambos desde el principio. Condiciona T12 y D8. **Pendiente**
+- [ ] D8 — **Modelo de lenguaje en producción.** La arquitectura del núcleo prevé inferencia local (A5, Ollama); en desarrollo se usa Groq (externo). En producción: local (privacidad total, pero requiere GPU en el servidor del cliente o un VPS con GPU), proveedor externo (barato y potente, pero las conversaciones y los fragmentos de documentos salen de la empresa) o mixto (externo para lo general, local para lo sensible). Relacionado con el principio 6 (datos sensibles). **Pendiente**
 - [ ] D4 — **Estrategia de entrega** de la feature (la previsión supera con mucho ~400 líneas): `ask-on-risk`; la estrategia de cadena (`stacked-to-main` o `feature-branch-chain`) se pregunta antes del primer commit de implementación
 
 ### Fase 1 — Plataforma
@@ -137,4 +143,4 @@ Solo planificación (pedido del humano 2026-10-14: "añádelo a las tareas"). Ni
 
 ## Next step
 
-D1 decidido (consola web + widget de escritorio y app móvil de solo chat) y D5 decidido (conexiones de empresa y personales). Falta decidir D6 (acceso fuera de la oficina), D2 (stack del frontend), D3 (orden de conectores) y la tecnología del widget (Tauri propuesto), y autorizar la Fase 1 (P1–P3 como primer bloque).
+D1, D5 y D6 decididos (D6 con implementación diferida). Falta decidir D7 (modo de despliegue inicial), D8 (modelo de lenguaje en producción), D2 (stack del frontend), D3 (orden de conectores) y la tecnología del widget (Tauri propuesto), y autorizar la Fase 1 (P1–P3 como primer bloque).
