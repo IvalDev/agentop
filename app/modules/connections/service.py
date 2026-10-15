@@ -33,9 +33,10 @@ Status semantics of a stored row:
 - :func:`delete` removes the row and audits its pre-delete state.
 
 Each function commits its own unit of work; audit events go through
-:func:`persist_event <app.modules.audit.service.persist_event>` — its own
-transaction, same as the catalog service (on the shared SQLite test
-connection it commits flushed work too; see the audit module).
+:func:`stage_event <app.modules.audit.service.stage_event>` — staged on the
+caller's transaction and committed atomically with it, same as the catalog
+service (SQLite's single writer makes an independent audit connection
+deadlock on a file database).
 """
 
 from typing import Any
@@ -44,7 +45,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import CredentialsKeyFormatError, encrypt_credentials
-from app.modules.audit.service import persist_event
+from app.modules.audit.service import stage_event
 from app.modules.catalog.registry import ModuleCatalog
 from app.modules.connections.exceptions import (
     ConnectionConflictError,
@@ -149,12 +150,15 @@ async def _refresh_after_flush(session: AsyncSession, row: UserConnection) -> No
 async def _persist_state_event(
     session: AsyncSession, caller: CurrentUser, action: str, row: UserConnection
 ) -> None:
-    """Write one connection-change event (its own transaction, no secrets).
+    """Stage one connection-change event on the caller's transaction.
 
-    The payload is the public triple only — ``row`` may be an instance already
-    scheduled for deletion; its loaded attributes are what gets audited.
+    Staged, not independently committed: the caller commits right after, so
+    action and audit share SQLite's single writer atomically instead of
+    deadlocking on a second connection. The payload is the public triple
+    only — ``row`` may be an instance already scheduled for deletion; its
+    loaded attributes are what gets audited.
     """
-    await persist_event(
+    stage_event(
         session,
         tenant_id=caller.tenant_id,
         action=action,
@@ -330,7 +334,7 @@ async def delete(session: AsyncSession, *, caller: CurrentUser, connection_id: i
     resource_id = str(row.id)
     await session.delete(row)
     await session.flush()
-    await persist_event(
+    stage_event(
         session,
         tenant_id=caller.tenant_id,
         action="connection.deleted",

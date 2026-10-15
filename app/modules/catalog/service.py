@@ -14,15 +14,16 @@ mutations to owner/admin; this module enforces the data rules:
   ``active=false``. Repeats therefore never duplicate rows (the unique
   ``(tenant_id, module_key)`` constraint is the backstop).
 
-Audit: each real state change persists ``module.activated`` /
+Audit: each real state change stages ``module.activated`` /
 ``module.deactivated`` through
-:func:`persist_event <app.modules.audit.service.persist_event>` with
+:func:`stage_event <app.modules.audit.service.stage_event>` with
 ``resource_type="module"``, ``resource_id=<key>``, and a payload of key plus
 manifest version — manifests carry no secrets, so neither does the event.
-``persist_event`` commits in its own transaction, so the trail survives a
-later rollback of the caller's transaction (see the audit service for the
-in-memory SQLite caveat in tests). Each function commits its own unit of
-work; idempotent repeats audit nothing because nothing changed.
+The event shares the caller's transaction: the function commits action and
+audit atomically, which also satisfies SQLite's single-writer rule that an
+independent audit connection would break on a file database. Each function
+commits its own unit of work; idempotent repeats audit nothing because
+nothing changed.
 """
 
 from dataclasses import dataclass
@@ -30,7 +31,7 @@ from dataclasses import dataclass
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.modules.audit.service import persist_event
+from app.modules.audit.service import stage_event
 from app.modules.catalog.manifest import ModuleManifest
 from app.modules.catalog.models import ModuleActivation
 from app.modules.catalog.registry import ModuleCatalog
@@ -102,8 +103,13 @@ async def _load_activation(
 async def _persist_state_event(
     session: AsyncSession, caller: CurrentUser, action: str, manifest: ModuleManifest
 ) -> None:
-    """Write one activation-change event (its own transaction, no secrets)."""
-    await persist_event(
+    """Stage one activation-change event on the caller's transaction.
+
+    Staged, not independently committed: the caller commits right after, so
+    action and audit share SQLite's single writer atomically instead of
+    deadlocking on a second connection.
+    """
+    stage_event(
         session,
         tenant_id=caller.tenant_id,
         action=action,

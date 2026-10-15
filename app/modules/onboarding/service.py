@@ -90,8 +90,9 @@ connection write leaves the flow resumable on its last step. The
 connections service commits the shared unit of work (same session), matching
 the per-function commit semantics of the catalog and connections services.
 
-Audit (:func:`persist_event <app.modules.audit.service.persist_event>`,
-own transaction): ``onboarding.started`` (first submit),
+Audit (:func:`stage_event <app.modules.audit.service.stage_event>`,
+staged on the caller's transaction and committed atomically with it):
+``onboarding.started`` (first submit),
 ``onboarding.step_completed`` (every successful step), ``onboarding.completed``
 (final step), ``onboarding.restarted`` (:func:`restart`). Payloads are
 exactly ``{module_key, step_key, status}`` — never answers, never secrets.
@@ -113,7 +114,7 @@ from app.core.crypto import (
     decrypt_credentials,
     encrypt_credentials,
 )
-from app.modules.audit.service import persist_event
+from app.modules.audit.service import stage_event
 from app.modules.catalog.manifest import FieldSpec, ModuleManifest, StepSpec
 from app.modules.catalog.registry import ModuleCatalog
 from app.modules.catalog.service import active_module_keys
@@ -463,8 +464,14 @@ async def _persist_state_event(
     step_key: str,
     status: OnboardingStatus,
 ) -> None:
-    """Write one onboarding event (own transaction; never answers or secrets)."""
-    await persist_event(
+    """Stage one onboarding event on the caller's transaction (never answers
+    or secrets).
+
+    Staged, not independently committed: the caller commits right after, so
+    action and audit share SQLite's single writer atomically instead of
+    deadlocking on a second connection.
+    """
+    stage_event(
         session,
         tenant_id=caller.tenant_id,
         action=action,
