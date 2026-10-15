@@ -15,7 +15,9 @@ Contract under test (design decisions of the T1 slice):
   missing ``code`` as 400, token-exchange refusal as 400, transport failure
   as 502, and a missing encryption key as 500 fail-closed — then stores the
   tokens through ``connections.service.create_or_update`` (encrypted at rest,
-  status ``connected``) and 302-redirects to ``/configuracion/herramientas``.
+  status ``connected``) and 302-redirects to the D8 wizard route
+  ``/configuracion/herramientas/{module_key}/onboarding`` (T2: the success
+  landing no longer stops at the tools index).
 
 The token-exchange seam is ``app.modules.oauth.service.exchange_code`` (looked
 up as a module attribute at call time), so endpoint tests never touch the
@@ -53,7 +55,8 @@ BASE = "/api/v1/oauth"
 CALLBACK = f"{BASE}/google/callback"
 AUTH_HOST = "accounts.google.com"
 AUTH_PATH = "/o/oauth2/v2/auth"
-WELCOME_PATH = "/configuracion/herramientas"
+#: D8 wizard landing of a successful callback (the module's onboarding page).
+WELCOME_PATH = "/configuracion/herramientas/calendar/onboarding"
 JWT_SECRET = "test-secret-0123456789-abcdefghijklmnop"
 GOOGLE_CLIENT_ID = "client.apps.googleusercontent.com"
 GOOGLE_CLIENT_SECRET = "GOCSPX-test-client-secret"

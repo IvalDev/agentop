@@ -7,11 +7,11 @@ route                                                     meaning              a
 ========================================================= ==================== ==================
 ``GET /api/v1/oauth/{module_key}/authorize``              302 to Google's      any authenticated
                                                           consent screen
-``GET /api/v1/oauth/google/callback``                     302 to the tools     browser (no
-                                                          settings page after  bearer — the
-                                                          storing tokens       pending state
-                                                                               identifies the
-                                                                               flow)
+``GET /api/v1/oauth/google/callback``                     302 to the module's  browser (no
+                                                          onboarding wizard    bearer — the
+                                                          after storing        pending state
+                                                          tokens + completing  identifies the
+                                                          the redirect step    flow)
 ========================================================= ==================== ==================
 
 Start order (checked first to last): settings → module → redirect step →
@@ -34,21 +34,31 @@ Success: the tokens are written through
 (write-only, encrypted at rest, status ``connected``, provider ``google``) —
 which audits ``connection.created`` / ``connection.updated`` with
 ``{module_key, provider, status}``, the same payload as every other write path
-(no extra audit event here; a redirect flow has no separate browser-identity
-seam yet — T2 revisits whether OAuth landings deserve their own event). The
+(no extra audit event here — the onboarding engine emits its own
+``onboarding.step_completed`` when it advances the redirect step). The
 stored blob carries ``{access_token, refresh_token?, expires_at, scopes}`` —
-never the client secret, which stays in settings. The response is a 302 to
-the web app's tools page (a redirect flow is a browser navigation, not an API
-resource, so no contract schema changes).
+never the client secret, which stays in settings. The callback then advances
+the module's onboarding flow through
+:func:`complete_redirect_step
+<app.modules.onboarding.service.complete_redirect_step>` (T2: the ONLY path
+that completes a ``redirect`` step — POST submit stays 501) and answers a
+302 to the D8 generic wizard route
+``/configuracion/herramientas/{module_key}/onboarding``. That completion is
+BEST-EFFORT: the connection is already stored, so a missing/inactive/
+completed onboarding flow (or any engine error) is logged server-side and
+the browser still lands on the wizard — which shows the real stored state
+on the next visit. The web app does not serve the wizard route until T4;
+until then the landing is a harmless 404 (a redirect flow is a browser
+navigation, not an API resource, so no contract schema changes).
 
-T2 handoff note: the onboarding engine builds its ``ConnectionContext`` from
-its own step state, so after this flow the ``test_connection`` step still
-needs the stored tokens bridged into ``context.credentials`` — the tester
-itself (this slice) reads ``credentials["access_token"]`` and fails closed
-when it is absent.
+The tester bridge (``test_connection`` after this callback) lives in the
+onboarding engine: it decrypts this stored row into
+``ConnectionContext.credentials`` (``credentials["access_token"]`` per
+:mod:`app.modules.calendar.testers`).
 """
 
 import json
+import logging
 import time
 from typing import Annotated
 
@@ -67,6 +77,9 @@ from app.modules.connections.exceptions import CredentialsEncryptionError
 from app.modules.connections.service import create_or_update
 from app.modules.identity.deps import CurrentUser, get_current_user
 from app.modules.oauth import service
+from app.modules.onboarding.service import complete_redirect_step
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/oauth", tags=["oauth"])
 
@@ -75,8 +88,16 @@ CurrentUserDep = Annotated[CurrentUser, Depends(get_current_user)]
 SettingsDep = Annotated[Settings, Depends(get_settings)]
 ModuleCatalogDep = Annotated[ModuleCatalog, Depends(get_module_catalog)]
 
-#: Where the browser lands after a successful connection (web app tools page).
-WELCOME_PATH = "/configuracion/herramientas"
+#: Base path of the web app's tools section; a successful callback lands on
+#: ``{base}/{module_key}/onboarding`` — the D8 generic wizard route. The web
+#: app does not serve it until T4; until then the landing is a harmless 404.
+TOOLS_BASE_PATH = "/configuracion/herramientas"
+
+
+def onboarding_landing_path(module_key: str) -> str:
+    """Where the browser lands after a successful connection (D8 wizard)."""
+    return f"{TOOLS_BASE_PATH}/{module_key}/onboarding"
+
 
 _NOT_CONFIGURED = (
     "Google OAuth is not configured; set AA_GOOGLE_CLIENT_ID and AA_GOOGLE_CLIENT_SECRET"
@@ -169,7 +190,25 @@ async def google_oauth_callback(
         raise HTTPException(status_code=500, detail=_NO_KEY) from exc
     except UnknownModuleError as exc:
         raise HTTPException(status_code=404, detail=_MODULE_NOT_FOUND) from exc
-    return RedirectResponse(url=WELCOME_PATH, status_code=302)
+    try:
+        await complete_redirect_step(
+            session,
+            catalog=catalog,
+            credentials_key=_credentials_key(settings),
+            caller=pending.user,
+            module_key=pending.module_key,
+        )
+    except Exception:
+        # Best effort (T2): the connection IS stored above; a missing,
+        # inactive, or already-completed onboarding flow — or any engine
+        # error — must not break the browser landing. The wizard shows the
+        # real stored state on the next visit; the failure is logged.
+        logger.warning(
+            "oauth callback could not complete the onboarding redirect step",
+            exc_info=True,
+            extra={"module_key": pending.module_key},
+        )
+    return RedirectResponse(url=onboarding_landing_path(pending.module_key), status_code=302)
 
 
 @router.get("/{module_key}/authorize")

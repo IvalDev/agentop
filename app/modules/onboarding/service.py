@@ -56,9 +56,27 @@ Step semantics
   (:mod:`app.modules.onboarding.testers`) receives the connection context;
   no registered tester fails closed (router: 501), ``False`` refuses (409),
   a raise becomes 502 — refusals leave the state untouched;
-- ``redirect``: declarative placeholder in this foundations slice — the
-  engine refuses to auto-complete it (router: 501 naming the future OAuth
-  callback path); no fake OAuth flow is invented here.
+- ``redirect``: POST-submitting it keeps raising
+  :class:`RedirectStepError` (router: 501 naming the provider OAuth
+  callback path) for every client — the ONLY completion path is
+  :func:`complete_redirect_step`, called by the provider callback (the
+  Google flow of :mod:`app.modules.oauth`) after it stored the
+  connection. The engine never invents a fake OAuth flow.
+
+Stored-connection bridge (``redirect`` / ``test_connection``)
+-------------------------------------------------------------
+An OAuth callback writes the tokens to the user's ``UserConnection`` row
+*before* the flow advances, so the engine bridges that stored row back into
+the step machinery (:func:`_connection_secrets`): when a ``redirect`` or
+``test_connection`` step runs, the module's newest stored connection —
+decrypted in memory for this call only — merges *under* the accumulated
+state secrets for the tester's ``credentials`` context and for the final
+credentials payload. State secrets win per key; the connection's provider is
+used when the flow never answered a ``provider`` field (an OAuth flow stores
+none — the callback knows the provider). Result: a ``test_connection`` step
+can verify the OAuth tokens, and completing it never clobbers them with an
+empty payload. Steps that only touch user answers (``form`` /
+``scope_select``) never load the stored connection.
 
 Completion
 ----------
@@ -99,7 +117,8 @@ from app.modules.audit.service import persist_event
 from app.modules.catalog.manifest import FieldSpec, ModuleManifest, StepSpec
 from app.modules.catalog.registry import ModuleCatalog
 from app.modules.catalog.service import active_module_keys
-from app.modules.connections.service import create_or_update
+from app.modules.connections.models import UserConnection
+from app.modules.connections.service import create_or_update, revoke
 from app.modules.identity.deps import CurrentUser
 from app.modules.onboarding.exceptions import (
     ConnectionTestError,
@@ -130,6 +149,11 @@ _FIXED_DECRYPTION = "stored onboarding answers could not be decrypted"
 #: One canonical serialized form for the credentials payload (write-only),
 #: mirroring the connections API's dict handling.
 _JSON_OPTIONS = {"ensure_ascii": False, "separators": (",", ":"), "sort_keys": True}
+
+#: Step types whose machinery may need the module's stored connection row:
+#: ``test_connection`` verifies it, and a ``redirect`` step's completion
+#: (final or not) must never clobber the tokens the OAuth callback stored.
+_CONNECTION_AWARE_STEPS = frozenset({"redirect", "test_connection"})
 
 
 @dataclass(frozen=True)
@@ -316,6 +340,49 @@ def _open_secrets(credentials_key: str | None, state: OnboardingState | None) ->
         raise OnboardingEncryptionError(_FIXED_DECRYPTION) from exc
 
 
+async def _connection_secrets(
+    session: AsyncSession,
+    *,
+    tenant_id: int,
+    user_id: int,
+    module_key: str,
+    credentials_key: str | None,
+) -> tuple[dict[str, Any], str | None]:
+    """Decrypt the module's stored connection credentials for the tester bridge.
+
+    Loads the NEWEST ``UserConnection`` row of one (tenant, user, module) —
+    the MVP stores one provider row per module — and returns
+    ``(secrets, provider)``. ``secrets`` is the decrypted JSON blob an OAuth
+    callback stored (``access_token``, ``refresh_token``, ``expires_at``,
+    ``scopes`` …) or ``{}`` when no row or no blob exists; ``provider`` is
+    that row's provider (``None`` when no row exists). A missing or unusable
+    ``credentials_key`` over an existing blob fails closed
+    (:class:`OnboardingEncryptionError`) — same rule as the state secrets.
+    Plaintext exists only in memory for the current call; nothing here is
+    logged, audited, or persisted.
+    """
+    result = await session.execute(
+        select(UserConnection)
+        .where(
+            UserConnection.tenant_id == tenant_id,
+            UserConnection.user_id == user_id,
+            UserConnection.module_key == module_key,
+        )
+        .order_by(UserConnection.created_at.desc(), UserConnection.id.desc())
+        .limit(1)
+    )
+    row = result.scalar_one_or_none()
+    if row is None or row.credentials_encrypted is None:
+        return {}, row.provider if row is not None else None
+    if credentials_key is None:
+        raise OnboardingEncryptionError(_FIXED_ENCRYPTION)
+    try:
+        decrypted = json.loads(decrypt_credentials(credentials_key, row.credentials_encrypted))
+    except (CredentialsKeyFormatError, DecryptionError, json.JSONDecodeError) as exc:
+        raise OnboardingEncryptionError(_FIXED_DECRYPTION) from exc
+    return decrypted, row.provider
+
+
 async def _require_active(
     session: AsyncSession, catalog: ModuleCatalog, caller: CurrentUser, module_key: str
 ) -> ModuleManifest:
@@ -478,32 +545,91 @@ async def submit_step(
         raise WrongStepError("step is not the current onboarding step")
     step = _find_step(manifest, step_key)
     if step.type == "redirect":
-        # Declarative placeholder: never invent a fake OAuth flow (see module docs).
+        # Generic contract: only the provider OAuth callback completes it
+        # (:func:`complete_redirect_step`); no fake OAuth flow is invented here.
         raise RedirectStepError(
             "redirect steps complete at the provider OAuth callback "
             "(/api/v1/onboarding/{module_key}/callback); not supported in this release"
         )
     non_secret, secrets = _validate_answers(manifest, step, answers)
+    return await _advance(
+        session,
+        manifest=manifest,
+        catalog=catalog,
+        credentials_key=credentials_key,
+        testers=testers,
+        caller=caller,
+        module_key=module_key,
+        step=step,
+        non_secret=non_secret,
+        secrets=secrets,
+        state=state,
+    )
+
+
+async def _advance(
+    session: AsyncSession,
+    *,
+    manifest: ModuleManifest,
+    catalog: ModuleCatalog,
+    credentials_key: str | None,
+    testers: Mapping[str, ConnectionTester],
+    caller: CurrentUser,
+    module_key: str,
+    step: StepSpec,
+    non_secret: Mapping[str, Any],
+    secrets: Mapping[str, str],
+    state: OnboardingState | None,
+) -> OnboardingViewState:
+    """Apply one already-validated step: advance, audit, commit, return the view.
+
+    The shared transition machinery of :func:`submit_step` and
+    :func:`complete_redirect_step`: the ``non_secret`` answers and ``secrets``
+    merge over the stored state, the flow advances to the next declared step
+    (or completes, writing the connection BEFORE marking the state
+    ``completed``), and the same ``onboarding.started`` /
+    ``onboarding.step_completed`` / ``onboarding.completed`` events are
+    audited. ``redirect`` and ``test_connection`` steps additionally bridge
+    the module's stored connection (:func:`_connection_secrets`) under the
+    state secrets for the tester context and the final credentials payload —
+    so completing an OAuth flow never clobbers the tokens the callback
+    stored. Refusals (a failing tester, a failed connection write) leave the
+    stored state untouched.
+    """
     merged_data = {**(state.data if state is not None else {}), **non_secret}
-    merged_secrets = {**_open_secrets(credentials_key, state), **secrets}
+    state_secrets = {**_open_secrets(credentials_key, state), **secrets}
     provider = _resolve_provider(module_key, merged_data)
+    index = next(i for i, item in enumerate(manifest.onboarding) if item.key == step.key)
+    is_final = index == len(manifest.onboarding) - 1
+    connection_secrets: dict[str, Any] = {}
+    if step.type in _CONNECTION_AWARE_STEPS:
+        connection_secrets, connection_provider = await _connection_secrets(
+            session,
+            tenant_id=caller.tenant_id,
+            user_id=caller.id,
+            module_key=module_key,
+            credentials_key=credentials_key,
+        )
+        # An OAuth-stored connection knows its provider; the manifest's
+        # provider rule only wins when the flow actually answered the field.
+        if connection_provider is not None and "provider" not in merged_data:
+            provider = connection_provider
     if step.type == "test_connection":
         context = ConnectionContext(
             tenant_id=caller.tenant_id,
             user_id=caller.id,
             module_key=module_key,
             provider=provider,
-            credentials=merged_secrets,
+            credentials={**connection_secrets, **state_secrets},
             data=merged_data,
         )
         await _run_tester(testers, context)
-    index = next(i for i, item in enumerate(manifest.onboarding) if item.key == step_key)
-    is_final = index == len(manifest.onboarding) - 1
     if is_final:
-        if credentials_key is None and merged_secrets:
+        final_secrets = {**connection_secrets, **state_secrets}
+        if credentials_key is None and final_secrets:
             # Fail closed before the connection write (no key, no secret at rest).
             raise OnboardingEncryptionError(_FIXED_ENCRYPTION)
-        credentials = json.dumps(merged_secrets, **_JSON_OPTIONS)
+        credentials = json.dumps(final_secrets, **_JSON_OPTIONS)
         # Connection first: a failed write leaves the flow parked on this step.
         await create_or_update(
             session,
@@ -521,7 +647,9 @@ async def submit_step(
     else:
         next_status = OnboardingStatus.IN_PROGRESS
         next_step = manifest.onboarding[index + 1].key
-        secrets_token = _seal_secrets(credentials_key, merged_secrets)
+        # Only the state's own secrets travel in the token: stored connection
+        # secrets stay in the connection row (single source of truth).
+        secrets_token = _seal_secrets(credentials_key, state_secrets)
     created = state is None
     if state is None:
         state = OnboardingState(
@@ -547,7 +675,7 @@ async def submit_step(
             caller,
             "onboarding.started",
             module_key=module_key,
-            step_key=next_step if next_step is not None else step_key,
+            step_key=next_step if next_step is not None else step.key,
             status=next_status,
         )
     await _persist_state_event(
@@ -555,7 +683,7 @@ async def submit_step(
         caller,
         "onboarding.step_completed",
         module_key=module_key,
-        step_key=step_key,
+        step_key=step.key,
         status=next_status,
     )
     if is_final:
@@ -564,11 +692,67 @@ async def submit_step(
             caller,
             "onboarding.completed",
             module_key=module_key,
-            step_key=step_key,
+            step_key=step.key,
             status=next_status,
         )
     await session.commit()
     return _view(manifest, state)
+
+
+async def complete_redirect_step(
+    session: AsyncSession,
+    *,
+    catalog: ModuleCatalog,
+    credentials_key: str | None,
+    caller: CurrentUser,
+    module_key: str,
+) -> OnboardingViewState:
+    """Complete the module's current ``redirect`` step — the OAuth callback path.
+
+    The provider callback (today: the Google flow in :mod:`app.modules.oauth`)
+    calls this AFTER storing the connection: the module must be active for the
+    tenant (router-less seam: :class:`ModuleInactiveError` /
+    ``UnknownModuleError`` propagate), and the caller's flow must be parked
+    on — or, virtually, about to start at — the manifest's ``redirect`` step
+    (``WrongStepError`` otherwise, ``OnboardingCompletedError`` on a
+    completed flow). The step advances through the same machinery as a
+    submitted form step (:func:`_advance`), auditing the same
+    ``onboarding.step_completed`` event; when the redirect step is the LAST
+    declared step the flow completes, and the final credentials payload
+    keeps the stored connection secrets (the OAuth tokens) under any state
+    secrets.
+
+    POST-submitting a ``redirect`` step keeps raising
+    :class:`RedirectStepError` (router: 501) for every client — this function
+    is the only completion path. The OAuth callback treats every error here
+    as best-effort: the connection IS stored, so it logs and lands the
+    browser on the wizard anyway.
+    """
+    manifest = await _require_active(session, catalog, caller, module_key)
+    state = await _load(
+        session, tenant_id=caller.tenant_id, user_id=caller.id, module_key=module_key
+    )
+    if state is not None and state.status is OnboardingStatus.COMPLETED:
+        raise OnboardingCompletedError("onboarding is already completed")
+    if not manifest.onboarding:
+        raise WrongStepError("step is not the current onboarding step")
+    current_key = state.current_step if state is not None else manifest.onboarding[0].key
+    step = _find_step(manifest, current_key)
+    if step.type != "redirect":
+        raise WrongStepError("step is not the current onboarding step")
+    return await _advance(
+        session,
+        manifest=manifest,
+        catalog=catalog,
+        credentials_key=credentials_key,
+        testers={},
+        caller=caller,
+        module_key=module_key,
+        step=step,
+        non_secret={},
+        secrets={},
+        state=state,
+    )
 
 
 async def _run_tester(testers: Mapping[str, ConnectionTester], context: ConnectionContext) -> None:
@@ -586,6 +770,38 @@ async def _run_tester(testers: Mapping[str, ConnectionTester], context: Connecti
         raise ConnectionTestFailedError("connection test failed")
 
 
+async def _revoke_connections(
+    session: AsyncSession, *, caller: CurrentUser, module_key: str
+) -> None:
+    """Destroy the stored connections of one module for the caller (D7).
+
+    Every row of the caller's (tenant, user, module) goes through
+    :func:`connections.service.revoke`: status ``revoked`` AND
+    ``credentials_encrypted`` destroyed — the secret is unrecoverable, only a
+    fresh OAuth flow can reconnect. Status-revoked (not row removal) keeps
+    the ``UNIQUE (tenant, user, module, provider)`` natural key stable, so
+    the next completion re-activates the same row through create-or-update
+    and the audit trail keeps one stable connection id
+    (``connection.revoked``, payload ``{module_key, provider, status}`` —
+    never secrets). Safe when no connection exists: nothing to revoke.
+    """
+    rows = (
+        (
+            await session.execute(
+                select(UserConnection).where(
+                    UserConnection.tenant_id == caller.tenant_id,
+                    UserConnection.user_id == caller.id,
+                    UserConnection.module_key == module_key,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for row in rows:
+        await revoke(session, caller=caller, connection_id=row.id)
+
+
 async def restart(
     session: AsyncSession,
     *,
@@ -593,14 +809,16 @@ async def restart(
     caller: CurrentUser,
     module_key: str,
 ) -> OnboardingViewState:
-    """Reset the caller's completed onboarding so they can reconfigure.
+    """Reset the caller's completed onboarding so they can reconfigure (D7).
 
     A completed flow returns to ``in_progress`` parked on the first declared
     step: ``data`` and the secret token are cleared and the event
-    ``onboarding.restarted`` is audited. A flow that is not completed (or a
-    module with no steps) is returned unchanged — nothing to restart. The
-    existing connection row survives until the user completes again, where
-    create-or-update replaces its credentials.
+    ``onboarding.restarted`` is audited. When the manifest declares a
+    ``redirect`` step (an OAuth flow), the stored connection is destroyed as
+    well (:func:`_revoke_connections`): restart means reconnecting from
+    scratch, never reusing tokens the user just discarded. A flow that is
+    not completed (or a module with no steps) is returned unchanged —
+    nothing to restart, nothing revoked.
     """
     manifest = await _require_active(session, catalog, caller, module_key)
     state = await _load(
@@ -627,11 +845,15 @@ async def restart(
         status=OnboardingStatus.IN_PROGRESS,
     )
     await session.commit()
+    if any(step.type == "redirect" for step in manifest.onboarding):
+        # After the state commit: revoke() commits its own unit of work.
+        await _revoke_connections(session, caller=caller, module_key=module_key)
     return _view(manifest, state)
 
 
 __all__ = [
     "OnboardingViewState",
+    "complete_redirect_step",
     "get_state",
     "restart",
     "submit_step",
