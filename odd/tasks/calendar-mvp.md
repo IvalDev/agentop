@@ -177,6 +177,23 @@ real responde un error claro (no un 500).
       78 archivos, 12597 líneas, base `6b1ae08`), consentimiento:
       `declined_this_candidate`.
 
+- [x] T5 — **Allowlist de producción (decisión del humano, 2026-10-15)** —
+      commit `e21d6c4`. Opción 1 aprobada: revierte el desvío de T1 (opción 2)
+      y habilita la prueba end-to-end real. Cambios: `MODULE_CATALOG_ALLOWLIST
+      = ["calendar"]` y `BUILTIN_TOOL_ALLOWLIST = {search_documents,
+      list_events, create_event, cancel_event}`; `app/main.py` registra al
+      importar `register_default_calendar()`, `register_google_provider()`,
+      `register_calendar_tester()` y `register_calendar_tools(default_registry)`
+      (una sola vez; segundo registro = `ModuleRegistrationError`, idempotencia
+      documentada). Tests que codificaban la decisión vieja invertidos
+      (`test_calendar_manifest.py` exige presencia en producción + rechazo de
+      registro duplicado, `test_agent_api.py` subproceso imprime las 4 tools,
+      cabeceras de `test_catalog_registry`, `test_calendar_tester`,
+      `test_catalog_api`, comentario de `test_onboarding_api`). TDD: RED
+      3 failed → GREEN, docstrings obsoletos actualizados; ruff check/format
+      ✓; **suite completa 773 passed** (5:29). RDD: pendiente de
+      assess/consentimiento.
+
 ## Criterios de aceptación
 
 1. Admin activa "Calendario" en Herramientas → usuario ve Mis herramientas con
@@ -201,12 +218,14 @@ juntos). RDD ON: assess por commit; consentimiento del humano por slice.
   `feat/module-foundations`.
 - 2026-10-15: T1 completa (`d800cdf`), T2 (`b666edc`), T3 (`b0a3466`),
   T4 (`87dc864`) — evidence arriba. Desvío del allowlist registrado arriba
-  (opción 2 del humano): sin registro en producción, el flujo real de
-  prueba necesita resolverlo.
+  (opción 2 del humano) **revocado** por decisión del humano el 2026-10-15
+  (opción 1 → T5 `e21d6c4`): el calendario ya está registrado en producción.
 
 ## Next step
 
-Feature implementada: (1) resolver con el humano el allowlist de
-producción (catálogo + registry de tools) para que la prueba real funcione,
-(2) prueba end-to-end con cuenta Google del humano, (3) consentimiento RDD
-de T4.
+Feature implementada y cableada en producción: (1) consentimiento RDD de T5
+en curso, (2) prueba end-to-end con cuenta Google del humano — checklist:
+`make app`; `.env` con `AA_GOOGLE_CLIENT_ID/SECRET` (consola Google → OAuth
+web → redirect `http://localhost:8000/api/v1/oauth/google/callback` →
+Google Calendar API habilitada); activar Calendario en Herramientas;
+wizard de onboarding; pedirle al chat "listar mis próximos eventos".
