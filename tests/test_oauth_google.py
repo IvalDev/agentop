@@ -8,6 +8,10 @@ Contract under test (design decisions of the T1 slice):
   the module's redirect step and scopes (400), and answers 302 to Google's
   authorization endpoint with PKCE (``S256``), ``offline``/``consent``, and a
   one-shot state stored in the in-process pending store;
+- ``POST /api/v1/oauth/{module_key}/authorize`` runs that exact start order
+  but answers 200 ``{"url": …}``: the SPA cannot put a bearer header on the
+  top-level browser navigation to the consent screen, so it fetches the URL
+  with an authenticated POST first and then navigates;
 - ``GET /api/v1/oauth/google/callback`` is unauthenticated: it resolves the
   identity from the pending record (never from a bearer header), consumes the
   state exactly once (unknown / expired / reused share one fixed 400
@@ -221,6 +225,12 @@ async def _authorize(
     return await client.get(f"{BASE}/{module_key}/authorize", headers=headers or {})
 
 
+async def _post_authorize(
+    client: AsyncClient, module_key: str = "calendar", headers: dict[str, str] | None = None
+) -> httpx.Response:
+    return await client.post(f"{BASE}/{module_key}/authorize", headers=headers or {})
+
+
 def _owner_principal() -> CurrentUser:
     """The acme owner as ``get_current_user`` would resolve them."""
     return CurrentUser(
@@ -321,6 +331,76 @@ async def test_authorize_redirects_to_google_with_pkce_and_state(
 
     assert response.status_code == 302
     parsed = urllib.parse.urlsplit(response.headers["location"])
+    assert (parsed.hostname, parsed.path) == (AUTH_HOST, AUTH_PATH)
+    query = urllib.parse.parse_qs(parsed.query)
+    assert query["response_type"] == ["code"]
+    assert query["code_challenge_method"] == ["S256"]
+    assert query["access_type"] == ["offline"]
+    assert query["prompt"] == ["consent"]
+    assert query["client_id"] == [GOOGLE_CLIENT_ID]
+    assert query["redirect_uri"] == [f"http://test{CALLBACK}"]
+    assert CALENDAR_EVENTS_SCOPE in query["scope"][0].split()
+
+    state = query["state"][0]
+    pending = service.pending_states[state]
+    assert pending.user.id == 1  # the logged-in acme owner resolved server-side
+    assert pending.module_key == "calendar"
+    assert pending.step_key == "connect_google"
+    assert query["code_challenge"] == [_expected_challenge(pending.pkce_verifier)]
+
+
+# --- POST start endpoint (the SPA cannot send a bearer header on a navigation) ---
+
+
+async def test_post_authorize_requires_authentication(oauth_client: AsyncClient) -> None:
+    response = await _post_authorize(oauth_client)
+    assert response.status_code == 401
+
+
+async def test_post_authorize_without_google_credentials_returns_501(
+    no_google_client: AsyncClient,
+) -> None:
+    headers = await _owner(no_google_client)
+    response = await _post_authorize(no_google_client, headers=headers)
+    assert response.status_code == 501
+    assert response.json()["detail"] == (
+        "Google OAuth is not configured; set AA_GOOGLE_CLIENT_ID and AA_GOOGLE_CLIENT_SECRET"
+    )
+
+
+async def test_post_authorize_unknown_module_returns_404(oauth_client: AsyncClient) -> None:
+    headers = await _owner(oauth_client)
+    response = await _post_authorize(oauth_client, "missing_module", headers=headers)
+    assert response.status_code == 404
+    assert response.json()["detail"] == "module not found"
+
+
+async def test_post_authorize_module_without_redirect_step_returns_400(
+    oauth_client: AsyncClient,
+) -> None:
+    headers = await _owner(oauth_client)
+    response = await _post_authorize(oauth_client, "form_only", headers=headers)
+    assert response.status_code == 400
+
+
+async def test_post_authorize_module_without_scopes_returns_400(
+    oauth_client: AsyncClient,
+) -> None:
+    headers = await _owner(oauth_client)
+    response = await _post_authorize(oauth_client, "no_scopes", headers=headers)
+    assert response.status_code == 400
+
+
+async def test_post_authorize_returns_google_url_and_stores_pending_state(
+    oauth_client: AsyncClient,
+) -> None:
+    headers = await _owner(oauth_client)
+    response = await _post_authorize(oauth_client, headers=headers)
+
+    assert response.status_code == 200
+    url = response.json()["url"]
+    assert url.startswith(f"https://{AUTH_HOST}/")
+    parsed = urllib.parse.urlsplit(url)
     assert (parsed.hostname, parsed.path) == (AUTH_HOST, AUTH_PATH)
     query = urllib.parse.parse_qs(parsed.query)
     assert query["response_type"] == ["code"]

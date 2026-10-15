@@ -4,8 +4,8 @@ import { ApiError } from '../api/client';
 import {
   getOnboardingState,
   invalidAnswerKeys,
-  oauthAuthorizePath,
   restartOnboarding,
+  startAuthorization,
   submitStep,
   type OnboardingState,
   type OnboardingStep,
@@ -253,6 +253,24 @@ export function OnboardingPage() {
     }
   }
 
+  async function handleRedirect(): Promise<void> {
+    if (busy) {
+      return;
+    }
+    setBusy(true);
+    setSubmitFailure(null);
+    try {
+      // A top-level browser navigation cannot carry the `Authorization` header,
+      // so first fetch the consent URL through the authenticated API, then leave.
+      const { url } = await startAuthorization(api, moduleKey);
+      window.location.assign(url);
+    } catch (error) {
+      setSubmitFailure(submitFailureKind(error, 'redirect'));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   let body = null;
   if (loading && state === null) {
     body = <p className="page__note">{t('onboarding.loading')}</p>;
@@ -310,12 +328,12 @@ export function OnboardingPage() {
           {heading}
           {intro}
           {notice}
-          <div className="actions">
-            {/* The browser leaves for the provider: a redirect step is never POSTed. */}
-            <Button onClick={() => window.location.assign(oauthAuthorizePath(moduleKey))}>
-              {t('onboarding.redirect.connect')}
-            </Button>
-          </div>
+            <div className="actions">
+              {/* Fetch the consent URL first (the navigation cannot send the bearer header). */}
+              <Button aria-disabled={busy || undefined} onClick={() => void handleRedirect()}>
+                {t('onboarding.redirect.connect')}
+              </Button>
+            </div>
         </section>
       );
     } else if (step.type === 'test_connection') {

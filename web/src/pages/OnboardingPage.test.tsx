@@ -11,6 +11,8 @@ const SUBMIT_TEST = 'POST /api/v1/onboarding/calendar/steps/test_connection';
 const SUBMIT_FORM = 'POST /api/v1/onboarding/calendar/steps/credentials';
 const SUBMIT_SCOPES = 'POST /api/v1/onboarding/calendar/steps/pick_scopes';
 const RESTART = 'POST /api/v1/onboarding/calendar/restart';
+const AUTHORIZE = 'POST /api/v1/oauth/calendar/authorize';
+const CONSENT_URL = 'https://accounts.google.com/o/oauth2/v2/auth?state=abc&code_challenge=xyz';
 const ROUTE = '/configuracion/herramientas/calendar/onboarding';
 
 interface FieldBody {
@@ -106,6 +108,7 @@ describe('OnboardingPage: the generic step renderer', () => {
           }),
         }),
       ),
+      [AUTHORIZE]: { status: 200, body: { url: CONSENT_URL } },
     });
 
     expect(screen.getByRole('heading', { level: 1, name: 'Configurar la herramienta' })).toBeInTheDocument();
@@ -115,9 +118,32 @@ describe('OnboardingPage: the generic step renderer', () => {
     await user.click(screen.getByRole('button', { name: 'Conectar' }));
 
     expect(oauthAuthorizePath('calendar')).toBe('/api/v1/oauth/calendar/authorize');
-    expect(assign).toHaveBeenCalledWith('/api/v1/oauth/calendar/authorize');
-    // A redirect step is never POSTed: the browser leaves for the provider.
-    expect(routesCalled(fetchMock)).toEqual([ME, STATE]);
+    // The bearer header cannot ride a browser navigation, so the page fetches
+    // the consent URL first and only then leaves for the provider.
+    await waitFor(() => expect(assign).toHaveBeenCalledWith(CONSENT_URL));
+    expect(routesCalled(fetchMock)).toEqual([ME, STATE, AUTHORIZE]);
+  });
+
+  it('explains a failed OAuth start (501) with the error alert and stays on the step', async () => {
+    const assign = stubLocation();
+    const { user, fetchMock } = await openWizard({
+      [STATE]: stateReply(REDIRECT),
+      [AUTHORIZE]: {
+        status: 501,
+        body: {
+          detail: 'Google OAuth is not configured; set AA_GOOGLE_CLIENT_ID and AA_GOOGLE_CLIENT_SECRET',
+        },
+      },
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Conectar' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Se ha producido un error inesperado. Inténtalo de nuevo.');
+    expect(alert).not.toHaveTextContent('Google OAuth is not configured');
+    expect(assign).not.toHaveBeenCalled();
+    expect(screen.getByRole('button', { name: 'Conectar' })).not.toHaveAttribute('aria-disabled');
+    expect(routesCalled(fetchMock)).toEqual([ME, STATE, AUTHORIZE]);
   });
 
   it('runs the connection test without answers and advances to the completed view', { timeout: AXE_TEST_TIMEOUT_MS }, async () => {

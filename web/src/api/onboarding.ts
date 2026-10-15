@@ -108,6 +108,18 @@ export function oauthAuthorizePath(moduleKey: string): string {
   return `/api/v1/oauth/${encodeURIComponent(moduleKey)}/authorize`;
 }
 
+/**
+ * `POST /api/v1/oauth/{key}/authorize`: the Google consent URL as JSON. The
+ * wizard fetches it here (with the bearer header) and navigates itself, since
+ * a top-level `window.location` navigation cannot carry that header.
+ */
+export async function startAuthorization(
+  api: ApiClient,
+  moduleKey: string,
+): Promise<{ url: string }> {
+  return api.post<{ url: string }>(oauthAuthorizePath(moduleKey));
+}
+
 /** `GET /api/v1/onboarding/{key}`: the caller's own state and the current step to render. */
 export async function getOnboardingState(api: ApiClient, moduleKey: string): Promise<OnboardingState> {
   return toState(await api.get<OnboardingStateBody>(modulePath(moduleKey)));

@@ -7,6 +7,14 @@ route                                                     meaning              a
 ========================================================= ==================== ==================
 ``GET /api/v1/oauth/{module_key}/authorize``              302 to Google's      any authenticated
                                                           consent screen
+``POST /api/v1/oauth/{module_key}/authorize``             200 JSON {"url"}     any authenticated
+                                                          for the SPA (a
+                                                          browser navigation
+                                                          cannot carry the
+                                                          bearer header; GET
+                                                          stays for
+                                                          navigations that
+                                                          can)
 ``GET /api/v1/oauth/google/callback``                     302 to the module's  browser (no
                                                           onboarding wizard    bearer — the
                                                           after storing        pending state
@@ -18,7 +26,11 @@ Start order (checked first to last): settings → module → redirect step →
 scopes. Missing Google credentials answer 501 ``Google OAuth is not
 configured; set AA_GOOGLE_CLIENT_ID and AA_GOOGLE_CLIENT_SECRET`` even for an
 unknown module; an unknown module is 404 ``module not found``; a manifest
-without a ``redirect`` step or without permissions is 400.
+without a ``redirect`` step or without permissions is 400. Both start routes
+share that order and the same pending-state/PKCE build: the browser then
+either follows GET's 302 or, for a top-level navigation that cannot carry the
+``Authorization`` header (the SPA's onboarding wizard), POSTs for the consent
+URL first and navigates itself.
 
 Callback rules: the identity comes from the one-shot pending record (this is
 unauthenticated browser traffic — no bearer header, no cookies), consumed
@@ -220,6 +232,43 @@ async def start_module_authorization(
     settings: SettingsDep,
 ) -> RedirectResponse:
     """Send an authenticated user to Google's consent screen (302, PKCE)."""
+    return RedirectResponse(
+        url=_authorization_url(
+            module_key, request=request, user=user, catalog=catalog, settings=settings
+        ),
+        status_code=302,
+    )
+
+
+@router.post("/{module_key}/authorize")
+async def start_module_authorization_json(
+    module_key: str,
+    request: Request,
+    user: CurrentUserDep,
+    catalog: ModuleCatalogDep,
+    settings: SettingsDep,
+) -> dict[str, str]:
+    """The same consent URL as JSON (200) for the SPA's fetch-then-navigate.
+
+    A top-level browser navigation cannot carry the ``Authorization`` header,
+    so the onboarding wizard fetches the URL here (authenticated) and calls
+    ``window.location.assign(url)`` itself.
+    """
+    url = _authorization_url(
+        module_key, request=request, user=user, catalog=catalog, settings=settings
+    )
+    return {"url": url}
+
+
+def _authorization_url(
+    module_key: str,
+    *,
+    request: Request,
+    user: CurrentUser,
+    catalog: ModuleCatalog,
+    settings: Settings,
+) -> str:
+    """Run the start checks in order and build Google's consent URL (shared by GET/POST)."""
     client_id, _client_secret = _google_credentials(settings)
     try:
         manifest = catalog.get(module_key)
@@ -241,11 +290,10 @@ async def start_module_authorization(
     )
     # Both credentials were validated above; only the public id reaches the
     # consent URL (never the secret, never the verifier).
-    url = service.build_authorization_url(
+    return service.build_authorization_url(
         client_id=client_id,
         redirect_uri=str(request.url_for("google_oauth_callback")),
         scopes=manifest.permissions,
         state=state,
         code_challenge=challenge,
     )
-    return RedirectResponse(url=url, status_code=302)
