@@ -577,7 +577,7 @@ async def test_test_connection_without_registered_tester_fails_closed(
     """No tester for the module: 501, state unchanged, no connection, no event."""
     headers = await _owner(onboarding_client)
     await _activate(onboarding_client, headers, CALENDAR)
-    # ``testers`` stays empty: production ships the registry empty too.
+    # ``testers`` has no entry for ``demo_calendar``: nothing registers it.
     await _submit(
         onboarding_client, headers, CALENDAR, CALENDAR_FORM, CALENDAR_ANSWERS[CALENDAR_FORM]
     )

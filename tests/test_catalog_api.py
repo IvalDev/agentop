@@ -1,8 +1,8 @@
 """Module catalog API tests: catalog reads, activation, RBAC, isolation, audit.
 
 The app under test carries a local ``ModuleCatalog`` with two test-only
-manifests (the process-wide default catalog stays empty), so activation can
-be observed without shipping a real module — T1 ships no production module.
+manifests (never the process-wide default catalog), so activation can
+be observed without touching the real module registry.
 
 HTTP shape under test: ``GET /api/v1/modules`` is readable by any
 authenticated role and reflects only the caller's tenant; the owner/admin

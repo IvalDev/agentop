@@ -13,12 +13,13 @@ Entry points:
 - :func:`register_calendar` — register the manifest on *any* catalog; the
   tests use it with a local :class:`~app.modules.catalog.registry.ModuleCatalog`
   (the local-fixture pattern of ``tests/test_catalog_registry.py``);
-- :func:`register_default_calendar` — the future production wiring: the
-  ``register_default`` call exists as code, executed only when a caller
-  (tests proving it, or the future allowlist change) asks for it;
+- :func:`register_default_calendar` — the production wiring: ``app.main``
+  executes it once at import time (reviewed calendar-mvp allowlist change);
+  a second call raises ``ModuleRegistrationError``;
 - :func:`register_google_provider` / :func:`register_calendar_tester` — wire
   the process-wide provider and tester registries the same explicit way;
-  also never called at import (same human decision, same allowlist gate).
+  ``app.main`` calls them once at import, importing this module alone stays
+  free of side effects.
 
 Everything here is import-safe: module imports perform **no** registration.
 """
@@ -45,10 +46,9 @@ def register_calendar(catalog: ModuleCatalog) -> ModuleManifest:
 def register_default_calendar() -> ModuleManifest:
     """Register the calendar manifest on the process-wide default catalog.
 
-    Deliberately **not** called anywhere in the production import graph:
-    ``tests/test_catalog_registry.py`` locks ``default_catalog`` empty until
-    a reviewed allowlist change adopts this call. Tests that exercise it must
-    roll the key back immediately (see ``tests/test_calendar_manifest.py``).
+    Executed exactly once by the production import graph (``app.main``, the
+    human-approved calendar allowlist change): a second call raises
+    ``ModuleRegistrationError``, which is the duplicate-registration contract.
     """
     return register_default(CALENDAR_MANIFEST)
 
@@ -57,9 +57,8 @@ def register_google_provider() -> None:
     """Register the Google adapter factory under provider name ``google``.
 
     Process-wide and explicit, like every entry point here: importing this
-    module registers nothing; callers (tests, or the future allowlist change)
-    decide when the registry gains the provider. Overwrites an existing
-    registration — same contract as ``register_tester``.
+    module registers nothing; ``app.main`` calls it once at import time.
+    Overwrites an existing registration — same contract as ``register_tester``.
     """
     register_provider("google", GoogleCalendarProvider)
 

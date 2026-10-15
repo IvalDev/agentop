@@ -4,9 +4,11 @@ Covers the T1 catalog contract: valid manifests register and round-trip;
 duplicate keys, invalid keys, blank name/description, and malformed
 onboarding steps (empty or duplicated step keys, unknown step types) raise
 ``ModuleRegistrationError``; unknown lookups raise ``UnknownModuleError``.
-The process-wide default catalog ships empty: a production module may only
-appear after someone deliberately extends the allowlist, so adding one later
-is a reviewed decision instead of a silent side effect.
+The process-wide default catalog holds exactly the reviewed allowlist: the
+calendar module joined it via the human-approved calendar-mvp change, so any
+further module may only appear after someone deliberately extends
+``MODULE_CATALOG_ALLOWLIST`` — a reviewed decision, never a silent side
+effect of an import.
 """
 
 from dataclasses import FrozenInstanceError
@@ -17,8 +19,9 @@ from app.modules.catalog.exceptions import ModuleRegistrationError, UnknownModul
 from app.modules.catalog.manifest import FieldSpec, ModuleManifest, StepSpec
 from app.modules.catalog.registry import ModuleCatalog, default_catalog, register_default
 
-#: Production modules registered on the process-wide catalog; none yet (T1).
-MODULE_CATALOG_ALLOWLIST: list[str] = []
+#: Production modules registered on the process-wide catalog (reviewed
+#: calendar-mvp allowlist change, human-approved 2026-10-15).
+MODULE_CATALOG_ALLOWLIST: list[str] = ["calendar"]
 INVALID_KEYS = ["Demo Module", "google-mail", "2fast", "", "UPPER_snake", " spaced"]
 
 

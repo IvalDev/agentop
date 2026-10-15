@@ -10,12 +10,13 @@ Contract under test:
   tokens are dead; every other failure (provider error, transport error,
   unknown provider) propagates so the engine can surface 502;
 - :func:`register_google_provider` and :func:`register_calendar_tester` wire
-  the process-wide registries when a caller (tests, or the future allowlist
-  change) asks for it — importing :mod:`app.modules.calendar.registry` alone
-  must not touch them.
+  the process-wide registries — ``app.main`` calls them once at import time
+  (reviewed calendar-mvp allowlist change); importing
+  :mod:`app.modules.calendar.registry` alone must not touch them.
 
-Every registry mutation in this file is rolled back per test: the production
-registries stay empty, mirroring the ``default_catalog`` decision.
+Every registry mutation this file adds beyond the production wiring is rolled
+back per test, so the process-wide registries keep exactly the entries
+``app.main`` installed.
 """
 
 from typing import Any

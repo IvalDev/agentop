@@ -20,6 +20,12 @@ from app.modules.agent.router import router as chat_router
 from app.modules.approvals.router import router as approvals_router
 from app.modules.audit.router import router as audit_router
 from app.modules.audit.service import configure_audit
+from app.modules.calendar.registry import (
+    register_calendar_tester,
+    register_default_calendar,
+    register_google_provider,
+)
+from app.modules.calendar.tools import register_calendar_tools
 from app.modules.catalog.registry import default_catalog
 from app.modules.catalog.router import router as modules_router
 from app.modules.connections.router import router as connections_router
@@ -34,6 +40,15 @@ from app.modules.retrieval.embeddings import build_embedding_provider
 from app.modules.retrieval.router import router as search_router
 from app.modules.tools import builtin  # noqa: F401  (registers the production tools)
 from app.modules.tools.registry import default_registry
+
+# Calendar module wiring (reviewed allowlist entries, human-approved
+# 2026-10-15): register the manifest on the process-wide catalog, plus the
+# Google provider factory, the connection tester and the chat tools. Runs once
+# at import time, like the builtin tools above.
+register_default_calendar()
+register_google_provider()
+register_calendar_tester()
+register_calendar_tools(default_registry)
 
 logger = logging.getLogger(__name__)
 
