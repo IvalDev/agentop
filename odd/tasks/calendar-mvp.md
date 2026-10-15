@@ -224,8 +224,9 @@ juntos). RDD ON: assess por commit; consentimiento del humano por slice.
 
 ## Next step
 
-Feature implementada y cableada en producción: (1) consentimiento RDD de T5
-en curso, (2) prueba end-to-end con cuenta Google del humano — checklist:
+Feature implementada, cableada en producción y T5 cerrado (consentimiento
+`declined_this_candidate`). Queda (solo) la prueba end-to-end con cuenta
+Google del humano — checklist:
 `make app`; `.env` con `AA_GOOGLE_CLIENT_ID/SECRET` (consola Google → OAuth
 web → redirect `http://localhost:8000/api/v1/oauth/google/callback` →
 Google Calendar API habilitada); activar Calendario en Herramientas;
