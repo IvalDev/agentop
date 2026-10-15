@@ -195,6 +195,29 @@ real responde un error claro (no un 500).
       (`slice_budget_reached`, 79 archivos, 12643 líneas, base `6b1ae08`),
       consentimiento: `declined_this_candidate`.
 
+- [x] **BUG — `database is locked` al activar (2026-10-15, prueba manual
+      del humano)** — fix `270aaab`. `persist_event` abría una conexión
+      separada del pool para comitear la auditoría mientras la sesión de la
+      request tenía la fila flushada (transacción de escritura abierta) →
+      deadlock de dos escritores en SQLite file (`sqlite3.OperationalError:
+      database is locked` en `POST /api/v1/modules/calendar/activate`).
+      Ciego para los tests: conftest usa `:memory:` (conexión única
+      compartida), donde dos sesiones nunca compiten — reproducido y
+      confirmado con script. Arreglo: los servicios de **acción** (catalog
+      `activate`/`deactivate`, connections `create_or_update`/`revoke`/
+      `delete`/`replace`, onboarding `_advance`/`restart`) pasan a
+      `stage_event` (evento en la transacción del caller — ya comiteaban
+      justo después → atomicidad acción+auditoría y un solo escritor);
+      `persist_event` conserva su contrato independiente para negativas y
+      auditorías en vuelo (refuse, upload_rejected, executor, agent) y su
+      docstring ahora documenta la guarda SQLite. TDD: RED con test
+      file-DB nuevo `tests/test_sqlite_file_db_locks.py` (2 failed con el
+      error exacto) → GREEN. **Suite completa 775 passed** (773 + 2).
+      Riesgo latente documentado: si un tool futuro usa aprobaciones
+      (flush de `approval_request` antes del audit independiente del
+      executor), repetiría el patrón — hoy ningún tool production pide
+      aprobación.
+
 ## Criterios de aceptación
 
 1. Admin activa "Calendario" en Herramientas → usuario ve Mis herramientas con
@@ -224,9 +247,9 @@ juntos). RDD ON: assess por commit; consentimiento del humano por slice.
 
 ## Next step
 
-Feature implementada, cableada en producción y T5 cerrado (consentimiento
-`declined_this_candidate`). Queda (solo) la prueba end-to-end con cuenta
-Google del humano — checklist:
+Feature implementada, cableada en producción; T5 cerrado (`declined_this_candidate`);
+bug de activación en SQLite file corregido (`270aaab`). Prueba end-to-end con
+cuenta Google del humano — checklist:
 `make app`; `.env` con `AA_GOOGLE_CLIENT_ID/SECRET` (consola Google → OAuth
 web → redirect `http://localhost:8000/api/v1/oauth/google/callback` →
 Google Calendar API habilitada); activar Calendario en Herramientas;
