@@ -129,13 +129,28 @@ real responde un error claro (no un 500).
       credenciales, fila estable para reactivar) solo en flujos con
       paso redirect. Desvío del allowlist sigue vigente (sin cambios en
       producción registrada).
-- [ ] T3 — **Tools + ToolContext + chat**: `list_events`, `create_event`,
-      `cancel_event` con `CalendarProvider` (adapter Google con httpx),
-      `ToolContext.credentials_key` (+ parámetro del executor), precheck de
-      conexión con mensaje accionable, refresh de token bajo demanda, gating
-      por módulo activo (existente) y verificación de que el chat arma los
-      esquemas cuando el módulo está activo. **Ruta: delegated direct
-      (writer).** TDD RED→GREEN.
+- [x] T3 — **Tools + ToolContext + chat** — commit `b0a3466`; RED por fases
+      (19+collection+4 failed) → GREEN; spot check parent: ruff/format ✓ +
+      171 enfocados (allowlists bloqueados intactos); suite completa
+      `773 passed`; RDD: assess pendiente. Contenido: `app/modules/calendar/
+      tools.py` — `list_events` (EXTRACT/viewer), `create_event` y
+      `cancel_event` (ACTION/operator, **`ALLOW_WITHOUT_APPROVAL`**: nuevo
+      valor en `ApprovalPolicy` porque el invariante ACTION+REQUIRE era
+      bloqueante para D5; ACTION+AUTO sigue rechazado), precheck común
+      (`not configured`/`expired` en inglés accionable, jamás 500 ni fuga
+      de secretos) + refresh bajo demanda (60 s de skew, persiste vía
+      `create_or_update` — para eso construye un catálogo descartable de
+      un módulo, ya que el default no registra `calendar`); entry point
+      `register_calendar_tools` (registro de producción intacto, decisión
+      T1); provider Google con `create_event`/`delete_event` reales +
+      rango `time_min/time_max` en `list_events`; oauth
+      `refresh_access_token` (preserva el refresh_token guardado — Google
+      no lo devuelve en el refresh); `ToolContext` suma `credentials_key` y
+      `settings` (deviación documentada: el refresh necesita client
+      id/secret de Settings) cableados `execute_tool` → `AgentDeps` →
+      router (la ruta de aprobaciones queda con default None: los tools
+      calendario nunca pasan por ahí); D6 verificado: `tool_schemas`
+      incluye las 3 tools con el módulo activo y las excluye sin él.
 - [ ] T4 — **Web: Mis herramientas + onboarding genérico**: página de estado
       por usuario (módulos activos, conexión, CTA), wizard que renderiza
       `redirect`/`test_connection`/`form`/`scope_select` genéricamente, i18n
@@ -169,4 +184,4 @@ juntos). RDD ON: assess por commit; consentimiento del humano por slice.
 
 ## Next step
 
-T3 — tools del calendario + ToolContext.credentials_key + precheck + chat.
+T4 — web: Mis herramientas + wizard de onboarding genérico.
