@@ -85,13 +85,32 @@ real responde un error claro (no un 500).
 
 ## Tareas
 
-- [ ] T1 — **OAuth core + manifest + provider Google** (`app/modules/oauth/`,
-      `app/modules/calendar/{manifest,registry,provider,service}.py`, settings,
-      tester `test_connection`, registro en `default_catalog`). Incluye el
-      endpoint `GET /api/v1/oauth/google/start` (genera state+PKCE, redirige) y
-      `GET /api/v1/oauth/google/callback` (valida state, intercambia code,
-      guarda conexión, completa el paso redirect). **Ruta: delegated direct
-      (writer).** TDD RED→GREEN.
+- [x] T1 — **OAuth core + manifest + provider Google** — commit `d800cdf`;
+      RED→GREEN por grupos (config/manifest 12, oauth 23, provider 9, tester 8
+      = 52 tests nuevos), spot check parent: ruff/format ✓ + 73 enfocados ✓;
+      suite completa `695 passed`; RDD: assess pendiente. Contenido:
+      `app/modules/oauth/` — start `GET /api/v1/oauth/{module_key}/authorize`
+      (401→501 sin env→404 módulo→400 sin redirect/scopes→302 a Google con
+      state one-shot + PKCE) y `GET /api/v1/oauth/google/callback` (state
+      opaco in-memory 600 s de un solo uso que transporta el principal
+      completo — el callback es tráfico de browser sin bearer —, exchange
+      con seam monkeypcheable, errores 400/502 mapeados, persistencia vía
+      `connections.service.create_or_update` cifrada, 302 a
+      `/configuracion/herramientas`); `app/modules/calendar/` —
+      `CALENDAR_MANIFEST` (scope `calendar.events`, tools
+      `list_events/create_event/cancel_event`, pasos `connect_google` +
+      `test_connection`), protocolo `CalendarProvider` con providers
+      futuros documentados (D1/D9: Exchange, CalDAV, system, third-party),
+      `GoogleCalendarProvider` con `list_events` real, registry de
+      factories por usuario, tester fail-closed (chequeo de token antes de
+      buscar provider); settings `AA_GOOGLE_CLIENT_ID/SECRET`;
+      `app/main.py` cablea solo el oauth router. **Desvío decidido por el
+      humano (opción 2):** nada registra en `default_catalog` en el import
+      de producción (allowlist `test_catalog_registry.py` intacta) —
+      `GET /api/v1/modules` no lista `calendar` y el admin no puede
+      activarlo hasta un cambio revisado del allowlist; los entry points
+      (`register_default_calendar` etc.) existen como código tras llamadas
+      explícitas.
 - [ ] T2 — **Onboarding integrado**: el callback completa el paso `redirect`
       del motor T4 (sin romper el 501 genérico para otros módulos), tester de
       conexión real registrado, `restart` destruye la conexión, estados
@@ -130,8 +149,12 @@ juntos). RDD ON: assess por commit; consentimiento del humano por slice.
 
 ## Progress
 
-- 2026-10-15: doc creado; branch `feat/calendar-mvp` pendiente de crear.
+- 2026-10-15: doc creado; branch `feat/calendar-mvp` sobre
+  `feat/module-foundations`.
+- 2026-10-15: T1 completa (`d800cdf`, evidence arriba). Desvío del allowlist
+  registrado arriba (opción 2 del humano).
 
 ## Next step
 
-Crear branch y ejecutar T1 (OAuth core + manifest + provider Google).
+T2 — integración del callback con el motor de onboarding (completar el paso
+`redirect`, tester registrado en producción, `restart` + estados).
