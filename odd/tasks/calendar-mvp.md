@@ -112,11 +112,23 @@ real responde un error claro (no un 500).
       (`register_default_calendar` etc.) existen como código tras llamadas
       explícitas. RDD: assess `medium` (`slice_budget_reached`, 69 archivos,
       8246 líneas, base `6b1ae08`), consentimiento: `declined_this_candidate`.
-- [ ] T2 — **Onboarding integrado**: el callback completa el paso `redirect`
-      del motor T4 (sin romper el 501 genérico para otros módulos), tester de
-      conexión real registrado, `restart` destruye la conexión, estados
-      `wrong_state`/`expired` manejados. **Ruta: delegated direct (writer).**
-      TDD RED→GREEN.
+- [x] T2 — **Onboarding integrado** — commit `b666edc`; RED 8 failed + 25
+      passed → GREEN 60 enfocados; spot check parent: ruff/format ✓ + 81 ✓;
+      suite completa `708 passed`; RDD: assess pendiente. Contenido:
+      `complete_redirect_step` en el motor (solo el callback OAuth lo llama;
+      el POST genérico del paso redirect sigue respondiendo 501), callback
+      best-effort (conexión almacenada sobrevive a errores del motor) con
+      landing en `/configuracion/herramientas/{module}/onboarding` (404
+      hasta T4, documentado), **puente de credenciales**: `_advance` mezcla
+      los secretos de la `UserConnection` más nueva bajo los del estado
+      ({\*\*connection, \*\*state}) en pasos redirect/test_connection —
+      sin esto el tester vería vacío y el write final habría destruido el
+      blob OAuth (bug encontrado y cubierto); provider fallback a la fila
+      de conexión (si no, `calendar` ≠ `google` y el tester fallaba);
+      `restart` revoca la conexión (`revoke`: status + destrucción de
+      credenciales, fila estable para reactivar) solo en flujos con
+      paso redirect. Desvío del allowlist sigue vigente (sin cambios en
+      producción registrada).
 - [ ] T3 — **Tools + ToolContext + chat**: `list_events`, `create_event`,
       `cancel_event` con `CalendarProvider` (adapter Google con httpx),
       `ToolContext.credentials_key` (+ parámetro del executor), precheck de
@@ -157,5 +169,4 @@ juntos). RDD ON: assess por commit; consentimiento del humano por slice.
 
 ## Next step
 
-T2 — integración del callback con el motor de onboarding (completar el paso
-`redirect`, tester registrado en producción, `restart` + estados).
+T3 — tools del calendario + ToolContext.credentials_key + precheck + chat.
