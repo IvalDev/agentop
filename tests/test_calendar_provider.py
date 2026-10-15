@@ -1,15 +1,18 @@
 """Calendar provider protocol, Google adapter, and provider registry (D7).
 
-Contract under test (T1):
+Contract under test (T1 + T3):
 
 - :class:`CalendarProvider` is a runtime-checkable protocol with
   ``list_events`` / ``create_event`` / ``delete_event``; the Google adapter
-  implements ``list_events`` only (create/cancel land with T3) and raises
-  ``NotImplementedError`` for the other two;
+  implements all three (T3 turned the create/cancel stubs into real calls);
 - ``list_events`` calls the Calendar API with a Bearer header and nothing
   else, percent-encodes the calendar id into the path, requests
   ``singleEvents=true`` + ``orderBy=startTime``, and returns the ``items``
   list;
+- ``create_event`` POSTs an event body (summary, ``dateTime`` start/end,
+  optional description and attendees as ``{email}`` objects) to the events
+  collection and returns the created payload; ``delete_event`` DELETEs one
+  event resource and accepts a 204 (or any 2xx) as success;
 - 401/403 → :class:`CalendarAuthenticationError` (the tester answers False);
   any other failure → :class:`CalendarProviderError` (the engine surfaces
   502); a non-JSON body or missing ``items`` is a provider error too;
@@ -18,6 +21,7 @@ Contract under test (T1):
   like ``register_tester``, ``get_provider`` raises ``UnknownProviderError``.
 """
 
+import json
 from typing import Any
 
 import httpx
@@ -73,6 +77,23 @@ async def test_list_events_sends_bearer_path_and_query_params() -> None:
     assert "key=" not in seen["url"]
 
 
+async def test_list_events_passes_the_time_range_as_timemin_timemax() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"items": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        await provider.list_events(
+            time_min="2026-10-20T08:00:00+02:00", time_max="2026-10-20T18:00:00+02:00"
+        )
+
+    assert "timeMin=2026-10-20T08%3A00%3A00%2B02%3A00" in seen["url"]
+    assert "timeMax=2026-10-20T18%3A00%3A00%2B02%3A00" in seen["url"]
+
+
 @pytest.mark.parametrize("status_code", [401, 403])
 async def test_list_events_auth_failure_raises_authentication_error(status_code: int) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
@@ -115,12 +136,175 @@ async def test_list_events_transport_error_propagates() -> None:
             await provider.list_events()
 
 
-async def test_create_and_delete_are_t3_stubs() -> None:
-    provider = GoogleCalendarProvider(ACCESS_TOKEN)
-    with pytest.raises(NotImplementedError):
-        await provider.create_event()
-    with pytest.raises(NotImplementedError):
-        await provider.delete_event()
+async def test_create_event_posts_event_body_and_returns_payload() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers["Authorization"]
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "evt1", "html_link": "https://cal/evt1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        payload = await provider.create_event(
+            summary="Standup",
+            start="2026-10-20T10:00:00+02:00",
+            end="2026-10-20T10:30:00+02:00",
+            description="Daily sync",
+            attendees=["ana@example.com", "luis@example.com"],
+        )
+
+    assert payload == {"id": "evt1", "html_link": "https://cal/evt1"}
+    assert seen["method"] == "POST"
+    assert seen["url"] == "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+    assert seen["authorization"] == f"Bearer {ACCESS_TOKEN}"
+    assert seen["body"] == {
+        "summary": "Standup",
+        "start": {"dateTime": "2026-10-20T10:00:00+02:00"},
+        "end": {"dateTime": "2026-10-20T10:30:00+02:00"},
+        "description": "Daily sync",
+        "attendees": [{"email": "ana@example.com"}, {"email": "luis@example.com"}],
+    }
+
+
+async def test_create_event_percent_encodes_the_calendar_id() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(200, json={"id": "evt2"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        await provider.create_event(
+            calendar_id="team@example.com",
+            summary="Review",
+            start="2026-10-21T09:00:00Z",
+            end="2026-10-21T10:00:00Z",
+        )
+
+    assert (
+        seen["url"] == "https://www.googleapis.com/calendar/v3/calendars/team%40example.com/events"
+    )
+
+
+async def test_create_event_omits_optional_fields_when_absent() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "evt3"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        await provider.create_event(
+            summary="Focus", start="2026-10-22T14:00:00Z", end="2026-10-22T15:00:00Z"
+        )
+
+    assert seen["body"] == {
+        "summary": "Focus",
+        "start": {"dateTime": "2026-10-22T14:00:00Z"},
+        "end": {"dateTime": "2026-10-22T15:00:00Z"},
+    }
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_create_event_auth_failure_raises_authentication_error(status_code: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": {"code": status_code}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(CalendarAuthenticationError):
+            await provider.create_event(
+                summary="X", start="2026-10-20T10:00:00Z", end="2026-10-20T11:00:00Z"
+            )
+
+
+async def test_create_event_server_failure_raises_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "backend"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(CalendarProviderError) as excinfo:
+            await provider.create_event(
+                summary="X", start="2026-10-20T10:00:00Z", end="2026-10-20T11:00:00Z"
+            )
+    assert type(excinfo.value) is CalendarProviderError
+
+
+async def test_create_event_non_json_body_raises_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>oops</html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(CalendarProviderError):
+            await provider.create_event(
+                summary="X", start="2026-10-20T10:00:00Z", end="2026-10-20T11:00:00Z"
+            )
+
+
+async def test_delete_event_sends_delete_with_encoded_ids_and_accepts_204() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers["Authorization"]
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        result = await provider.delete_event(event_id="evt_123")
+
+    assert result is None
+    assert seen["method"] == "DELETE"
+    assert seen["url"] == "https://www.googleapis.com/calendar/v3/calendars/primary/events/evt_123"
+    assert seen["authorization"] == f"Bearer {ACCESS_TOKEN}"
+
+
+async def test_delete_event_percent_encodes_calendar_and_event_ids() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        return httpx.Response(204)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        await provider.delete_event(calendar_id="team@example.com", event_id="evt 456/x")
+
+    assert (
+        seen["url"] == "https://www.googleapis.com/calendar/v3/calendars/team%40example.com"
+        "/events/evt%20456%2Fx"
+    )
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_delete_event_auth_failure_raises_authentication_error(status_code: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": {"code": status_code}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(CalendarAuthenticationError):
+            await provider.delete_event(event_id="evt1")
+
+
+@pytest.mark.parametrize("status_code", [400, 404, 500])
+async def test_delete_event_failure_raises_provider_error(status_code: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"error": {"code": status_code}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(CalendarProviderError) as excinfo:
+            await provider.delete_event(event_id="evt1")
+    assert type(excinfo.value) is CalendarProviderError
 
 
 def test_register_provider_round_trip_overwrites_and_unknown_raises() -> None:

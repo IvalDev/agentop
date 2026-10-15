@@ -643,3 +643,86 @@ async def test_exchange_code_transport_error_propagates() -> None:
                 code_verifier="v",
                 client=client,
             )
+
+
+# --- refresh_access_token (T3: under-demand refresh, D3) ----------------------
+
+
+async def test_refresh_access_token_posts_refresh_grant_and_parses_tokens() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["form"] = dict(urllib.parse.parse_qsl(request.content.decode("utf-8")))
+        return httpx.Response(
+            200,
+            json={"access_token": "ya29.fresh", "expires_in": 3600, "scope": CALENDAR_EVENTS_SCOPE},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        tokens = await service.refresh_access_token(
+            refresh_token="rt-1",
+            client_id="cid",
+            client_secret="csecret",
+            client=client,
+        )
+
+    assert seen["url"] == "https://oauth2.googleapis.com/token"
+    assert seen["form"] == {
+        "refresh_token": "rt-1",
+        "client_id": "cid",
+        "client_secret": "csecret",
+        "grant_type": "refresh_token",
+    }
+    assert tokens.access_token == "ya29.fresh"
+    # Google may omit the refresh token and scope on a refresh: parse as None/empty.
+    assert tokens.refresh_token is None
+    assert tokens.expires_in == 3600
+    assert tokens.scopes == (CALENDAR_EVENTS_SCOPE,)
+
+
+async def test_refresh_access_token_keeps_a_returned_refresh_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"access_token": "ya29.fresh2", "refresh_token": "rt-2", "expires_in": 60}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        tokens = await service.refresh_access_token(
+            refresh_token="rt-1", client_id="cid", client_secret="csecret", client=client
+        )
+
+    assert (tokens.access_token, tokens.refresh_token) == ("ya29.fresh2", "rt-2")
+
+
+async def test_refresh_access_token_refusal_raises_token_exchange_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, json={"error": "invalid_grant"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(service.TokenExchangeError):
+            await service.refresh_access_token(
+                refresh_token="dead", client_id="cid", client_secret="csecret", client=client
+            )
+
+
+async def test_refresh_access_token_missing_token_raises_token_exchange_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"expires_in": 3600})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(service.TokenExchangeError):
+            await service.refresh_access_token(
+                refresh_token="rt", client_id="cid", client_secret="csecret", client=client
+            )
+
+
+async def test_refresh_access_token_transport_error_propagates() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(httpx.RequestError):
+            await service.refresh_access_token(
+                refresh_token="rt", client_id="cid", client_secret="csecret", client=client
+            )

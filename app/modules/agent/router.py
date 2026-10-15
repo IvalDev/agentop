@@ -54,6 +54,11 @@ def get_agent_deps(
         embeddings=embeddings,
         settings=settings,
         storage=storage,
+        # The Fernet key for provider connections (calendar-mvp T3): tools
+        # that decrypt per-user tokens get it here; None fails them closed.
+        credentials_key=(
+            settings.credentials_key.get_secret_value() if settings.credentials_key else None
+        ),
     )
 
 

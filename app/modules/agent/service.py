@@ -11,8 +11,9 @@ the audit correlation id of everything the run does):
 2. A reply without tool calls is the final answer. Otherwise each call (at
    most :data:`MAX_TOOL_CALLS_PER_STEP` per reply) runs through
    :func:`~app.modules.tools.executor.execute_tool` as actor ``agent`` with
-   the run id as correlation id (tools get the run's ``llm`` and document
-   ``storage`` in their context), its result goes back as a ``tool`` message,
+   the run id as correlation id (tools get the run's ``llm``, document
+   ``storage``, the app ``settings``, and the per-user-connection
+   ``credentials_key`` in their context), its result goes back as a ``tool`` message,
    and the model is asked again — at most ``Settings.agent_max_steps`` model
    calls per run. When that budget is spent the run stops with
    :data:`STEP_LIMIT_ANSWER`; calls requested on the last step never run.
@@ -133,6 +134,9 @@ class AgentDeps:
     embeddings: EmbeddingProvider | None
     settings: Settings
     storage: DocumentStorage | None = None
+    #: Fernet key for per-user provider connections (calendar-mvp T3/D3);
+    #: ``None`` fails the calendar tools closed with a precheck error.
+    credentials_key: str | None = None
 
 
 def new_run_id() -> str:
@@ -319,6 +323,8 @@ class AgentRun:
                 llm=self._deps.llm,
                 storage=self._deps.storage,
                 active_modules=self._active_modules,
+                credentials_key=self._deps.credentials_key,
+                settings=self._deps.settings,
             )
             summary, content, new_approval = await self._handle(call_id, name, result)
         self._summaries.append(summary)

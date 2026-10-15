@@ -6,9 +6,15 @@ authenticated user. Every tool declares:
 - its :class:`ToolKind` — ``EXTRACT`` (read-only, produces structured data)
   or ``ACTION`` (mutates external state or sends something);
 - its :class:`ApprovalPolicy` — ``AUTO`` may run without human approval and
-  is only legal for ``EXTRACT``; ``REQUIRE_APPROVAL`` must be approved by a
-  human first and is mandatory for every ``ACTION`` (feature decision A7:
-  the model never authorizes);
+  is only legal for ``EXTRACT``; ``ALLOW_WITHOUT_APPROVAL`` also runs
+  without approval and is the explicit no-approval policy for deliberate
+  self-service ``ACTION`` tools (calendar-mvp D5: the user's own calendar —
+  the model acts on the caller's behalf with no third-party effect, so a
+  human approval round-trip would only add friction; the registration
+  invariant still forbids ``AUTO`` on ``ACTION``, so an action must declare
+  its no-approval policy explicitly); ``EXTRACT`` tools may use it as the
+  clearer spelling of ``AUTO``; ``REQUIRE_APPROVAL`` must be approved by a
+  human first (feature decision A7: the model never authorizes);
 - the minimum :class:`~app.modules.identity.models.role` that may invoke it;
 - the catalog ``module`` key it belongs to: ``None`` marks a core tool every
   tenant always has, while a non-``None`` key (a lowercase identifier like a
@@ -63,6 +69,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.modules.agent.llm import LLMProvider
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.models import UserRole
@@ -81,6 +88,7 @@ class ApprovalPolicy(enum.StrEnum):
     """Whether a human must approve the tool before it executes."""
 
     AUTO = "auto"
+    ALLOW_WITHOUT_APPROVAL = "allow_without_approval"
     REQUIRE_APPROVAL = "require_approval"
 
 
@@ -101,6 +109,11 @@ class ToolContext:
     from the authenticated principal, never from tool input). ``embeddings``,
     ``llm``, and ``storage`` are ``None`` when the caller wired no such
     service; handlers must degrade or fail closed instead of assuming one.
+    ``credentials_key`` is the Fernet key for decrypting per-user provider
+    connections (calendar-mvp T3); ``settings`` carries the app configuration
+    a handler's precheck may need (the Google OAuth client credentials for
+    the under-demand token refresh, D3). Both default to ``None`` — tools
+    that need them must fail closed with a precheck error, never a 500.
     """
 
     session: AsyncSession
@@ -110,6 +123,8 @@ class ToolContext:
     correlation_id: str | None = None
     llm: LLMProvider | None = None
     storage: DocumentStorage | None = None
+    credentials_key: str | None = None
+    settings: Settings | None = None
 
 
 ToolHandler = Callable[[ToolContext, BaseModel], Awaitable[Any]]
@@ -190,12 +205,13 @@ class ToolRegistry:
             )
         if not callable(spec.handler):
             raise ToolRegistrationError(f"tool {spec.name!r} needs a callable handler")
-        if (
-            spec.kind is ToolKind.ACTION
-            and spec.approval_policy is not ApprovalPolicy.REQUIRE_APPROVAL
+        if spec.kind is ToolKind.ACTION and spec.approval_policy not in (
+            ApprovalPolicy.REQUIRE_APPROVAL,
+            ApprovalPolicy.ALLOW_WITHOUT_APPROVAL,
         ):
             raise ToolRegistrationError(
-                f"tool {spec.name!r}: ACTION tools must use approval_policy=REQUIRE_APPROVAL"
+                f"tool {spec.name!r}: ACTION tools must declare approval_policy="
+                "REQUIRE_APPROVAL or ALLOW_WITHOUT_APPROVAL (never AUTO)"
             )
         for hook in ("approval_role", "precheck"):
             if getattr(spec, hook) is not None and not callable(getattr(spec, hook)):

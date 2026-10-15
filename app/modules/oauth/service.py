@@ -21,7 +21,12 @@ the router stays free of URLs:
   body, or a response without an ``access_token`` raises
   :class:`TokenExchangeError` (the router maps it to 400); network failures
   propagate as :class:`httpx.RequestError` (mapped to 502), so the caller can
-  tell "Google refused" from "Google is unreachable".
+  tell "Google refused" from "Google is unreachable";
+- :func:`refresh_access_token` — exchanges a ``refresh_token`` for a fresh
+  access token (T3: the calendar tools' under-demand refresh, D3). Same
+  response parsing and the same error types as the code exchange; Google may
+  omit ``refresh_token`` and ``scope`` on a refresh, which parses as
+  ``None``/empty (callers keep their stored values).
 
 Single-process limitation (same contract as the tool registry and the default
 module catalog): ``pending_states`` lives in this process's memory — a restart
@@ -212,6 +217,18 @@ async def exchange_code(
     else:
         async with httpx.AsyncClient() as owned_client:
             response = await owned_client.post(GOOGLE_TOKEN_ENDPOINT, data=form)
+    return _parse_token_response(response)
+
+
+def _parse_token_response(response: httpx.Response) -> OAuthTokens:
+    """Parse a token-endpoint response into :class:`OAuthTokens`.
+
+    Shared by :func:`exchange_code` and :func:`refresh_access_token`.
+
+    Raises:
+        TokenExchangeError: non-2xx response, non-JSON body, or a response
+            without an ``access_token``.
+    """
     if response.is_error:
         raise TokenExchangeError(f"token endpoint answered {response.status_code}")
     try:
@@ -232,6 +249,45 @@ async def exchange_code(
     )
 
 
+async def refresh_access_token(
+    *,
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+    client: httpx.AsyncClient | None = None,
+) -> OAuthTokens:
+    """Exchange a refresh token for a fresh access token (``grant_type=refresh_token``).
+
+    Used by the calendar tools' precheck (T3 / D3): an expired access token
+    is refreshed transparently and the new blob is persisted on the
+    connection. ``client`` is an injection seam for tests
+    (:class:`httpx.MockTransport`); without it this function owns a
+    short-lived client and closes it.
+
+    Google may omit ``refresh_token`` and ``scope`` on a refresh response —
+    that parses as ``None``/empty, and the caller decides whether to keep its
+    stored values (the calendar precheck does).
+
+    Raises:
+        TokenExchangeError: non-2xx response, non-JSON body, or a response
+            without an ``access_token`` — "Google said no" (callers surface
+            "reconnect in Settings").
+        httpx.RequestError: the token endpoint could not be reached.
+    """
+    form = {
+        "refresh_token": refresh_token,
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "grant_type": "refresh_token",
+    }
+    if client is not None:
+        response = await client.post(GOOGLE_TOKEN_ENDPOINT, data=form)
+    else:
+        async with httpx.AsyncClient() as owned_client:
+            response = await owned_client.post(GOOGLE_TOKEN_ENDPOINT, data=form)
+    return _parse_token_response(response)
+
+
 __all__ = [
     "GOOGLE_AUTHORIZATION_ENDPOINT",
     "GOOGLE_TOKEN_ENDPOINT",
@@ -245,5 +301,6 @@ __all__ = [
     "new_pkce",
     "new_state",
     "pending_states",
+    "refresh_access_token",
     "store_pending",
 ]
