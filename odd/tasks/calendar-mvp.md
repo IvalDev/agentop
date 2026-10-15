@@ -191,8 +191,9 @@ real responde un error claro (no un 500).
       cabeceras de `test_catalog_registry`, `test_calendar_tester`,
       `test_catalog_api`, comentario de `test_onboarding_api`). TDD: RED
       3 failed → GREEN, docstrings obsoletos actualizados; ruff check/format
-      ✓; **suite completa 773 passed** (5:29). RDD: pendiente de
-      assess/consentimiento.
+      ✓; **suite completa 773 passed** (5:29). RDD: assess `medium`
+      (`slice_budget_reached`, 79 archivos, 12643 líneas, base `6b1ae08`),
+      consentimiento: `declined_this_candidate`.
 
 ## Criterios de aceptación
 
