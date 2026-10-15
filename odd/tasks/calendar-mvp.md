@@ -218,6 +218,23 @@ real responde un error claro (no un 500).
       executor), repetiría el patrón — hoy ningún tool production pide
       aprobación.
 
+- [x] **BUG — 401 en `GET /oauth/calendar/authorize` (2026-10-15, prueba
+      manual del humano)** — fix pendiente de commit de docs. Síntoma: con
+      cualquier usuario, el botón "Conectar con Google" devolvía 401
+      `not authenticated`. Causa raíz verificada: la auth web es **solo
+      bearer header** en el fetch de `ApiClient`; el wizard navegaba con
+      `window.location.assign` (navegación de navegador = sin header) →
+      401. Arreglo: nueva ruta `POST /api/v1/oauth/{module_key}/authorize`
+      (mismos prechecks vía helper compartido `_authorization_url`, 200
+      `{"url"}`) que el frontend llama con fetch autenticado y recién ahí
+      navega; el contrato GET 302 queda intacto (docstring tabla
+      actualizado). Errores 501/404/400 del start reutilizan el
+      `submitFailure`/`notice` existente (sin i18n nuevo). TDD delegado a
+      writer: RED backend `assert 405 == 401` (ruta inexistente) + RED web
+      (aserción vieja de assign síncrono) → GREEN; spot check parent: 34
+      passed + superficies exactas (5 archivos, 197+/13-); writer: ruff ✓,
+      44 enfocados ✓, typecheck ✓, lint ✓, **130 web tests** ✓.
+
 ## Criterios de aceptación
 
 1. Admin activa "Calendario" en Herramientas → usuario ve Mis herramientas con
