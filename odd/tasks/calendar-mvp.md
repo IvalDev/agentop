@@ -151,6 +151,8 @@ real responde un error claro (no un 500).
       router (la ruta de aprobaciones queda con default None: los tools
       calendario nunca pasan por ahí); D6 verificado: `tool_schemas`
       incluye las 3 tools con el módulo activo y las excluye sin él.
+      RDD: assess `medium` (`slice_budget_reached`, 73 archivos, 11165
+      líneas, base `6b1ae08`), consentimiento: `declined_this_candidate`.
 - [ ] T4 — **Web: Mis herramientas + onboarding genérico**: página de estado
       por usuario (módulos activos, conexión, CTA), wizard que renderiza
       `redirect`/`test_connection`/`form`/`scope_select` genéricamente, i18n
