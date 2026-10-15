@@ -4,8 +4,8 @@ import { t } from '../../i18n';
 import { paths } from '../../routes/paths';
 
 export interface MainNavProps {
-  /** Settings (Team and Tools); only owners and admins get the group. */
-  showSettings: boolean;
+  /** Equipo and Herramientas; only owners and admins get those two links. */
+  showAdminSections: boolean;
 }
 
 const MENU_ID = 'main-nav-menu';
@@ -13,8 +13,10 @@ const MENU_ID = 'main-nav-menu';
 /**
  * Section links. On narrow screens the list collapses behind a "Menú" toggle
  * (`aria-expanded`); Escape closes it and returns focus to the toggle.
+ * The settings group is for everyone (each user configures their own tools);
+ * only its admin entries (Equipo, Herramientas) honour `showAdminSections`.
  */
-export function MainNav({ showSettings }: MainNavProps) {
+export function MainNav({ showAdminSections }: MainNavProps) {
   const [open, setOpen] = useState(false);
   const toggleRef = useRef<HTMLButtonElement>(null);
 
@@ -57,25 +59,32 @@ export function MainNav({ showSettings }: MainNavProps) {
             {t('nav.knowledge')}
           </NavLink>
         </li>
-        {showSettings && (
-          <li className="main-nav__group">
-            <span id="main-nav-settings" className="main-nav__group-label">
-              {t('nav.settings')}
-            </span>
-            <ul className="main-nav__submenu" aria-labelledby="main-nav-settings">
-              <li>
-                <NavLink className="main-nav__link" to={paths.team} onClick={close}>
-                  {t('nav.team')}
-                </NavLink>
-              </li>
-              <li>
-                <NavLink className="main-nav__link" to={paths.tools} onClick={close}>
-                  {t('nav.tools')}
-                </NavLink>
-              </li>
-            </ul>
-          </li>
-        )}
+        <li className="main-nav__group">
+          <span id="main-nav-settings" className="main-nav__group-label">
+            {t('nav.settings')}
+          </span>
+          <ul className="main-nav__submenu" aria-labelledby="main-nav-settings">
+            <li>
+              <NavLink className="main-nav__link" to={paths.myTools} onClick={close}>
+                {t('nav.myTools')}
+              </NavLink>
+            </li>
+            {showAdminSections && (
+              <>
+                <li>
+                  <NavLink className="main-nav__link" to={paths.team} onClick={close}>
+                    {t('nav.team')}
+                  </NavLink>
+                </li>
+                <li>
+                  <NavLink className="main-nav__link" to={paths.tools} onClick={close}>
+                    {t('nav.tools')}
+                  </NavLink>
+                </li>
+              </>
+            )}
+          </ul>
+        </li>
       </ul>
     </nav>
   );

@@ -46,16 +46,17 @@ describe('auth guard', () => {
 });
 
 describe('role-based navigation', () => {
-  it.each<Role>(['viewer', 'operator'])('hides Settings from a %s', async (role) => {
+  it.each<Role>(['viewer', 'operator'])('shows a %s only Mis herramientas inside Settings', async (role) => {
     signedIn(role, '/chat');
     await screen.findByRole('heading', { level: 1, name: 'Chat' });
 
     const nav = mainNav();
     expect(within(nav).getByRole('link', { name: 'Chat' })).toHaveAttribute('aria-current', 'page');
     expect(within(nav).getByRole('link', { name: 'Base de conocimiento' })).toBeInTheDocument();
+    expect(within(nav).getByText('Configuración')).toBeInTheDocument();
+    expect(within(nav).getByRole('link', { name: 'Mis herramientas' })).toBeInTheDocument();
     expect(within(nav).queryByRole('link', { name: 'Equipo' })).not.toBeInTheDocument();
     expect(within(nav).queryByRole('link', { name: 'Herramientas' })).not.toBeInTheDocument();
-    expect(within(nav).queryByText('Configuración')).not.toBeInTheDocument();
   });
 
   it.each<Role>(['viewer', 'operator'])('redirects a %s away from the Team route', async (role) => {
@@ -70,6 +71,41 @@ describe('role-based navigation', () => {
 
     expect(await screen.findByRole('heading', { level: 1, name: 'Chat' })).toBeInTheDocument();
     expect(screen.getByTestId('location')).toHaveTextContent('/chat');
+  });
+
+  it.each<Role>(['viewer', 'operator'])('lets a %s reach My tools (their own tools, not the admin panel)', async (role) => {
+    signedIn(role, '/configuracion/mis-herramientas');
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Mis herramientas' })).toBeInTheDocument();
+    expect(screen.getByTestId('location')).toHaveTextContent('/configuracion/mis-herramientas');
+  });
+
+  it.each<Role>(['viewer', 'operator'])('lets a %s reach the onboarding wizard (the OAuth landing)', async (role) => {
+    installFakeApi({
+      ...signedInRoutes(role),
+      'GET /api/v1/onboarding/calendar': {
+        status: 200,
+        body: {
+          module_key: 'calendar',
+          status: 'not_started',
+          current_step: 'connect_google',
+          step: {
+            key: 'connect_google',
+            type: 'redirect',
+            title: 'Conéctate con Google',
+            description: 'Autoriza el acceso.',
+            fields: [],
+          },
+          data: {},
+          created_at: null,
+          updated_at: null,
+        },
+      },
+    });
+    renderApp({ route: '/configuracion/herramientas/calendar/onboarding', storedToken: `${role}-token` });
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Configurar la herramienta' })).toBeInTheDocument();
+    expect(screen.getByTestId('location')).toHaveTextContent('/configuracion/herramientas/calendar/onboarding');
   });
 
   it.each<Role>(['owner', 'admin'])('lets a %s reach Settings → Team', async (role) => {

@@ -34,7 +34,7 @@ export function DashboardShell() {
           userName={user.fullName}
           role={user.role}
           onLogout={logout}
-          navigation={<MainNav showSettings={canManageSettings(user.role)} />}
+          navigation={<MainNav showAdminSections={canManageSettings(user.role)} />}
         />
       }
     >

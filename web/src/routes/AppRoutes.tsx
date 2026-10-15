@@ -3,7 +3,9 @@ import { ChatPage } from '../pages/ChatPage';
 import { DashboardShell } from '../pages/DashboardShell';
 import { KnowledgePage } from '../pages/KnowledgePage';
 import { LoginPage } from '../pages/LoginPage';
+import { MyToolsPage } from '../pages/MyToolsPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
+import { OnboardingPage } from '../pages/OnboardingPage';
 import { TeamPage } from '../pages/TeamPage';
 import { ToolsPage } from '../pages/ToolsPage';
 import { SETTINGS_ADMIN_ROLES } from '../session/roles';
@@ -25,6 +27,10 @@ export function AppRoutes() {
         <Route index element={<Navigate to={paths.chat} replace />} />
         <Route path={paths.chat} element={<ChatPage />} />
         <Route path={paths.knowledge} element={<KnowledgePage />} />
+        {/* Every user configures their own tools: these two are NOT admin-gated,
+            or the OAuth callback would bounce a connected non-admin. */}
+        <Route path={paths.myTools} element={<MyToolsPage />} />
+        <Route path={paths.onboardingRoute} element={<OnboardingPage />} />
         <Route
           path={paths.settings}
           element={
