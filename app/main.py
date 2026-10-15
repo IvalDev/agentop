@@ -27,6 +27,7 @@ from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.router import router as auth_router
 from app.modules.identity.users_router import router as users_router
+from app.modules.oauth.router import router as oauth_router
 from app.modules.onboarding.router import router as onboarding_router
 from app.modules.onboarding.testers import connection_testers
 from app.modules.retrieval.embeddings import build_embedding_provider
@@ -191,6 +192,8 @@ def create_app() -> FastAPI:
     application.state.llm = build_llm_provider(settings)
     application.state.tool_registry = default_registry
     application.state.module_catalog = default_catalog
+    # calendar-mvp: app.modules.calendar is deliberately not imported here —
+    # default_catalog stays empty until the reviewed allowlist change (T1 decision).
     # Per-module connection testers for onboarding's test_connection steps
     # (empty in production; module packages register theirs at import time).
     application.state.connection_testers = connection_testers
@@ -204,6 +207,7 @@ def create_app() -> FastAPI:
     application.include_router(modules_router)
     application.include_router(connections_router)
     application.include_router(onboarding_router)
+    application.include_router(oauth_router)
     application.include_router(chat_router)
     if settings.is_development:
         # Static dev console over the public API; any other environment answers 404.
