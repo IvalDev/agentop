@@ -173,7 +173,9 @@ real responde un error claro (no un 500).
       manifest del calendario lleva strings de developer en inglés por ser
       artefacto de código — D8 prioriza ramas cero en el renderer);
       cleanup: cachés `node_modules`/`vitest` accidentales en la raíz
-      eliminados (sin package.json raíz).
+      eliminados (sin package.json raíz). RDD: assess `medium` (`slice_budget_reached`,
+      78 archivos, 12597 líneas, base `6b1ae08`), consentimiento:
+      `declined_this_candidate`.
 
 ## Criterios de aceptación
 
