@@ -110,7 +110,8 @@ real responde un error claro (no un 500).
       `GET /api/v1/modules` no lista `calendar` y el admin no puede
       activarlo hasta un cambio revisado del allowlist; los entry points
       (`register_default_calendar` etc.) existen como código tras llamadas
-      explícitas.
+      explícitas. RDD: assess `medium` (`slice_budget_reached`, 69 archivos,
+      8246 líneas, base `6b1ae08`), consentimiento: `declined_this_candidate`.
 - [ ] T2 — **Onboarding integrado**: el callback completa el paso `redirect`
       del motor T4 (sin romper el 501 genérico para otros módulos), tester de
       conexión real registrado, `restart` destruye la conexión, estados
