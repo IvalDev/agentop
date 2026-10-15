@@ -153,11 +153,27 @@ real responde un error claro (no un 500).
       incluye las 3 tools con el módulo activo y las excluye sin él.
       RDD: assess `medium` (`slice_budget_reached`, 73 archivos, 11165
       líneas, base `6b1ae08`), consentimiento: `declined_this_candidate`.
-- [ ] T4 — **Web: Mis herramientas + onboarding genérico**: página de estado
-      por usuario (módulos activos, conexión, CTA), wizard que renderiza
-      `redirect`/`test_connection`/`form`/`scope_select` genéricamente, i18n
-      es-ES, tests (fake API + axe). **Ruta: delegated direct (writer web).**
-      TDD RED→GREEN.
+- [x] T4 — **Web: Mis herramientas + onboarding genérico** — commit
+      `87dc864`; RED 11 failed → GREEN 35 enfocados; spot check parent:
+      typecheck ✓, lint ✓, **129 web tests** ✓, build ✓; RDD: assess
+      pendiente. Contenido: `paths.myTools` + wizard en
+      `/configuracion/herramientas/:module/onboarding` (el 302 del callback
+      aterriza ahí), rutas para cualquier rol autenticado (el grupo de
+      settings siempre visible; Equipo/Herramientas conservan su regla
+      admin vía prop renombrada `showAdminSections`), `MyToolsPage`
+      (módulos activos + estado por `GET /onboarding/{key}` — sin
+      `GET /connections`, justificado: completed implica conexión —,
+      estados loading/error/empty, CTA "Configurar"), `OnboardingPage`
+      renderer cero-ramas por módulo: redirect → `window.location.assign`
+      al authorize (URL exacta asertada con `vi.stubGlobal('location')`),
+      test_connection sin answers, form con errores 422 inline por field
+      key (secret → password), scope_select, completed con restart tras
+      `ConfirmPanel`, salidas amables 404/409; i18n es-ES neutro.
+      **Nota:** el título/descripción de los pasos sale del server (el
+      manifest del calendario lleva strings de developer en inglés por ser
+      artefacto de código — D8 prioriza ramas cero en el renderer);
+      cleanup: cachés `node_modules`/`vitest` accidentales en la raíz
+      eliminados (sin package.json raíz).
 
 ## Criterios de aceptación
 
@@ -181,9 +197,14 @@ juntos). RDD ON: assess por commit; consentimiento del humano por slice.
 
 - 2026-10-15: doc creado; branch `feat/calendar-mvp` sobre
   `feat/module-foundations`.
-- 2026-10-15: T1 completa (`d800cdf`, evidence arriba). Desvío del allowlist
-  registrado arriba (opción 2 del humano).
+- 2026-10-15: T1 completa (`d800cdf`), T2 (`b666edc`), T3 (`b0a3466`),
+  T4 (`87dc864`) — evidence arriba. Desvío del allowlist registrado arriba
+  (opción 2 del humano): sin registro en producción, el flujo real de
+  prueba necesita resolverlo.
 
 ## Next step
 
-T4 — web: Mis herramientas + wizard de onboarding genérico.
+Feature implementada: (1) resolver con el humano el allowlist de
+producción (catálogo + registry de tools) para que la prueba real funcione,
+(2) prueba end-to-end con cuenta Google del humano, (3) consentimiento RDD
+de T4.
