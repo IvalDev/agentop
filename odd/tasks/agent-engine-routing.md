@@ -119,11 +119,36 @@ Auditoría de `dev.db` (runs `ccdddb8b…` y `f1e76f51…`):
       calendario: nunca la base de conocimiento; mover = crear primero y
       cancelar después. **Hueco para T4:** el ejecutor no limita las llamadas
       a las tools ofrecidas por el motor (un run de calendario podría
-      ejecutar `search_documents` si el modelo lo inventa).
-- [ ] T4 — **Router automático**: llamada de clasificación, salto con un solo
+      ejecutar `search_documents` si el modelo lo inventa). Commit `09cd9fb`.
+      RDD: assess `medium` sobre T1-T3 (`slice_budget_reached`, 28 archivos,
+      2029 líneas, base `225358a`), consentimiento:
+      `declined_this_candidate`.
+- [x] T4 — **Router automático**: llamada de clasificación, salto con un solo
       motor, fallback a `knowledge`, auditoría del motor elegido, ambos
       endpoints (`chat` y `chat/stream`), tests con módulo activo
       re-guionados. Ruta: delegada (writer).
+      Evidencia: RED colección (`routing` inexistente) + 17 failed → GREEN
+      99; writer: ruff ✓, format ✓, 152 enfocados ✓, **suite completa 911
+      passed**; spot check parent: 31 ✓ + ruff ✓ + format ✓ + superficies
+      exactas (8 archivos, ~834 líneas, ~530 de tests). Nuevo
+      `app/modules/agent/routing.py` (`route_message`, 6 turnos de historial
+      recortados a 500 caracteres y neutralizados, salida = clave cerrada;
+      fallbacks `unrecognized_reply`/`ambiguous_reply`/`tool_call_reply`/
+      `llm_error` → `knowledge`). `AgentRun.events()` elige el motor antes de
+      auditar; `agent.run_started` suma `engine`, `routed`,
+      `router_fallback`, `router_reason`. **Hueco de T3 cerrado:** una tool
+      no ofrecida se rechaza antes del ejecutor como `unknown_tool` /
+      `tool.not_found` con `reason: not_offered_by_engine`. Cambio de
+      auditoría aceptado: una tool oculta por rol o módulo inactivo ya no
+      llega al ejecutor (antes `tool.denied` / `tool.inactive_module`); el
+      intento sigue auditado y el ejecutor conserva sus controles.
+      `AgentRun(engine=None)` ahora significa "rutear". Pendientes (no
+      bloquean): solo `LLMError` cae a `knowledge` en el router; otra
+      excepción saldría antes de `agent.run_started` sin `agent.run_failed`
+      (baja probabilidad); sin temperatura/JSON mode el router no es
+      determinista; un modelo chico puede responder la pregunta en vez de
+      la clave (cae a `knowledge`); con el provider `fake` offline todo cae
+      a `knowledge`; en SSE el primer evento llega después del router.
 
 ## Criterios de aceptación
 
@@ -160,7 +185,12 @@ assess por commit con base en el último límite revisado (punto de rama
   `feat/calendar-mvp`; mapa del agente hecho por un explorer (sin cambios).
 - 2026-10-16: T1 (`0ca79f2`) y T2 (`31e57aa`) completas → slice PR1
   (contexto horario) cerrado en commits.
+- 2026-10-16: T3 (`09cd9fb`) y T4 completas → slice PR2 (motores y router)
+  cerrado en commits. Feature lista para prueba manual.
 
 ## Next step
 
-T3 — motores (refactor sin cambio de comportamiento visible).
+Prueba manual del humano con `make app` (calendario activo, cuenta Google
+conectada): "¿qué tengo el día 20?" → auditoría con `engine: calendar` y solo
+`list_events`; una pregunta de documentos → `engine: knowledge` con citas.
+Push/PR quedan a decisión del humano (slices PR1 = T1+T2, PR2 = T3+T4).

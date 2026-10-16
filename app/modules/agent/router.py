@@ -2,7 +2,10 @@
 
 Any authenticated role may chat; the tenant always comes from the user, and
 the tools offered to the model are filtered by that user's role and by the
-tenant's active catalog modules. The optional ``timezone`` (the browser's
+tenant's active catalog modules. Both endpoints build the same
+:class:`~app.modules.agent.service.AgentRun` from :func:`get_agent_deps`
+(whose ``catalog`` the engine router reads), so each message is routed to
+one engine the same way before the loop. The optional ``timezone`` (the browser's
 IANA name) gives the run the user's local date and time; a missing or
 unknown name is not an error, the run uses UTC. The model backend failing
 maps to 502 (JSON) or a typed ``error`` event (SSE) with a generic message.

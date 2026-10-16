@@ -22,6 +22,7 @@ from app.core.db import Database
 from app.main import create_app
 from app.modules.agent.llm import AssistantMessage, ChatMessage, FakeLLMProvider, ToolCall
 from app.modules.agent.router import get_agent_deps
+from app.modules.catalog.models import ModuleActivation
 from app.modules.documents.extract import extract_text
 from app.modules.documents.models import Document
 from app.modules.documents.service import create_document, ingest_document
@@ -334,6 +335,58 @@ async def test_chat_without_a_usable_timezone_runs_in_utc(
     [started] = await audit_log(seeded_db, action="agent.run_started")
     assert (started.payload["timezone"], started.payload["timezone_fallback"]) == ("UTC", True)
     assert "Mars" not in json.dumps(started.payload)
+
+
+@pytest.mark.parametrize("path", ["/api/v1/chat", "/api/v1/chat/stream"])
+async def test_both_endpoints_route_the_message_to_one_engine(
+    chat_app: FastAPI,
+    chat_client: AsyncClient,
+    seeded_db: Database,
+    seeded_users,
+    audit_log,
+    path: str,
+) -> None:
+    """With the calendar active, each endpoint asks the router first, then runs its pick."""
+    owner = seeded_users["owner@acme.test"]
+    async with seeded_db.sessionmaker() as session:
+        session.add(
+            ModuleActivation(
+                tenant_id=owner.tenant_id,
+                module_key="calendar",
+                active=True,
+                activated_by_user_id=owner.id,
+            )
+        )
+        await session.commit()
+    llm = FakeLLMProvider(
+        [AssistantMessage(content="calendar"), AssistantMessage(content="Your day is free.")]
+    )
+    chat_app.state.llm = llm
+
+    response = await chat_client.post(
+        path,
+        json={"message": "What do I have on the 20th?"},
+        headers=await _headers(chat_client),
+    )
+
+    assert response.status_code == 200, response.text
+    router_call, agent_call = llm.calls
+    assert router_call.tools == []
+    assert router_call.messages[-1].content == "What do I have on the 20th?"
+    assert {tool["function"]["name"] for tool in agent_call.tools} == {
+        "list_events",
+        "create_event",
+        "cancel_event",
+    }
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert (started.result["engine"], started.result["routed"]) == ("calendar", True)
+    assert started.result["router_fallback"] is False
+    if path.endswith("/stream"):
+        events = _parse_sse(response.text)
+        streamed = "".join(data["text"] for kind, data in events if kind == "token")
+        assert streamed == events[-1][1]["answer"] == "Your day is free."
+    else:
+        assert response.json()["answer"] == "Your day is free."
 
 
 async def test_chat_stream_emits_typed_events_in_order(

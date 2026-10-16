@@ -147,6 +147,13 @@ def _client_text(text: str) -> str:
     return neutralize(text[:CHAT_MESSAGE_MAX_CHARS])
 
 
+def check_history_roles(history: Sequence[HistoryTurn]) -> None:
+    """Raise ``ValueError`` for any history role other than ``user`` or ``assistant``."""
+    for turn in history:
+        if turn.role not in _HISTORY_ROLES:
+            raise ValueError(f"history role {turn.role!r} is not allowed; use user or assistant")
+
+
 def build_messages(
     message: str,
     history: Sequence[HistoryTurn],
@@ -164,14 +171,13 @@ def build_messages(
     message; without it the system message is exactly the policy.
 
     Raises ``ValueError`` for any history role other than ``user`` or
-    ``assistant``. Keeps the :data:`CHAT_HISTORY_MAX_MESSAGES` most recent
-    turns and clips every text to :data:`CHAT_MESSAGE_MAX_CHARS` (the API
-    contract already rejects larger requests; this is defense in depth).
+    ``assistant`` (:func:`check_history_roles`). Keeps the
+    :data:`CHAT_HISTORY_MAX_MESSAGES` most recent turns and clips every text
+    to :data:`CHAT_MESSAGE_MAX_CHARS` (the API contract already rejects
+    larger requests; this is defense in depth).
     """
     turns = list(history)
-    for turn in turns:
-        if turn.role not in _HISTORY_ROLES:
-            raise ValueError(f"history role {turn.role!r} is not allowed; use user or assistant")
+    check_history_roles(turns)
     system = SYSTEM_PROMPT if system_prompt is None else system_prompt
     if time_context:
         system = f"{system.rstrip()}\n\n{time_context}"
