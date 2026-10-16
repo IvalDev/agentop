@@ -78,10 +78,25 @@ Auditoría de `dev.db` (runs `ccdddb8b…` y `f1e76f51…`):
       `render_time_context`; `ValueError`/`OSError` también caen a UTC). En
       fallback las tools reciben `"UTC"`; la auditoría guarda solo el nombre
       resuelto, nunca el texto crudo del cliente (deliberado, con test).
-- [ ] T2 — **Calendario en la zona del usuario**: entradas sin offset
+      Commit `0ca79f2`. RDD: assess `medium` (`slice_budget_reached`, 16
+      archivos, 745 líneas), consentimiento: `declined_this_candidate`.
+- [x] T2 — **Calendario en la zona del usuario**: entradas sin offset
       localizadas con `ctx.timezone`, `timeZone` hacia Google, descripciones
       de tools, docstrings obsoletos (`tools.py:3-7`, `:467-473`,
       `main.py:210-211`). Ruta: delegada (writer).
+      Evidencia: RED 14 failed (mensaje viejo de offset, `KeyError:
+      'time_zone'`, kwarg inexistente en el provider) → GREEN 80; writer:
+      ruff ✓, format ✓, 107 calendario ✓, **suite completa 842 passed**;
+      spot check parent: 80 ✓ + format ✓ + superficies exactas (5 archivos,
+      382+/51-). Mezclar horas con y sin offset en un mismo input → error de
+      validación accionable; DST con `fold=0`; zona irrecuperable → no se
+      manda `time_zone` a Google. Pendientes menores (no bloquean):
+      evento que empieza dentro de la hora saltada del cambio de horario y
+      termina menos de una hora después llega a Google con el fin antes del
+      inicio; quedan textos obsoletos sobre "calendar no registrado en
+      producción" en el docstring de `_calendar_catalog`
+      (`tools.py`), en el de `tests/test_calendar_tools.py` y en el
+      comentario de `connection_testers` de `main.py`.
 - [ ] T3 — **Motores (refactor sin cambio de comportamiento visible)**: prompt
       dividido en base común + grounding de `knowledge`, perfil `agent` en el
       manifest con validación, perfil del calendario, resolución de motores

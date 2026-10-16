@@ -9,7 +9,9 @@ directly:
   ``create_event`` inserts, and ``delete_event`` removes events through the
   Calendar API with a Bearer header and nothing else. Create sends
   ``dateTime`` ISO 8601 values with offset (all-day ``date`` events are out
-  of the MVP scope);
+  of the MVP scope); an optional IANA ``time_zone`` goes to Google as
+  ``timeZone`` (the event's zone on create, the response's zone on list) so
+  the user's calendar shows times in their zone (agent-engine-routing D7);
 - the registry — provider-name → **factory**, because tokens are per-user
   while the registry is process-wide (same single-process contract as the
   tool registry and the tester registry): ``register_provider`` overwrites
@@ -52,6 +54,7 @@ class CalendarProvider(Protocol):
         max_results: int = 10,
         time_min: str | None = None,
         time_max: str | None = None,
+        time_zone: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
     async def create_event(
@@ -63,6 +66,7 @@ class CalendarProvider(Protocol):
         end: str,
         description: str | None = None,
         attendees: Sequence[str] | None = None,
+        time_zone: str | None = None,
     ) -> dict[str, Any]: ...
 
     async def delete_event(self, *, calendar_id: str = "primary", event_id: str) -> None: ...
@@ -109,11 +113,14 @@ class GoogleCalendarProvider:
         max_results: int = 10,
         time_min: str | None = None,
         time_max: str | None = None,
+        time_zone: str | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch upcoming events of one calendar (``items`` of the API page).
 
         ``time_min``/``time_max`` are optional RFC 3339 bounds passed as the
         API's ``timeMin``/``timeMax`` (the chat tool's ``from``/``to`` range).
+        ``time_zone`` (IANA name) becomes the ``timeZone`` query parameter, so
+        Google expresses the returned event times in that zone.
 
         Raises:
             CalendarAuthenticationError: the API answered 401/403.
@@ -131,6 +138,8 @@ class GoogleCalendarProvider:
             params["timeMin"] = time_min
         if time_max is not None:
             params["timeMax"] = time_max
+        if time_zone is not None:
+            params["timeZone"] = time_zone
         response = await self._request("GET", url, params=params)
         self._raise_for_status(response)
         try:
@@ -151,8 +160,13 @@ class GoogleCalendarProvider:
         end: str,
         description: str | None = None,
         attendees: Sequence[str] | None = None,
+        time_zone: str | None = None,
     ) -> dict[str, Any]:
         """Insert one event (``dateTime`` ISO 8601 with offset) and return the API payload.
+
+        ``time_zone`` (IANA name) is sent as ``timeZone`` on both start and
+        end: the offset still fixes the instant, and Google stores that zone
+        as the event's time zone instead of the calendar's default.
 
         Raises:
             CalendarAuthenticationError: the API answered 401/403.
@@ -160,11 +174,12 @@ class GoogleCalendarProvider:
             httpx.RequestError: the API could not be reached (engine: 502).
         """
         url = GOOGLE_CALENDAR_EVENTS_URL.format(calendar_id=quote(calendar_id, safe=""))
-        body: dict[str, Any] = {
-            "summary": summary,
-            "start": {"dateTime": start},
-            "end": {"dateTime": end},
-        }
+        start_time: dict[str, str] = {"dateTime": start}
+        end_time: dict[str, str] = {"dateTime": end}
+        if time_zone is not None:
+            start_time["timeZone"] = time_zone
+            end_time["timeZone"] = time_zone
+        body: dict[str, Any] = {"summary": summary, "start": start_time, "end": end_time}
         if description is not None:
             body["description"] = description
         if attendees:

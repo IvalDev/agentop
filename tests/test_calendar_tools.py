@@ -9,7 +9,12 @@ Contract under test (D5/D6 of calendar-mvp):
   are ACTION / operator with ``ALLOW_WITHOUT_APPROVAL`` (D5: the user's own
   calendar is self-service, so the model never asks for approval);
 - input validation: bounded ``max_results``, ordered ``from``/``to``, a
-  non-empty summary, ``end > start``, timezone-aware datetimes;
+  non-empty summary, ``end > start``; datetimes may be naive (the user's
+  wall-clock time) or carry an offset, but never both in one input;
+- user timezone (agent-engine-routing D7): naive datetimes are localized with
+  ``ToolContext.timezone`` (UTC when it is ``None`` or unusable, ``fold=0`` on
+  DST edges), offset-bearing ones pass through unchanged, and the provider
+  receives the zone name as ``time_zone`` (omitted when the context has none);
 - the shared precheck never leaks secrets and never 500s: no connection
   row, no credentials blob, a missing or unusable ``credentials_key``, and
   an unreadable blob all answer one actionable ``precheck_failed`` reason;
@@ -213,6 +218,7 @@ async def run_tool(
     credentials_key: str | None = None,
     settings: Settings | None = None,
     active_modules: set[str] | None = None,
+    timezone: str | None = None,
 ):
     """One ``execute_tool`` call on a fresh session (what the agent loop does)."""
     async with db.sessionmaker() as session:
@@ -225,6 +231,7 @@ async def run_tool(
             credentials_key=credentials_key,
             settings=settings,
             active_modules=active_modules if active_modules is not None else {"calendar"},
+            timezone=timezone,
         )
 
 
@@ -267,8 +274,10 @@ def test_tool_specs_declare_module_roles_kinds_and_policies(
         {"to": "2026-10-20T18:00:00+02:00"},  # from missing
         {"from": "2026-10-20T08:00:00+02:00"},  # to missing
         {"from": "not-a-datetime", "to": "2026-10-20T18:00:00+02:00"},
-        {"from": "2026-10-20T08:00:00", "to": "2026-10-20T18:00:00"},  # naive
+        {"from": "2026-10-20T08:00:00", "to": "2026-10-20T18:00:00+02:00"},  # mixed
+        {"from": "2026-10-20T08:00:00+02:00", "to": "2026-10-20T18:00:00"},  # mixed
         {"from": "2026-10-20T18:00:00+02:00", "to": "2026-10-20T08:00:00+02:00"},  # reversed
+        {"from": "2026-10-20T18:00:00", "to": "2026-10-20T08:00:00"},  # naive, reversed
         {**LIST_INPUT, "max_results": 0},
         {**LIST_INPUT, "max_results": 51},
         {**LIST_INPUT, "extra": "smuggled"},
@@ -291,7 +300,9 @@ async def test_list_events_rejects_invalid_input(
         {"summary": "", "start": CREATE_INPUT["start"], "end": CREATE_INPUT["end"]},
         {"summary": "X", "start": "2026-10-21T10:00:00+02:00", "end": CREATE_INPUT["start"]},
         {"summary": "X", "start": CREATE_INPUT["start"], "end": CREATE_INPUT["start"]},
-        {"summary": "X", "start": "2026-10-21T09:00:00", "end": "2026-10-21T09:30:00"},  # naive
+        {"summary": "X", "start": "2026-10-21T09:00:00", "end": "2026-10-21T09:30:00Z"},  # mixed
+        {"summary": "X", "start": "2026-10-21T09:00:00Z", "end": "2026-10-21T09:30:00"},  # mixed
+        {"summary": "X", "start": "2026-10-21T10:00:00", "end": "2026-10-21T09:00:00"},  # naive
         {"summary": "X", "start": CREATE_INPUT["start"], "end": "bad"},
         {**CREATE_INPUT, "attendees": ["ok@example.com", ""]},
         {**CREATE_INPUT, "tenant_id": 999},
@@ -305,6 +316,25 @@ async def test_create_event_rejects_invalid_input(
     )
 
     assert (result.status, result.error_kind) == ("error", "validation")
+
+
+@pytest.mark.parametrize(
+    ("tool", "raw_input", "fields"),
+    [
+        ("list_events", {"from": "2026-10-20T08:00:00", "to": LIST_INPUT["to"]}, "from and to"),
+        ("create_event", {**CREATE_INPUT, "end": "2026-10-21T09:30:00"}, "start and end"),
+    ],
+)
+async def test_mixing_naive_and_offset_datetimes_is_an_actionable_validation_error(
+    seeded_db: Database, seeded_users, calendar_registry: ToolRegistry, tool, raw_input, fields
+) -> None:
+    """One input never mixes the two forms: the model learns how to fix the call."""
+    result = await run_tool(seeded_db, seeded_users[OWNER], calendar_registry, tool, raw_input)
+
+    assert (result.status, result.error_kind) == ("error", "validation")
+    assert result.error is not None
+    assert f"{fields} must both include a UTC offset or both omit it" in result.error
+    assert "user's timezone" in result.error
 
 
 @pytest.mark.parametrize("raw_input", [{}, {"event_id": ""}, {"event_id": "x", "extra": 1}])
@@ -638,6 +668,197 @@ async def test_create_event_returns_id_and_html_link(
         }
     ]
     assert fake.access_tokens == ["ya29.stored"]
+
+
+# --- User timezone (agent-engine-routing D7) -------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("timezone", "start", "end", "expected_start", "expected_end"),
+    [
+        # Madrid is on summer time (+02:00) until the DST change on 2026-10-25.
+        (
+            "Europe/Madrid",
+            "2026-10-20T14:00:00",
+            "2026-10-20T15:00:00",
+            "2026-10-20T14:00:00+02:00",
+            "2026-10-20T15:00:00+02:00",
+        ),
+        # ...and on standard time (+01:00) after it.
+        (
+            "Europe/Madrid",
+            "2026-10-26T14:00:00",
+            "2026-10-26T15:00:00",
+            "2026-10-26T14:00:00+01:00",
+            "2026-10-26T15:00:00+01:00",
+        ),
+        # Repeated hour on 2026-10-25: fold=0 picks the first occurrence (+02:00).
+        (
+            "Europe/Madrid",
+            "2026-10-25T02:30:00",
+            "2026-10-25T04:00:00",
+            "2026-10-25T02:30:00+02:00",
+            "2026-10-25T04:00:00+01:00",
+        ),
+        # Skipped hour on 2026-03-29: fold=0 keeps the offset before the change.
+        (
+            "Europe/Madrid",
+            "2026-03-29T02:30:00",
+            "2026-03-29T04:00:00",
+            "2026-03-29T02:30:00+01:00",
+            "2026-03-29T04:00:00+02:00",
+        ),
+        (
+            "UTC",
+            "2026-10-20T14:00:00",
+            "2026-10-20T15:00:00",
+            "2026-10-20T14:00:00+00:00",
+            "2026-10-20T15:00:00+00:00",
+        ),
+    ],
+)
+async def test_create_event_localizes_naive_times_in_the_user_timezone(
+    seeded_db: Database,
+    seeded_users,
+    calendar_registry: ToolRegistry,
+    oauth_key,
+    timezone,
+    start,
+    end,
+    expected_start,
+    expected_end,
+) -> None:
+    fake = FakeCalendar()
+    register_provider("google", fake)
+    await seed_connection(seeded_db, seeded_users[ADMIN], key=oauth_key)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[ADMIN],
+        calendar_registry,
+        "create_event",
+        {"summary": "Lunch", "start": start, "end": end},
+        credentials_key=oauth_key,
+        timezone=timezone,
+    )
+
+    assert result.status == "ok"
+    assert fake.create_calls == [
+        {
+            "summary": "Lunch",
+            "start": expected_start,
+            "end": expected_end,
+            "description": None,
+            "attendees": None,
+            "time_zone": timezone,
+        }
+    ]
+
+
+async def test_create_event_keeps_offset_times_unchanged_in_any_user_timezone(
+    seeded_db: Database, seeded_users, calendar_registry: ToolRegistry, oauth_key
+) -> None:
+    fake = FakeCalendar()
+    register_provider("google", fake)
+    await seed_connection(seeded_db, seeded_users[ADMIN], key=oauth_key)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[ADMIN],
+        calendar_registry,
+        "create_event",
+        {**CREATE_INPUT, "end": "2026-10-21T07:30:00Z"},
+        credentials_key=oauth_key,
+        timezone="America/New_York",
+    )
+
+    assert result.status == "ok"
+    call = fake.create_calls[0]
+    assert (call["start"], call["end"]) == (
+        "2026-10-21T09:00:00+02:00",
+        "2026-10-21T07:30:00+00:00",
+    )
+    assert call["time_zone"] == "America/New_York"
+
+
+@pytest.mark.parametrize("timezone", [None, "Mars/Olympus_Mons"])
+async def test_create_event_reads_naive_times_as_utc_without_a_usable_timezone(
+    seeded_db: Database, seeded_users, calendar_registry: ToolRegistry, oauth_key, timezone
+) -> None:
+    """No zone outside chat runs (``None``) or an unusable one: UTC, and no ``time_zone``."""
+    fake = FakeCalendar()
+    register_provider("google", fake)
+    await seed_connection(seeded_db, seeded_users[ADMIN], key=oauth_key)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[ADMIN],
+        calendar_registry,
+        "create_event",
+        {"summary": "Lunch", "start": "2026-10-20T14:00:00", "end": "2026-10-20T15:00:00"},
+        credentials_key=oauth_key,
+        timezone=timezone,
+    )
+
+    assert result.status == "ok"
+    call = fake.create_calls[0]
+    assert (call["start"], call["end"]) == (
+        "2026-10-20T14:00:00+00:00",
+        "2026-10-20T15:00:00+00:00",
+    )
+    assert "time_zone" not in call
+
+
+async def test_list_events_localizes_a_naive_range_and_passes_the_user_timezone(
+    seeded_db: Database, seeded_users, calendar_registry: ToolRegistry, oauth_key
+) -> None:
+    fake = FakeCalendar()
+    register_provider("google", fake)
+    await seed_connection(seeded_db, seeded_users[VIEWER], key=oauth_key)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[VIEWER],
+        calendar_registry,
+        "list_events",
+        {"from": "2026-10-24T00:00:00", "to": "2026-10-26T00:00:00"},
+        credentials_key=oauth_key,
+        timezone="Europe/Madrid",
+    )
+
+    assert result.status == "ok"
+    assert fake.list_calls == [
+        {
+            "calendar_id": "primary",
+            "max_results": 10,
+            "time_min": "2026-10-24T00:00:00+02:00",
+            "time_max": "2026-10-26T00:00:00+01:00",
+            "time_zone": "Europe/Madrid",
+        }
+    ]
+
+
+async def test_list_events_keeps_an_offset_range_and_passes_the_user_timezone(
+    seeded_db: Database, seeded_users, calendar_registry: ToolRegistry, oauth_key
+) -> None:
+    fake = FakeCalendar()
+    register_provider("google", fake)
+    await seed_connection(seeded_db, seeded_users[VIEWER], key=oauth_key)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[VIEWER],
+        calendar_registry,
+        "list_events",
+        LIST_INPUT,
+        credentials_key=oauth_key,
+        timezone="Asia/Tokyo",
+    )
+
+    assert result.status == "ok"
+    call = fake.list_calls[0]
+    assert (call["time_min"], call["time_max"]) == (LIST_INPUT["from"], LIST_INPUT["to"])
+    assert call["time_zone"] == "Asia/Tokyo"
 
 
 async def test_cancel_event_returns_confirmation(
