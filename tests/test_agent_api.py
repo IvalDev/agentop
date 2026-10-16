@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -20,6 +21,7 @@ from app.core.config import Settings
 from app.core.db import Database
 from app.main import create_app
 from app.modules.agent.llm import AssistantMessage, ChatMessage, FakeLLMProvider, ToolCall
+from app.modules.agent.router import get_agent_deps
 from app.modules.documents.extract import extract_text
 from app.modules.documents.models import Document
 from app.modules.documents.service import create_document, ingest_document
@@ -381,6 +383,20 @@ async def test_chat_stream_reports_model_failure_as_an_error_event(
     events = _parse_sse(response.text)
     assert [kind for kind, _ in events] == ["run_started", "error"]
     assert events[1][1] == {"message": "language model unavailable"}
+
+
+def test_chat_deps_carry_the_apps_module_catalog(
+    chat_app: FastAPI, storage: LocalDocumentStorage
+) -> None:
+    """Runs get ``app.state.module_catalog`` (the engines' source of module profiles)."""
+    request = SimpleNamespace(app=chat_app)
+    embeddings = chat_app.state.embeddings
+
+    agent_deps = get_agent_deps(request, SETTINGS, embeddings, storage)
+
+    assert agent_deps.catalog is chat_app.state.module_catalog
+    assert agent_deps.catalog.get("calendar").agent is not None
+    assert agent_deps.registry is chat_app.state.tool_registry
 
 
 def test_app_registers_the_builtin_tools() -> None:

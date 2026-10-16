@@ -20,6 +20,7 @@ from sqlalchemy import select
 
 from app.core.config import Settings
 from app.core.db import Database
+from app.modules.agent.engines import KNOWLEDGE, module_engine
 from app.modules.agent.llm import (
     AssistantMessage,
     ChatMessage,
@@ -28,6 +29,7 @@ from app.modules.agent.llm import (
     OpenAICompatibleChatProvider,
     ToolCall,
 )
+from app.modules.agent.prompt import SYSTEM_PROMPT
 from app.modules.agent.service import (
     MAX_TOOL_CALLS_PER_STEP,
     STEP_LIMIT_ANSWER,
@@ -38,6 +40,7 @@ from app.modules.agent.service import (
 from app.modules.agent.user_time import render_time_context, resolve_user_time
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
+from app.modules.calendar.manifest import CALENDAR_MANIFEST
 from app.modules.catalog.models import ModuleActivation
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.storage import LocalDocumentStorage
@@ -276,6 +279,51 @@ async def test_calling_an_inactive_module_tool_is_refused_until_the_module_is_ac
 
     assert [(i.tool_name, i.status) for i in allowed.tool_calls] == [("check_calendar", "ok")]
     assert len(approval_tools.spy.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("engine", "expected_tools"),
+    [
+        (None, {"peek_note", "search_documents", "check_calendar"}),
+        (KNOWLEDGE, {"peek_note", "search_documents"}),
+        (module_engine(CALENDAR_MANIFEST), {"check_calendar"}),
+    ],
+    ids=["no-engine", "knowledge", "calendar"],
+)
+async def test_an_engine_run_sends_only_its_tools_and_its_policy(
+    seeded_db: Database, seeded_users, registry, approval_tools, engine, expected_tools
+) -> None:
+    """With an engine the model sees its prompt and tools; without one, today's offer."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    user_time = resolve_user_time("Europe/Madrid", now=datetime(2026, 10, 16, 8, 7, tzinfo=UTC))
+    llm = FakeLLMProvider([answer("Hello")])
+    agent_deps = deps(registry, llm)
+
+    async with seeded_db.sessionmaker() as session:
+        agent_run = AgentRun(
+            session,
+            viewer,
+            "What do I have on the 20th?",
+            [],
+            agent_deps,
+            active_modules={"calendar"},
+            user_time=user_time,
+            engine=engine,
+        )
+        async for _event in agent_run.events():
+            pass
+
+    assert agent_deps.catalog is None  # hand-built deps keep working without a catalog
+    [model_call] = llm.calls
+    assert {tool["function"]["name"] for tool in model_call.tools} == expected_tools
+    policy = SYSTEM_PROMPT if engine is None else engine.system_prompt
+    system = model_call.messages[0]
+    assert system.role == "system"
+    assert system.content == f"{policy.rstrip()}\n\n{render_time_context(user_time)}"
+    if engine is not None and engine.module == "calendar":
+        assert "search_documents" not in system.content
+        assert CALENDAR_MANIFEST.agent.instructions.strip() in system.content
 
 
 # --- Approvals -------------------------------------------------------------------

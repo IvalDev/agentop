@@ -16,8 +16,15 @@ from dataclasses import FrozenInstanceError
 import pytest
 
 from app.modules.catalog.exceptions import ModuleRegistrationError, UnknownModuleError
-from app.modules.catalog.manifest import FieldSpec, ModuleManifest, StepSpec
-from app.modules.catalog.registry import ModuleCatalog, default_catalog, register_default
+from app.modules.catalog.manifest import AgentProfile, FieldSpec, ModuleManifest, StepSpec
+from app.modules.catalog.registry import (
+    AGENT_INSTRUCTIONS_MAX_CHARS,
+    RESERVED_MODULE_KEYS,
+    ROUTING_DESCRIPTION_MAX_CHARS,
+    ModuleCatalog,
+    default_catalog,
+    register_default,
+)
 
 #: Production modules registered on the process-wide catalog (reviewed
 #: calendar-mvp allowlist change, human-approved 2026-10-15).
@@ -34,6 +41,7 @@ def build_manifest(
     permissions: tuple[str, ...] = (),
     tools: tuple[str, ...] = (),
     onboarding: tuple[StepSpec, ...] = (),
+    agent: AgentProfile | None = None,
 ) -> ModuleManifest:
     """Build a ModuleManifest with test defaults; individual fields can be overridden."""
     return ModuleManifest(
@@ -44,7 +52,15 @@ def build_manifest(
         permissions=permissions,
         tools=tools,
         onboarding=onboarding,
+        agent=agent,
     )
+
+
+def build_profile(
+    routing_description: str = "Requests about the demo module.",
+    instructions: str = "Use only the demo tools.",
+) -> AgentProfile:
+    return AgentProfile(routing_description=routing_description, instructions=instructions)
 
 
 def test_register_and_get_round_trip() -> None:
@@ -170,6 +186,59 @@ def test_empty_step_key_raises() -> None:
 
     with pytest.raises(ModuleRegistrationError, match="empty key"):
         catalog.register(manifest)
+
+
+def test_agent_profile_is_optional_and_round_trips() -> None:
+    """Without a profile ``agent`` is None; a valid profile is stored as declared."""
+    catalog = ModuleCatalog()
+    profile = build_profile(
+        routing_description="r" * ROUTING_DESCRIPTION_MAX_CHARS,
+        instructions="i" * AGENT_INSTRUCTIONS_MAX_CHARS,
+    )
+
+    catalog.register(build_manifest("plain_module"))
+    catalog.register(build_manifest("agent_module", agent=profile))
+
+    assert catalog.get("plain_module").agent is None
+    assert catalog.get("agent_module").agent is profile
+    with pytest.raises(FrozenInstanceError):
+        profile.instructions = "changed"
+
+
+@pytest.mark.parametrize("field", ["routing_description", "instructions"])
+@pytest.mark.parametrize("blank", ["", "   \n"])
+def test_blank_agent_profile_field_raises(field: str, blank: str) -> None:
+    """The router and the engine prompt both need real text."""
+    catalog = ModuleCatalog()
+
+    with pytest.raises(ModuleRegistrationError, match=f"non-empty agent {field}"):
+        catalog.register(build_manifest(agent=build_profile(**{field: blank})))
+
+
+@pytest.mark.parametrize(
+    ("field", "limit"),
+    [
+        ("routing_description", ROUTING_DESCRIPTION_MAX_CHARS),
+        ("instructions", AGENT_INSTRUCTIONS_MAX_CHARS),
+    ],
+)
+def test_too_long_agent_profile_field_raises(field: str, limit: int) -> None:
+    """Profiles stay short: they ride along in every routed prompt."""
+    assert (ROUTING_DESCRIPTION_MAX_CHARS, AGENT_INSTRUCTIONS_MAX_CHARS) == (300, 2000)
+    catalog = ModuleCatalog()
+
+    with pytest.raises(ModuleRegistrationError, match=f"agent {field} exceeds {limit}"):
+        catalog.register(build_manifest(agent=build_profile(**{field: "x" * (limit + 1)})))
+
+
+def test_reserved_engine_key_cannot_be_a_module_key() -> None:
+    """``knowledge`` names the agent's built-in engine, never a module."""
+    catalog = ModuleCatalog()
+
+    assert "knowledge" in RESERVED_MODULE_KEYS
+    with pytest.raises(ModuleRegistrationError, match="reserved"):
+        catalog.register(build_manifest("knowledge"))
+    assert catalog.keys() == []
 
 
 def test_get_unknown_key_raises_not_found() -> None:

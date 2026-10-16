@@ -11,9 +11,14 @@ import pytest
 
 from app.modules.agent.citations import CitationIndex, cited_numbers
 from app.modules.agent.prompt import (
+    BASE_PROMPT,
+    KNOWLEDGE_RULES,
+    LANGUAGE_RULE,
     SYSTEM_PROMPT,
     TOOL_MESSAGE_MAX_CHARS,
     build_messages,
+    compose_system_prompt,
+    module_prompt,
     neutralize,
     render_passages,
     render_tool_output,
@@ -68,6 +73,34 @@ def test_system_prompt_grounds_every_answer_in_the_knowledge_base() -> None:
     assert "when you use document passages" not in prompt
 
 
+def test_system_prompt_is_the_knowledge_engine_composition() -> None:
+    """Shared base (identity + security rules), grounding rules, then the language rule."""
+    assert SYSTEM_PROMPT == compose_system_prompt(KNOWLEDGE_RULES)
+    assert SYSTEM_PROMPT == (
+        f"{BASE_PROMPT.strip()}\n\n{KNOWLEDGE_RULES.strip()}\n\n{LANGUAGE_RULE.strip()}\n"
+    )
+    security = BASE_PROMPT[BASE_PROMPT.index("Security rules") :]
+    assert [line[:2] for line in security.splitlines() if line[:1].isdigit()] == [
+        "1.",
+        "2.",
+        "3.",
+        "4.",
+    ]
+    assert "Answer in the user's language, briefly and clearly." in LANGUAGE_RULE
+
+
+def test_module_prompt_shares_security_and_language_rules_without_grounding() -> None:
+    """A module engine's policy: the same base and language rule around its own section."""
+    prompt = module_prompt("Ledger", "Use only the ledger tools.\n")
+
+    assert prompt == (
+        f"{BASE_PROMPT.strip()}\n\nLedger instructions:\nUse only the ledger tools.\n\n"
+        f"{LANGUAGE_RULE.strip()}\n"
+    )
+    assert KNOWLEDGE_RULES.strip() not in prompt
+    assert "search_documents" not in prompt
+
+
 def test_build_messages_puts_the_policy_first_and_alone() -> None:
     """One system message (the policy), then history, then the new user turn."""
     history = [
@@ -96,6 +129,22 @@ def test_build_messages_appends_the_time_context_to_the_policy() -> None:
         ("user", "What is due today?"),
     ]
     assert build_messages("Hi", [], time_context=None)[0].content == SYSTEM_PROMPT
+
+
+def test_build_messages_uses_the_given_engine_policy() -> None:
+    """An engine's system prompt replaces the default one; the time context still follows."""
+    policy = module_prompt("Ledger", "Use only the ledger tools.")
+    context = "Current date and time for the user: Friday, 2026-10-16 10:07 (Europe/Madrid)."
+
+    plain = build_messages("Hi", [], system_prompt=policy)
+    timed = build_messages("Hi", [], time_context=context, system_prompt=policy)
+
+    assert [(message.role, message.content) for message in plain] == [
+        ("system", policy),
+        ("user", "Hi"),
+    ]
+    assert timed[0].content == f"{policy.rstrip()}\n\n{context}"
+    assert build_messages("Hi", [], system_prompt=None)[0].content == SYSTEM_PROMPT
 
 
 @pytest.mark.parametrize("role", ["system", "tool", "developer", "SYSTEM"])

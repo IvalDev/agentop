@@ -9,7 +9,10 @@ the audit correlation id of everything the run does):
    history, and the new message (:func:`~app.modules.agent.prompt.build_messages`).
    The model is offered only the tools whose required role the user
    satisfies and whose module (when the tool declares one) the tenant has
-   active, with JSON schemas from their input models.
+   active, with JSON schemas from their input models. A run given an
+   engine (:mod:`~app.modules.agent.engines`) uses that engine's system
+   prompt and only its tools; without one it uses the default policy and
+   every visible tool.
 2. A reply without tool calls is the final answer. Otherwise each call (at
    most :data:`MAX_TOOL_CALLS_PER_STEP` per reply) runs through
    :func:`~app.modules.tools.executor.execute_tool` as actor ``agent`` with
@@ -60,6 +63,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.modules.agent.citations import CitationIndex
+from app.modules.agent.engines import Engine, visible_specs
 from app.modules.agent.llm import (
     AssistantMessage,
     ChatMessage,
@@ -82,6 +86,7 @@ from app.modules.approvals.exceptions import ApprovalError
 from app.modules.approvals.service import create_approval_request
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
+from app.modules.catalog.registry import ModuleCatalog
 from app.modules.catalog.service import active_module_keys
 from app.modules.documents.storage import DocumentStorage
 from app.modules.retrieval.embeddings import EmbeddingProvider
@@ -91,7 +96,6 @@ from app.modules.tools.executor import (
     ApprovalRequestPayload,
     ToolExecutionResult,
     execute_tool,
-    role_satisfies,
 )
 from app.modules.tools.registry import ToolRegistry, ToolUser
 from packages.contracts.schemas import ChatResponse, PendingApproval, ToolCallSummary
@@ -143,6 +147,9 @@ class AgentDeps:
     #: Fernet key for per-user provider connections (calendar-mvp T3/D3);
     #: ``None`` fails the calendar tools closed with a precheck error.
     credentials_key: str | None = None
+    #: Module catalog the engines read their agent profiles from
+    #: (``app.state.module_catalog``); ``None`` leaves only ``knowledge``.
+    catalog: ModuleCatalog | None = None
 
 
 def new_run_id() -> str:
@@ -151,7 +158,10 @@ def new_run_id() -> str:
 
 
 def tool_schemas(
-    registry: ToolRegistry, user: ToolUser, active_modules: set[str]
+    registry: ToolRegistry,
+    user: ToolUser,
+    active_modules: set[str],
+    engine: Engine | None = None,
 ) -> list[dict[str, Any]]:
     """Function schemas of the tools ``user`` may use (what the model sees).
 
@@ -159,14 +169,12 @@ def tool_schemas(
     and its module is available: core tools (``spec.module is None``)
     always, module tools only when ``spec.module`` is one of the tenant's
     ``active_modules`` (from
-    :func:`~app.modules.catalog.service.active_module_keys`).
+    :func:`~app.modules.catalog.service.active_module_keys`). An ``engine``
+    then keeps only its own tools (core tools for ``knowledge``, the
+    module's tools for a module engine); ``None`` offers every visible tool.
     """
     schemas = []
-    for spec in registry.list_specs():
-        if not role_satisfies(user, spec.required_role):
-            continue
-        if spec.module is not None and spec.module not in active_modules:
-            continue
+    for spec in visible_specs(registry, user, active_modules, engine):
         assert spec.input_model is not None  # registration invariant
         schemas.append(
             {
@@ -190,8 +198,11 @@ class AgentRun:
 
     ``user_time`` is the requesting user's resolved time (see
     :func:`~app.modules.agent.user_time.resolve_user_time`); ``None`` means
-    no timezone was sent and the run uses UTC as a fallback. Raises
-    ``ValueError`` at construction for a privileged history role.
+    no timezone was sent and the run uses UTC as a fallback. ``engine``
+    (see :mod:`~app.modules.agent.engines`) sets the run's system prompt and
+    narrows its tools; ``None`` uses :data:`~app.modules.agent.prompt.SYSTEM_PROMPT`
+    and every visible tool. Raises ``ValueError`` at construction for a
+    privileged history role.
     """
 
     def __init__(
@@ -204,6 +215,7 @@ class AgentRun:
         *,
         active_modules: set[str],
         user_time: UserTime | None = None,
+        engine: Engine | None = None,
     ) -> None:
         self.run_id = new_run_id()
         self._session = session
@@ -213,10 +225,13 @@ class AgentRun:
         self._history_count = len(history)
         self._user_time = user_time if user_time is not None else resolve_user_time(None)
         self._messages = build_messages(
-            message, history, time_context=render_time_context(self._user_time)
+            message,
+            history,
+            time_context=render_time_context(self._user_time),
+            system_prompt=engine.system_prompt if engine is not None else None,
         )
         self._active_modules = active_modules
-        self._tools = tool_schemas(deps.registry, user, active_modules)
+        self._tools = tool_schemas(deps.registry, user, active_modules, engine)
         self._citations = CitationIndex()
         self._approvals: dict[str, PendingApproval] = {}
         self._summaries: list[ToolCallSummary] = []

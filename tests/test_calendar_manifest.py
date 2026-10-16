@@ -17,6 +17,7 @@ Contract under test (T1 / D4 / D7 / D8, allowlist update in calendar-mvp):
 
 import pytest
 
+from app.modules.calendar.manifest import CALENDAR_MANIFEST
 from app.modules.calendar.registry import register_calendar, register_default_calendar
 from app.modules.catalog.exceptions import ModuleRegistrationError
 from app.modules.catalog.registry import ModuleCatalog, default_catalog
@@ -46,6 +47,26 @@ def test_calendar_manifest_registers_on_a_local_catalog() -> None:
     # which the import graph registers (reviewed allowlist change).
     assert "calendar" in default_catalog.keys()
     assert default_catalog.get("calendar") is manifest
+
+
+def test_calendar_declares_an_agent_profile_for_its_engine() -> None:
+    """The calendar engine stays off the knowledge base and moves events safely."""
+    profile = CALENDAR_MANIFEST.agent
+
+    assert profile is not None
+    routing = profile.routing_description.lower()
+    assert "calendar" in routing
+    assert all(word in routing for word in ("event", "availability", "cancel"))
+    text = " ".join(profile.instructions.lower().split())
+    assert "never the knowledge base" in text
+    assert "list_events" in text
+    assert "never invent events" in text
+    assert "no update tool" in text
+    create_first = text.index("first create the new event")
+    cancel_after = text.index("cancel the old one only after the creation succeeded")
+    assert create_first < cancel_after
+    # Registration on a fresh catalog also checks the profile's invariants.
+    register_calendar(ModuleCatalog())
 
 
 def test_production_registers_the_calendar_once_at_import() -> None:

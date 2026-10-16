@@ -96,12 +96,30 @@ Auditoría de `dev.db` (runs `ccdddb8b…` y `f1e76f51…`):
       inicio; quedan textos obsoletos sobre "calendar no registrado en
       producción" en el docstring de `_calendar_catalog`
       (`tools.py`), en el de `tests/test_calendar_tools.py` y en el
-      comentario de `connection_testers` de `main.py`.
-- [ ] T3 — **Motores (refactor sin cambio de comportamiento visible)**: prompt
+      comentario de `connection_testers` de `main.py`. Commit `31e57aa`.
+      RDD: assess `medium` sobre T1+T2 (`slice_budget_reached`, 21 archivos,
+      1193 líneas, base `225358a`), consentimiento:
+      `declined_this_candidate`.
+- [x] T3 — **Motores (refactor sin cambio de comportamiento visible)**: prompt
       dividido en base común + grounding de `knowledge`, perfil `agent` en el
       manifest con validación, perfil del calendario, resolución de motores
       disponibles; `AgentRun` acepta un motor (sin motor = comportamiento
       actual). Ruta: delegada (writer).
+      Evidencia: RED 4 módulos sin importar (`engines`, `BASE_PROMPT`,
+      `AgentProfile` inexistentes) + 2 failed (`AgentDeps.catalog`,
+      `ModuleManifest.agent`) → GREEN; writer: ruff ✓, format ✓, 157
+      enfocados ✓, **suite completa 878 passed**; spot check parent: 23 ✓ +
+      superficies exactas (13 archivos, 801+/29-) + lectura del prompt del
+      motor calendario. Nuevo `app/modules/agent/engines.py` (`Engine`,
+      `KNOWLEDGE_ENGINE`, `module_engine`, `available_engines`,
+      `visible_specs` como único filtro rol + módulo + motor). Única
+      diferencia sin motor: la regla de idioma pasa de "11." a línea final
+      sin número (compartida por todos los motores). Clave `knowledge`
+      reservada y límites 300/2000 en `catalog/registry.py`. Perfil del
+      calendario: nunca la base de conocimiento; mover = crear primero y
+      cancelar después. **Hueco para T4:** el ejecutor no limita las llamadas
+      a las tools ofrecidas por el motor (un run de calendario podría
+      ejecutar `search_documents` si el modelo lo inventa).
 - [ ] T4 — **Router automático**: llamada de clasificación, salto con un solo
       motor, fallback a `knowledge`, auditoría del motor elegido, ambos
       endpoints (`chat` y `chat/stream`), tests con módulo activo
@@ -140,7 +158,9 @@ assess por commit con base en el último límite revisado (punto de rama
 
 - 2026-10-16: doc creado; rama `feat/agent-engine-routing` sobre
   `feat/calendar-mvp`; mapa del agente hecho por un explorer (sin cambios).
+- 2026-10-16: T1 (`0ca79f2`) y T2 (`31e57aa`) completas → slice PR1
+  (contexto horario) cerrado en commits.
 
 ## Next step
 
-T1 — contexto horario del usuario.
+T3 — motores (refactor sin cambio de comportamiento visible).

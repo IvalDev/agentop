@@ -50,9 +50,10 @@ _LLM_UNAVAILABLE = "language model unavailable"
 def get_agent_deps(
     request: Request, settings: SettingsDep, embeddings: EmbeddingsDep, storage: StorageDep
 ) -> AgentDeps:
-    """Collaborators of a run from ``app.state`` (registry, model, embeddings, storage)."""
+    """Collaborators of a run from ``app.state`` (registry, model, embeddings, storage, catalog)."""
     return AgentDeps(
         registry=request.app.state.tool_registry,
+        catalog=request.app.state.module_catalog,
         llm=request.app.state.llm,
         embeddings=embeddings,
         settings=settings,

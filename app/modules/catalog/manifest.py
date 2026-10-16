@@ -75,6 +75,20 @@ class StepSpec:
 
 
 @dataclass(frozen=True)
+class AgentProfile:
+    """How the chat agent works with a module's tools (its *engine*).
+
+    ``routing_description`` tells the engine router which requests belong to
+    the module; ``instructions`` become the module engine's section of the
+    system prompt. Both are developer-written English, never shown to admins
+    through the catalog API; their limits are checked at registration.
+    """
+
+    routing_description: str
+    instructions: str
+
+
+@dataclass(frozen=True)
 class ModuleManifest:
     """Immutable registration record of one module (see the module docstring).
 
@@ -84,6 +98,8 @@ class ModuleManifest:
     ``ValidationError``). ``permissions`` are the OAuth/API scopes the module's
     tools would request — never credentials; ``tools`` are the tool names the
     module contributes, which T2 gates on the tenant's active modules.
+    ``agent`` is the optional :class:`AgentProfile`; without one the agent
+    falls back to ``description`` and generic instructions.
     """
 
     key: str
@@ -93,3 +109,4 @@ class ModuleManifest:
     permissions: tuple[str, ...] = ()
     tools: tuple[str, ...] = ()
     onboarding: tuple[StepSpec, ...] = ()
+    agent: AgentProfile | None = None
