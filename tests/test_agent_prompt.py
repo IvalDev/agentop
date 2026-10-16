@@ -85,6 +85,19 @@ def test_build_messages_puts_the_policy_first_and_alone() -> None:
     ]
 
 
+def test_build_messages_appends_the_time_context_to_the_policy() -> None:
+    """The server-built time paragraph follows the policy in the one system message."""
+    context = "Current date and time for the user: Friday, 2026-10-16 10:07 (Europe/Madrid)."
+
+    messages = build_messages("What is due today?", [], time_context=context)
+
+    assert [(message.role, message.content) for message in messages] == [
+        ("system", f"{SYSTEM_PROMPT.rstrip()}\n\n{context}"),
+        ("user", "What is due today?"),
+    ]
+    assert build_messages("Hi", [], time_context=None)[0].content == SYSTEM_PROMPT
+
+
 @pytest.mark.parametrize("role", ["system", "tool", "developer", "SYSTEM"])
 def test_build_messages_refuses_privileged_history_roles(role: str) -> None:
     """A client can never add a system/tool turn through the history."""

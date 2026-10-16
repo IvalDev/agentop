@@ -32,11 +32,12 @@ Handler contract (exact signature)::
 ``session``, the ``tenant_id`` and ``user`` of the authenticated principal,
 and the optional services a handler may need (the ``embeddings`` provider for
 semantic search, the chat model ``llm``, the document blob ``storage``, the
-run's ``correlation_id``). ``tenant_id`` is the isolation key (decision A8):
-handlers MUST scope every query with it. ``ToolUser`` is a structural
-protocol satisfied by both the ORM ``User`` and the request-scoped
-``CurrentUser`` value object, so handlers stay decoupled from either. New
-services are added as context fields, never as extra positional arguments.
+run's ``correlation_id``, the requesting user's ``timezone``). ``tenant_id``
+is the isolation key (decision A8): handlers MUST scope every query with it.
+``ToolUser`` is a structural protocol satisfied by both the ORM ``User`` and
+the request-scoped ``CurrentUser`` value object, so handlers stay decoupled
+from either. New services are added as context fields, never as extra
+positional arguments.
 
 Optional hooks (T11)::
 
@@ -114,6 +115,9 @@ class ToolContext:
     a handler's precheck may need (the Google OAuth client credentials for
     the under-demand token refresh, D3). Both default to ``None`` — tools
     that need them must fail closed with a precheck error, never a 500.
+    ``timezone`` is the resolved IANA name of the requesting user in a chat
+    run (``"UTC"`` when the browser sent none or an unknown one); it is
+    ``None`` outside chat runs, e.g. when an approved request executes.
     """
 
     session: AsyncSession
@@ -125,6 +129,7 @@ class ToolContext:
     storage: DocumentStorage | None = None
     credentials_key: str | None = None
     settings: Settings | None = None
+    timezone: str | None = None
 
 
 ToolHandler = Callable[[ToolContext, BaseModel], Awaitable[Any]]

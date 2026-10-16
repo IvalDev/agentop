@@ -113,8 +113,15 @@ def _client_text(text: str) -> str:
     return neutralize(text[:CHAT_MESSAGE_MAX_CHARS])
 
 
-def build_messages(message: str, history: Sequence[HistoryTurn]) -> list[ChatMessage]:
+def build_messages(
+    message: str, history: Sequence[HistoryTurn], *, time_context: str | None = None
+) -> list[ChatMessage]:
     """The conversation for a new run: policy, recent history, the new message.
+
+    ``time_context`` (the server-built paragraph from
+    :func:`~app.modules.agent.user_time.render_time_context`, never client
+    text) follows the policy after a blank line in the same ``system``
+    message; without it the system message is exactly :data:`SYSTEM_PROMPT`.
 
     Raises ``ValueError`` for any history role other than ``user`` or
     ``assistant``. Keeps the :data:`CHAT_HISTORY_MAX_MESSAGES` most recent
@@ -125,7 +132,10 @@ def build_messages(message: str, history: Sequence[HistoryTurn]) -> list[ChatMes
     for turn in turns:
         if turn.role not in _HISTORY_ROLES:
             raise ValueError(f"history role {turn.role!r} is not allowed; use user or assistant")
-    messages = [ChatMessage(role="system", content=SYSTEM_PROMPT)]
+    system = SYSTEM_PROMPT
+    if time_context:
+        system = f"{SYSTEM_PROMPT.rstrip()}\n\n{time_context}"
+    messages = [ChatMessage(role="system", content=system)]
     messages.extend(
         ChatMessage(role=turn.role, content=_client_text(turn.content))
         for turn in turns[-CHAT_HISTORY_MAX_MESSAGES:]

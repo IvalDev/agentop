@@ -286,6 +286,7 @@ async def execute_tool(
     active_modules: set[str] | None = None,
     credentials_key: str | None = None,
     settings: Settings | None = None,
+    timezone: str | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
 
@@ -302,7 +303,9 @@ async def execute_tool(
     :class:`ToolContext` for tools whose precheck/handler must decrypt
     stored credentials or refresh tokens (calendar-mvp T3/D3). The chat
     router wires them from ``Settings``; other callers may leave them
-    ``None`` and the tools fail closed with a precheck error.
+    ``None`` and the tools fail closed with a precheck error. ``timezone``
+    is the requesting user's resolved IANA name, set by the agent loop and
+    passed through to :class:`ToolContext` (``None`` for other callers).
 
     Check order (each failure returns immediately, handler is only reached by
     the last step):
@@ -332,9 +335,9 @@ async def execute_tool(
     7. Dry run ⇒ ``dry_run`` describing the call; handler not called.
     8. Handler run with a :class:`ToolContext` (``session``, the user's
        tenant, ``embeddings``, ``llm``, ``storage``, ``correlation_id``,
-       ``credentials_key``, ``settings``) — exceptions ⇒ ``error``/``execution``
-       with the generic :data:`TOOL_FAILED`; the exception text goes to the
-       server log and the audit event only.
+       ``credentials_key``, ``settings``, ``timezone``) — exceptions ⇒
+       ``error``/``execution`` with the generic :data:`TOOL_FAILED`; the
+       exception text goes to the server log and the audit event only.
     9. Output validation — ``spec.output_model`` rejects the return ⇒
        ``error``/``execution`` with :data:`INVALID_OUTPUT`.
 
@@ -352,6 +355,7 @@ async def execute_tool(
         storage=storage,
         credentials_key=credentials_key,
         settings=settings,
+        timezone=timezone,
     )
     result, record = await _evaluate(
         registry, context, tool_name, raw_input, dry_run, approval_grant, active_modules

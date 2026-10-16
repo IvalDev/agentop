@@ -8,6 +8,8 @@ seeded two-tenant SQLite database.
 
 import json
 import logging
+import re
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -30,8 +32,10 @@ from app.modules.agent.service import (
     MAX_TOOL_CALLS_PER_STEP,
     STEP_LIMIT_ANSWER,
     AgentDeps,
+    AgentRun,
     run_agent,
 )
+from app.modules.agent.user_time import render_time_context, resolve_user_time
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
 from app.modules.catalog.models import ModuleActivation
@@ -75,9 +79,16 @@ def deps(registry: ToolRegistry, llm, storage=None, **settings) -> AgentDeps:
     )
 
 
-async def run(db: Database, user, agent_deps: AgentDeps, message: str = "Help", history=()):
+async def run(
+    db: Database,
+    user,
+    agent_deps: AgentDeps,
+    message: str = "Help",
+    history=(),
+    timezone: str | None = None,
+):
     async with db.sessionmaker() as session:
-        return await run_agent(session, user, message, list(history), agent_deps)
+        return await run_agent(session, user, message, list(history), agent_deps, timezone=timezone)
 
 
 async def seed(db: Database, tenant_id: int, filename: str, contents: list[str]) -> str:
@@ -677,8 +688,98 @@ async def test_run_audit_keeps_metadata_but_never_conversation_text(
     for text in (message, reply, "Earlier private remark", "Earlier private reply"):
         assert text not in stored
     [started] = [e for e in events if e.action == "agent.run_started"]
-    assert started.payload == {"message_chars": len(message), "history_messages": 2}
+    local_time = started.payload["local_time"]
+    assert started.payload == {
+        "message_chars": len(message),
+        "history_messages": 2,
+        "timezone": "UTC",
+        "local_time": local_time,
+        "timezone_fallback": True,
+    }
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00", local_time)
     [completed] = [e for e in events if e.action == "agent.run_completed"]
     assert completed.result["answer_chars"] == len(response.answer)
     assert completed.result["citations"] == 0
     assert "answer" not in completed.result
+
+
+# --- User time context ----------------------------------------------------------------
+
+
+async def test_run_puts_the_users_time_in_prompt_audit_and_tool_context(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """One resolved time feeds the system message, ``agent.run_started``, and every tool."""
+    viewer = seeded_users[VIEWER]
+    user_time = resolve_user_time("Europe/Madrid", now=datetime(2026, 10, 16, 8, 7, tzinfo=UTC))
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+
+    async with seeded_db.sessionmaker() as session:
+        agent_run = AgentRun(
+            session,
+            viewer,
+            "Help",
+            [],
+            deps(registry, llm),
+            active_modules=set(),
+            user_time=user_time,
+        )
+        async for _event in agent_run.events():
+            pass
+
+    for model_call in llm.calls:
+        system = model_call.messages[0]
+        assert system.role == "system"
+        assert system.content.endswith(f"\n\n{render_time_context(user_time)}")
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert started.payload == {
+        "message_chars": len("Help"),
+        "history_messages": 0,
+        "timezone": "Europe/Madrid",
+        "local_time": "2026-10-16T10:07:00+02:00",
+        "timezone_fallback": False,
+    }
+    [context] = approval_tools.spy.contexts
+    assert context.timezone == "Europe/Madrid"
+
+
+async def test_run_agent_resolves_the_requested_timezone(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """``run_agent(timezone=...)`` reaches the prompt, the audit, and the tools."""
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+    before = datetime.now(UTC).replace(microsecond=0)
+
+    await run(seeded_db, seeded_users[VIEWER], deps(registry, llm), timezone="Asia/Tokyo")
+
+    after = datetime.now(UTC)
+    assert "(Asia/Tokyo, UTC+09:00)" in llm.calls[0].messages[0].content
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert (started.payload["timezone"], started.payload["timezone_fallback"]) == (
+        "Asia/Tokyo",
+        False,
+    )
+    local_time = datetime.fromisoformat(started.payload["local_time"])
+    assert local_time.utcoffset() == timedelta(hours=9)
+    assert before <= local_time <= after
+    [context] = approval_tools.spy.contexts
+    assert context.timezone == "Asia/Tokyo"
+
+
+@pytest.mark.parametrize("timezone", [None, "Not/AZone"], ids=["absent", "unknown"])
+async def test_runs_without_a_usable_timezone_fall_back_to_utc(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log, timezone
+) -> None:
+    """No zone or an unknown one: the run proceeds in UTC and says so everywhere."""
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+
+    response = await run(seeded_db, seeded_users[VIEWER], deps(registry, llm), timezone=timezone)
+
+    assert response.answer == "Done."
+    system = llm.calls[0].messages[0].content
+    assert "(UTC, UTC+00:00)" in system
+    assert "The user's timezone is unknown" in system
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert (started.payload["timezone"], started.payload["timezone_fallback"]) == ("UTC", True)
+    [context] = approval_tools.spy.contexts
+    assert context.timezone == "UTC"

@@ -206,6 +206,7 @@ async def test_handler_receives_a_context_with_session_and_services(
             embeddings=embeddings,
             llm=llm,
             storage=storage,
+            timezone="Europe/Madrid",
         )
         await execute_tool(tools.registry, session, make_user(), "spy_extract", {"value": 2})
         context, bare = tools.extract_spy.contexts
@@ -216,8 +217,9 @@ async def test_handler_receives_a_context_with_session_and_services(
     assert context.correlation_id == "run-1"
     assert context.llm is llm
     assert context.storage is storage
+    assert context.timezone == "Europe/Madrid"
     # Services are optional: a caller that wires none gives handlers None.
-    assert (bare.embeddings, bare.llm, bare.storage) == (None, None, None)
+    assert (bare.embeddings, bare.llm, bare.storage, bare.timezone) == (None, None, None, None)
 
 
 async def test_invalid_input_returns_validation_error_and_skips_handler(

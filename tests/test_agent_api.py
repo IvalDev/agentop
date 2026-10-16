@@ -173,6 +173,8 @@ async def test_chat_answers_with_verifiable_citations_from_the_callers_tenant(
         {"message": ""},
         {"message": "hi", "history": [{"role": "user", "content": "x"}] * 21},
         {"message": "hi", "tenant_id": 2},
+        {"message": "hi", "timezone": "x" * 65},
+        {"message": "hi", "timezone": 2},
     ],
     ids=[
         "system-role",
@@ -182,6 +184,8 @@ async def test_chat_answers_with_verifiable_citations_from_the_callers_tenant(
         "empty-message",
         "history-too-long",
         "tenant-override",
+        "timezone-too-long",
+        "timezone-not-a-string",
     ],
 )
 async def test_chat_rejects_unsafe_or_oversized_requests(
@@ -259,6 +263,75 @@ async def test_chat_gives_tools_the_apps_llm_and_storage(
     [context] = approval_tools.spy.contexts
     assert context.llm is chat_app.state.llm
     assert context.storage is chat_app.state.storage
+
+
+@pytest.mark.parametrize("path", ["/api/v1/chat", "/api/v1/chat/stream"])
+async def test_chat_uses_the_browsers_timezone_in_prompt_audit_and_tools(
+    chat_app: FastAPI,
+    chat_client: AsyncClient,
+    seeded_db: Database,
+    approval_tools,
+    audit_log,
+    path: str,
+) -> None:
+    """Both endpoints resolve ``timezone`` for the system message, the audit, and tools."""
+    chat_app.state.tool_registry = approval_tools.registry
+    note = {"to": "ops@acme.test", "body": "Report ready"}
+    llm = FakeLLMProvider(
+        [
+            AssistantMessage(content="", tool_calls=(ToolCall("peek_note", note),)),
+            AssistantMessage(content="Peeked."),
+        ]
+    )
+    chat_app.state.llm = llm
+
+    response = await chat_client.post(
+        path,
+        json={"message": "Peek", "timezone": "Asia/Tokyo"},
+        headers=await _headers(chat_client),
+    )
+
+    assert response.status_code == 200, response.text
+    assert "Peeked." in response.text
+    assert "(Asia/Tokyo, UTC+09:00)" in llm.calls[0].messages[0].content
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert (started.payload["timezone"], started.payload["timezone_fallback"]) == (
+        "Asia/Tokyo",
+        False,
+    )
+    assert started.payload["local_time"].endswith("+09:00")
+    [context] = approval_tools.spy.contexts
+    assert context.timezone == "Asia/Tokyo"
+
+
+@pytest.mark.parametrize("path", ["/api/v1/chat", "/api/v1/chat/stream"])
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"timezone": "Mars/Olympus_Mons"}, {"timezone": "../etc/passwd"}, {"timezone": None}],
+    ids=["absent", "unknown", "path-like", "null"],
+)
+async def test_chat_without_a_usable_timezone_runs_in_utc(
+    chat_app: FastAPI,
+    chat_client: AsyncClient,
+    seeded_db: Database,
+    audit_log,
+    path: str,
+    extra: dict,
+) -> None:
+    """A missing or unknown zone is never a 422: the run falls back to UTC, audited."""
+    llm = FakeLLMProvider([AssistantMessage(content="Hello.")])
+    chat_app.state.llm = llm
+
+    response = await chat_client.post(
+        path, json={"message": "hi", **extra}, headers=await _headers(chat_client)
+    )
+
+    assert response.status_code == 200, response.text
+    assert "Hello." in response.text
+    assert "(UTC, UTC+00:00)" in llm.calls[0].messages[0].content
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert (started.payload["timezone"], started.payload["timezone_fallback"]) == ("UTC", True)
+    assert "Mars" not in json.dumps(started.payload)
 
 
 async def test_chat_stream_emits_typed_events_in_order(

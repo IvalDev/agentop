@@ -2,8 +2,10 @@
 
 Any authenticated role may chat; the tenant always comes from the user, and
 the tools offered to the model are filtered by that user's role and by the
-tenant's active catalog modules. The model backend failing maps to 502
-(JSON) or a typed ``error`` event (SSE) with a generic message.
+tenant's active catalog modules. The optional ``timezone`` (the browser's
+IANA name) gives the run the user's local date and time; a missing or
+unknown name is not an error, the run uses UTC. The model backend failing
+maps to 502 (JSON) or a typed ``error`` event (SSE) with a generic message.
 
 SSE wire format: ``event: <type>\\ndata: <json>\\n\\n`` with the types
 ``run_started``, ``tool_call``, ``approval_required``, ``tool_result``,
@@ -27,6 +29,7 @@ from app.core.db import Database, get_session
 from app.core.deps import get_settings
 from app.modules.agent.llm import LLMError
 from app.modules.agent.service import AgentDeps, AgentRun, run_agent
+from app.modules.agent.user_time import resolve_user_time
 from app.modules.catalog.service import active_module_keys
 from app.modules.documents.router import StorageDep
 from app.modules.identity.deps import CurrentUser, get_current_user
@@ -71,7 +74,9 @@ async def chat(
 ) -> ChatResponse:
     """Run the agent to completion and return the answer with citations."""
     try:
-        return await run_agent(session, user, body.message, body.history, deps)
+        return await run_agent(
+            session, user, body.message, body.history, deps, timezone=body.timezone
+        )
     except LLMError as exc:
         logger.warning("chat run failed: %s", exc)
         raise HTTPException(status_code=502, detail=_LLM_UNAVAILABLE) from exc
@@ -97,7 +102,13 @@ async def _event_stream(
     async with db.sessionmaker() as session:
         active_modules = await active_module_keys(session, user.tenant_id)
         run = AgentRun(
-            session, user, body.message, body.history, deps, active_modules=active_modules
+            session,
+            user,
+            body.message,
+            body.history,
+            deps,
+            active_modules=active_modules,
+            user_time=resolve_user_time(body.timezone),
         )
         try:
             async for event in run.events(stream=True):

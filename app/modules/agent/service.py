@@ -3,7 +3,9 @@
 One chat request is one *run*, identified by ``run_id`` (a UUID that is also
 the audit correlation id of everything the run does):
 
-1. The conversation is the system policy, the client's capped user/assistant
+1. The conversation is the system policy followed by the user's current
+   date, time, and timezone (:mod:`~app.modules.agent.user_time`; UTC when
+   the client sent no usable timezone), the client's capped user/assistant
    history, and the new message (:func:`~app.modules.agent.prompt.build_messages`).
    The model is offered only the tools whose required role the user
    satisfies and whose module (when the tool declares one) the tenant has
@@ -12,8 +14,9 @@ the audit correlation id of everything the run does):
    most :data:`MAX_TOOL_CALLS_PER_STEP` per reply) runs through
    :func:`~app.modules.tools.executor.execute_tool` as actor ``agent`` with
    the run id as correlation id (tools get the run's ``llm``, document
-   ``storage``, the app ``settings``, and the per-user-connection
-   ``credentials_key`` in their context), its result goes back as a ``tool`` message,
+   ``storage``, the app ``settings``, the per-user-connection
+   ``credentials_key``, and the user's resolved ``timezone`` in their
+   context), its result goes back as a ``tool`` message,
    and the model is asked again — at most ``Settings.agent_max_steps`` model
    calls per run. When that budget is spent the run stops with
    :data:`STEP_LIMIT_ANSWER`; calls requested on the last step never run.
@@ -37,8 +40,10 @@ per-step cap); every executed call adds the executor's ``tool.*`` event, and
 every approval request the run submits adds its ``approval.created`` event
 (also ``agent`` with the run id; later ``approval.*`` events of that request
 are correlated by the request id). Run events carry metadata only (sizes,
-counts, tool names, approval ids): the message, history, and answer text are
-never written to the audit log.
+counts, tool names, approval ids, and on ``agent.run_started`` the user's
+resolved ``timezone``, ``local_time`` with its UTC offset, and whether the
+run fell back to UTC as ``timezone_fallback``): the message, history, and
+answer text are never written to the audit log.
 
 Transactions: the loop commits only the approval requests it creates
 (``EXTRACT`` tools are read-only); audit events use their own transactions.
@@ -72,6 +77,7 @@ from app.modules.agent.prompt import (
     render_tool_error,
     render_tool_output,
 )
+from app.modules.agent.user_time import UserTime, render_time_context, resolve_user_time
 from app.modules.approvals.exceptions import ApprovalError
 from app.modules.approvals.service import create_approval_request
 from app.modules.audit.models import ActorType
@@ -182,7 +188,10 @@ def _clip_name(name: str) -> str:
 class AgentRun:
     """State and event stream of one agent run (see the module docstring).
 
-    Raises ``ValueError`` at construction for a privileged history role.
+    ``user_time`` is the requesting user's resolved time (see
+    :func:`~app.modules.agent.user_time.resolve_user_time`); ``None`` means
+    no timezone was sent and the run uses UTC as a fallback. Raises
+    ``ValueError`` at construction for a privileged history role.
     """
 
     def __init__(
@@ -194,6 +203,7 @@ class AgentRun:
         deps: AgentDeps,
         *,
         active_modules: set[str],
+        user_time: UserTime | None = None,
     ) -> None:
         self.run_id = new_run_id()
         self._session = session
@@ -201,7 +211,10 @@ class AgentRun:
         self._deps = deps
         self._message = message
         self._history_count = len(history)
-        self._messages = build_messages(message, history)
+        self._user_time = user_time if user_time is not None else resolve_user_time(None)
+        self._messages = build_messages(
+            message, history, time_context=render_time_context(self._user_time)
+        )
         self._active_modules = active_modules
         self._tools = tool_schemas(deps.registry, user, active_modules)
         self._citations = CitationIndex()
@@ -232,7 +245,13 @@ class AgentRun:
         """
         await self._audit(
             "agent.run_started",
-            payload={"message_chars": len(self._message), "history_messages": self._history_count},
+            payload={
+                "message_chars": len(self._message),
+                "history_messages": self._history_count,
+                "timezone": self._user_time.timezone,
+                "local_time": self._user_time.now.isoformat(timespec="seconds"),
+                "timezone_fallback": self._user_time.fallback,
+            },
             result={"tools": [tool["function"]["name"] for tool in self._tools]},
         )
         yield AgentEvent("run_started", {"run_id": self.run_id})
@@ -325,6 +344,7 @@ class AgentRun:
                 active_modules=self._active_modules,
                 credentials_key=self._deps.credentials_key,
                 settings=self._deps.settings,
+                timezone=self._user_time.timezone,
             )
             summary, content, new_approval = await self._handle(call_id, name, result)
         self._summaries.append(summary)
@@ -445,15 +465,26 @@ async def run_agent(
     message: str,
     history: Sequence[HistoryTurn],
     deps: AgentDeps,
+    *,
+    timezone: str | None = None,
 ) -> ChatResponse:
     """Run the agent to completion and return its response (no streaming).
 
     The tenant's active module keys are read once per run and gate both the
     tools the model is offered and every ``execute_tool`` call in the loop.
+    ``timezone`` is the client's IANA name, resolved with a UTC fallback.
     Raises :class:`LLMError` when the model backend fails.
     """
     active_modules = await active_module_keys(session, user.tenant_id)
-    run = AgentRun(session, user, message, history, deps, active_modules=active_modules)
+    run = AgentRun(
+        session,
+        user,
+        message,
+        history,
+        deps,
+        active_modules=active_modules,
+        user_time=resolve_user_time(timezone),
+    )
     async for _event in run.events():
         pass
     return run.response()
