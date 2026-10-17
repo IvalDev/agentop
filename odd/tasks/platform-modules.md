@@ -67,7 +67,7 @@ Hoy la empresa y sus usuarios solo se crean con el seed de demo, no existe API d
 
 - [x] D1 — **Canal de chat. Decidido por el humano 2026-10-14:** una sola interfaz web de chat (WCAG 2.2 AA: teclado, lector de pantalla, contraste, zoom, movimiento reducido, adaptable a móvil) entregada de tres formas:
   - **Móvil:** PWA de solo chat instalada en la pantalla de inicio (Android e iOS), con notificaciones push web. Si más adelante hace falta estar en las tiendas, se envuelve la misma web (p. ej. Capacitor)
-  - **Escritorio, "widget":** aplicación ligera que envuelve la misma web y vive en la bandeja del sistema, con atajo de teclado global que abre una ventana flotante de chat, opción de "siempre visible", arranque con el sistema y notificaciones nativas. Propuesta: Tauri (usa el navegador del sistema, instalador de pocos MB) frente a Electron (más pesado). Alternativa mínima: la PWA instalada en el escritorio, que abre en su propia ventana pero sin atajo global ni bandeja. **Tecnología pendiente de confirmar**
+  - **Escritorio, "widget":** aplicación ligera que envuelve la misma web y vive en la bandeja del sistema, con atajo de teclado global que abre una ventana flotante de chat, opción de "siempre visible", arranque con el sistema y notificaciones nativas. **Tecnología confirmada por el humano 2026-10-17: Tauri** (usa el motor web del sistema, instalador de pocos MB) por sobre Electron. Alternativa mínima descartada: la PWA instalada en el escritorio, que abre en su propia ventana pero sin atajo global ni bandeja. El plan de implementación vive en `odd/tasks/desktop-widget.md`
   - **Navegador:** la misma web en una dirección
   - Complementos posteriores: chat embebible en la intranet o sistema de la empresa, y canales de mensajería (WhatsApp Business, Telegram, Teams) como módulos
   - Restricción derivada: PWA y notificaciones exigen HTTPS con certificado válido, y el móvil fuera de la oficina necesita llegar al servidor de la empresa (dirección pública con HTTPS o VPN). Afecta a T12 (deployment) de `admin-agent-core`
@@ -119,7 +119,7 @@ Objetivo: una aplicación React + Vite + TypeScript (D2) corriendo en la máquin
 ### Fase 2 — Canal de chat (tras D1 y D2)
 
 - [ ] C1 — Consola web de producción: login y dashboard con las secciones Chat (con citas), Base de conocimiento, Configuración (equipo y roles; herramientas, módulos y onboarding) y aprobaciones, visibles según el rol. Modo "solo chat" de la misma web, instalable como PWA en el móvil (D1). WCAG 2.2 AA verificada. Resolver al pasar de la consola: estáticos como package data, y no montar UI de desarrollo si falta `AA_ENVIRONMENT`
-- [ ] C2 — Widget de escritorio (según D1) para quien solo necesita hablar con el bot: envoltorio ligero del modo "solo chat" de la misma web con bandeja del sistema, atajo global, ventana flotante, arranque con el sistema y notificaciones nativas; instaladores para Windows, macOS y Linux
+- [ ] C2 — Widget de escritorio (según D1) para quien solo necesita hablar con el bot: envoltorio ligero del modo "solo chat" de la misma web con bandeja del sistema, atajo global, ventana flotante, arranque con el sistema y notificaciones nativas; instaladores para Windows, macOS y Linux — **adelantada** como feature `desktop-widget` (plan en `odd/tasks/desktop-widget.md`; Linux primero, Windows/macOS diferidos; incluye botón «Instalar widget» en la consola para facilitar la instalación)
 - [ ] C2.b — Chat embebible en la intranet o sistema de la empresa (posterior)
 - [ ] C3 — Canales de mensajería como módulos (WhatsApp Business, Telegram, Teams), con el mismo contrato de módulo
 
@@ -159,4 +159,4 @@ Solo planificación (pedido del humano 2026-10-14: "añádelo a las tareas"). Ni
 
 ## Next step
 
-D1, D2, D4, D5, D6 (implementación diferida), D7 y D8 decididos. Falta decidir D3 (orden de conectores) y la tecnología del widget (Tauri propuesto). **Fase 0.5 (app local) completa en código el 2026-10-14** (L1–L5, rama `feat/local-app`); pendiente la prueba manual del humano en el navegador. Después: decidir si se abren los PRs apilados (`feat/admin-agent-core` → `feat/local-app`) y autorizar la Fase 1.
+D1, D2, D4, D5, D6 (implementación diferida), D7 y D8 decididos. D3 (orden de conectores) sigue pendiente. **Tecnología del widget confirmada (Tauri, 2026-10-17)**; su plan vive en `odd/tasks/desktop-widget.md` (T0–T6, Linux primero), pendiente de aprobación del humano. **Fase 0.5 (app local) completa en código el 2026-10-14** (L1–L5, rama `feat/local-app`); pendiente la prueba manual del humano en el navegador. Después: decidir si se abren los PRs apilados (`feat/admin-agent-core` → `feat/local-app`) y autorizar la Fase 1.
