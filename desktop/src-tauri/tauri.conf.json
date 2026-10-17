@@ -7,16 +7,6 @@
     "frontendDist": "../ui"
   },
   "app": {
-    "windows": [
-      {
-        "label": "main",
-        "title": "Asistente",
-        "width": 440,
-        "height": 700,
-        "resizable": true,
-        "center": true
-      }
-    ],
     "security": {
       "csp": null
     }
