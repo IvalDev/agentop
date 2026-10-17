@@ -1,37 +1,25 @@
 /**
- * Where the access token survives a reload: `sessionStorage`, so it is scoped to
- * this tab and gone when the tab closes. Never `localStorage`. The API has no
- * refresh token yet; the follow-up is an httpOnly refresh cookie.
+ * Where the access token lives: in memory only, for the lifetime of the page.
+ * Nothing token-shaped is written to `sessionStorage` or `localStorage`; a
+ * reload restores the session with `POST /api/v1/auth/refresh`, carrying the
+ * httpOnly refresh cookie that JavaScript cannot read. The `TokenStorage`
+ * seam stays so tests (or a future client) can inject their own storage.
  */
-export const TOKEN_STORAGE_KEY = 'admin-agent.access-token';
-
 export interface TokenStorage {
   read(): string | null;
   write(token: string): void;
   clear(): void;
 }
 
-// Storage access can throw (privacy modes, blocked site data): degrade to memory only.
-export const sessionTokenStorage: TokenStorage = {
-  read() {
-    try {
-      return window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
-    } catch {
-      return null;
-    }
-  },
-  write(token) {
-    try {
-      window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
-    } catch {
-      // Memory only: a reload will ask for the login again.
-    }
+let token: string | null = null;
+
+/** Process-wide in-memory storage: gone on reload, unreachable from other origins. */
+export const memoryTokenStorage: TokenStorage = {
+  read: () => token,
+  write(next) {
+    token = next;
   },
   clear() {
-    try {
-      window.sessionStorage.removeItem(TOKEN_STORAGE_KEY);
-    } catch {
-      // Nothing stored.
-    }
+    token = null;
   },
 };
