@@ -1,6 +1,6 @@
 # Feature: Widget de escritorio (desktop-widget)
 
-**Creado:** 2026-10-17 · **Estado:** plan propuesto — pendiente de aprobación del humano (sin implementación autorizada)
+**Creado:** 2026-10-17 · **Estado:** aprobado por el humano (2026-10-17) — implementación en curso: T0 completada y verificada; T1 siguiente
 **Rama prevista:** `feat/desktop-widget`, apilada sobre `feat/agent-engine-routing` (extremo actual de la pila de trabajo local)
 **Relación:** adelanta C2 de `odd/tasks/platform-modules.md` (decisiones D1, D2, D4, D7, D8). El chat web que envuelve ya existe y funciona (Fase 0.5, tarea L3).
 
@@ -28,8 +28,8 @@ Consecuencias asumidas:
 
 - Ubuntu 26.04, GNOME 50.1, sesión **Wayland**.
 - Bandeja: extensión `ubuntu-appindicators@ubuntu.com` activa → los iconos de bandeja se muestran en GNOME.
-- `libwebkit2gtk-4.1-dev` 2.52.6, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libxdo-dev`, `build-essential` y `libssl-dev` disponibles en apt (candidatos verificados).
-- Rust/cargo: **no instalados**.
+- `libwebkit2gtk-4.1-dev` 2.52.6, `libayatana-appindicator3-dev` 0.5.94, `libsoup-3.0` 3.6.6, `librsvg2-dev`, `libxdo-dev`, `build-essential` y `libssl-dev` **instalados** (sudo del humano, 2026-10-17).
+- Rust/cargo 1.99.1 + clippy/rustfmt instalados vía rustup (2026-10-17).
 - `notify-send` presente (notificaciones nativas funcionan).
 - Atajos globales: el portal `org.freedesktop.portal.GlobalShortcuts` existe en GNOME 50, pero el plugin `global-shortcut` de Tauri registra vía X11 → **en Wayland no funcionará nativo**. W4 define el mecanismo.
 
@@ -55,8 +55,8 @@ Consecuencias asumidas:
 
 ## Checklist de tareas
 
-- [ ] T0 — **Toolchain y spike de viabilidad (GNOME Wayland):** instalar Rust (rustup, sin sudo) y los paquetes apt (requieren sudo del humano: `libwebkit2gtk-4.1-dev`, `build-essential`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libxdo-dev`, `libssl-dev`, `file`, `wget`); scaffold mínimo de Tauri en `desktop/`; verificar en la máquina: ventana que carga `http://127.0.0.1:8000`, icono de bandeja visible, notificación nativa desde la app, y el mecanismo W4 (`--toggle` + atajo de GNOME). Evidencia: versiones instaladas + resultados observados, registrados acá. Ruta: inline (bash) + scaffold mínimo. ⚠️ Requiere acciones del humano: rustup + `sudo apt install`
-- [ ] T1 — **Modo solo-chat `/widget` en la web:** ruta nueva con shell mínimo (título, cerrar sesión, retorno a la consola), login cuando no hay sesión, reutiliza `ChatPage`/`ChatProvider`; textos en el catálogo i18n; sin cambios de comportamiento en la consola. Ruta: delegated direct (writer). Checks: vitest (ruta, gating de sesión, axe), typecheck, lint
+- [x] T0 — **Toolchain y spike de viabilidad (GNOME Wayland):** instalar Rust (rustup, sin sudo) y los paquetes apt (requieren sudo del humano: `libwebkit2gtk-4.1-dev`, `build-essential`, `libayatana-appindicator3-dev`, `librsvg2-dev`, `libxdo-dev`, `libssl-dev`, `file`, `wget`); scaffold mínimo de Tauri en `desktop/`; verificar en la máquina: ventana que carga `http://127.0.0.1:8000`, icono de bandeja visible, notificación nativa desde la app, y el mecanismo W4 (`--toggle` + atajo de GNOME). Evidencia (2026-10-17): Rust 1.99.1 + clippy/rustfmt; scaffold Tauri 2.12.4 en `desktop/` (single-instance 2.5.4, notification 2.7.0); build debug OK en 1m28s; la ventana cargó el SPA (`GET /` + assets en el log del servidor); bandeja, notificación de prueba y `--toggle` ocultar/mostrar confirmados por el humano en GNOME Wayland; warning de deprecación de libayatana-appindicator: inocuo; mecanismo W4 validado en la máquina (el atajo de GNOME se documenta en T6). Commit `e93981d`. Ruta: inline (bash/scaffold) + explorer para el mapa.
+- [ ] T1 — **Modo solo-chat `/widget` en la web:** ruta nueva con shell mínimo (título, cerrar sesión; sin enlace a la consola — pedido del humano: solo el chat), login cuando no hay sesión, reutiliza `ChatPage`/`ChatProvider`; textos en el catálogo i18n; sin cambios de comportamiento en la consola. Ruta: delegated direct (writer). Checks: vitest (ruta, gating de sesión, axe), typecheck, lint
 - [ ] T2 — **Sesión persistente:** refresh token en cookie httpOnly con rotación y revocación (tabla con hash + migración), endpoints `POST /api/v1/auth/refresh` y `POST /api/v1/auth/logout`, config de cookie por entorno; en la web: restauración silenciosa al abrir, 401 → un refresh → si falla, sesión expirada, logout llama al servidor; el access token deja de persistir en `sessionStorage`. Tests: rotación, reuso, expiración, revocación, aislamiento entre empresas; web: refresh silencioso y reintento único. Ruta: delegated direct (writer). ⚠️ Candidato de riesgo alto/medio: consentimiento RDD por candidato
 - [ ] T3 — **Shell Tauri:** proyecto en `desktop/` (Tauri 2), ventana principal que carga `{AA_SERVER_URL}/widget` (W6: env → archivo XDG → default localhost:8000), navegación restringida al origen configurado (enlaces externos al navegador del sistema), instancia única, cerrar oculta (sin bandeja todavía: hide llega con T4; hasta entonces cerrar puede salir), targets `make widget-dev` / `make widget-build`. Ruta: delegated direct (writer). Checks: `cargo check` + `cargo clippy` + smoke manual
 - [ ] T4 — **Experiencia de shell:** bandeja con menú (Mostrar/Ocultar, "Siempre visible" ✓, "Arranque con el sistema" ✓, Salir), cerrar → bandeja, `--toggle` con IPC sobre la instancia única, atajo nativo en X11 + documentación del atajo de GNOME para Wayland (W4), autostart (plugin; propuesta: activado por defecto en el primer arranque). Ruta: delegated direct (writer). Checks: `cargo clippy` + smoke manual documentado
@@ -105,7 +105,8 @@ Diferidas (fuera del MVP): F1 Windows/macOS (empaquetado + verificación; requie
 
 - 2026-10-17: plan creado tras confirmar Tauri; mapa de integración y entorno verificados (secciones de arriba); nada implementado. Tareas T0–T6 definidas; F1–F3 diferidas.
 - 2026-10-17 (2): pedido del humano — botón «Instalar widget» en la consola que instala lo necesario en la máquina del usuario; añadido como W7/T7 (depende de T6); criterio de aceptación 10; F4 registrada.
+- 2026-10-17 (3): aprobación del humano; T0 completada y verificada en la máquina (ventana + bandeja + notificación + `--toggle` confirmados visualmente). Commit `e93981d` `feat(desktop): scaffold the Tauri widget shell with tray, toggle and notifications`; entorno actualizado en la sección correspondiente.
 
 ## Next step
 
-Aprobación del humano → T0 (toolchain: rustup + `sudo apt install …`; spike de viabilidad en la máquina). Sin aprobación no se escribe código.
+T1 — Modo solo-chat `/widget` (ruta nueva con shell mínimo, reutiliza `ChatPage`/`ChatProvider`; delegated writer; checks: vitest + typecheck + lint). Después T2 — sesión persistente (candidato RDD de riesgo alto/medio).
