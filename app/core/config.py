@@ -52,6 +52,10 @@ class Settings(BaseSettings):
     jwt_secret: str = ""
     jwt_algorithm: str = "HS256"
     access_token_expire_minutes: int = 30
+    # Persistent sessions (T2): how long an unused refresh cookie stays valid,
+    # and whether it carries ``Secure`` (True for HTTPS deployments).
+    refresh_token_expire_days: int = 30
+    refresh_cookie_secure: bool = False
     max_upload_bytes: int = 20 * 1024 * 1024
     storage_base_dir: str = "./var/storage"
     # Retrieval (T5): adapter selection, model identity, and vector size.
