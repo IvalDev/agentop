@@ -1,6 +1,8 @@
 /** Client-side routes. FastAPI serves `index.html` for all of them (SPA fallback). */
 export const paths = {
   login: '/login',
+  /** Chat-only shell loaded by the desktop widget, outside the dashboard layout. */
+  widget: '/widget',
   chat: '/chat',
   knowledge: '/conocimiento',
   settings: '/configuracion',
