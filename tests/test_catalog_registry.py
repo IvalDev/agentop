@@ -27,8 +27,9 @@ from app.modules.catalog.registry import (
 )
 
 #: Production modules registered on the process-wide catalog (reviewed
-#: calendar-mvp allowlist change, human-approved 2026-10-15).
-MODULE_CATALOG_ALLOWLIST: list[str] = ["calendar"]
+#: calendar-mvp allowlist change, human-approved 2026-10-15; google-mail
+#: G1 allowlist change, 2026-10-18).
+MODULE_CATALOG_ALLOWLIST: list[str] = ["calendar", "google_mail"]
 INVALID_KEYS = ["Demo Module", "google-mail", "2fast", "", "UPPER_snake", " spaced"]
 
 
