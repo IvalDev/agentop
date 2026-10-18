@@ -24,9 +24,10 @@ get, approve, reject, and execute answer 403 (404 still wins for unknown and
 other-tenant ids). A tool that ran but failed — a precheck refusal included
 (``execution_error`` ``precheck_failed: <reason>``) — still answers 200 with
 status ``failed`` and ``execution_error``: the approval was consumed either
-way. Execution gives the tool the app's chat model (``app.state.llm``) and
-document storage (``app.state.storage``), the same objects the chat and
-documents routes use.
+way. Execution gives the tool the app's chat model (``app.state.llm``),
+document storage (``app.state.storage``), settings, and credentials key —
+the same objects the chat and documents routes use — so an approved call
+that decrypts per-user provider credentials runs like it would in chat.
 """
 
 from typing import Annotated
@@ -35,7 +36,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.db import get_session
+from app.core.deps import get_settings
 from app.modules.agent.llm import LLMProvider
 from app.modules.approvals.exceptions import (
     ApprovalBindingError,
@@ -66,6 +69,7 @@ router = APIRouter(prefix="/api/v1/approvals", tags=["approvals"])
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 CurrentUserDep = Annotated[CurrentUser, Depends(get_current_user)]
+SettingsDep = Annotated[Settings, Depends(get_settings)]
 
 
 def get_tool_registry(request: Request) -> ToolRegistry:
@@ -174,11 +178,23 @@ async def execute(
     user: CurrentUserDep,
     llm: LLMDep,
     storage: StorageDep,
+    settings: SettingsDep,
 ) -> ApprovalResponse:
     """Run an approved request's stored call exactly once."""
     try:
         execution = await execute_approved_action(
-            session, registry, user, approval_id, llm=llm, storage=storage
+            session,
+            registry,
+            user,
+            approval_id,
+            llm=llm,
+            storage=storage,
+            # The Fernet key for provider connections, as the agent route
+            # builds it: tools that decrypt per-user tokens fail closed on None.
+            credentials_key=(
+                settings.credentials_key.get_secret_value() if settings.credentials_key else None
+            ),
+            settings=settings,
         )
     except ApprovalError as exc:
         raise _http_error(exc) from exc

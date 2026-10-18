@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import select, update
 
 from app.core.config import Settings
+from app.core.crypto import generate_credentials_key
 from app.core.db import Database
 from app.modules.agent.llm import FakeLLMProvider
 from app.modules.approvals.exceptions import (
@@ -647,3 +648,48 @@ async def test_approved_execution_gives_the_tool_the_llm_and_storage(
     for context in (precheck_context, handler_context):
         assert context.llm is llm
         assert context.storage is storage
+
+
+async def test_approved_execution_gives_the_tool_the_credentials_key_and_settings(
+    seeded_db: Database, seeded_users, tiered_tools
+) -> None:
+    """A tool decrypting per-user provider credentials sees the injected key and settings."""
+    credentials_key = generate_credentials_key()
+    owner = seeded_users[OWNER]
+    request_id = await _create(seeded_db, tiered_tools, owner, tool="route_note")
+    await _approve(seeded_db, owner, request_id)
+
+    async with seeded_db.sessionmaker() as session:
+        outcome = await execute_approved_action(
+            session,
+            tiered_tools.registry,
+            owner,
+            request_id,
+            now=T0,
+            credentials_key=credentials_key,
+            settings=SETTINGS,
+        )
+
+    assert outcome.request.status is ApprovalStatus.EXECUTED
+    [precheck_context] = tiered_tools.precheck.contexts
+    [handler_context] = tiered_tools.spy.contexts
+    for context in (precheck_context, handler_context):
+        assert context.credentials_key == credentials_key
+        assert context.settings is SETTINGS
+
+
+async def test_approved_execution_without_a_credentials_key_leaves_the_context_unset(
+    seeded_db: Database, seeded_users, tiered_tools
+) -> None:
+    """Omitting both keeps today's contract: ``None`` in the context, so such tools fail closed."""
+    owner = seeded_users[OWNER]
+    request_id = await _create(seeded_db, tiered_tools, owner, tool="route_note")
+    await _approve(seeded_db, owner, request_id)
+
+    outcome = await _execute(seeded_db, tiered_tools, owner, request_id)
+
+    assert outcome.request.status is ApprovalStatus.EXECUTED
+    [precheck_context] = tiered_tools.precheck.contexts
+    [handler_context] = tiered_tools.spy.contexts
+    for context in (precheck_context, handler_context):
+        assert (context.credentials_key, context.settings) == (None, None)

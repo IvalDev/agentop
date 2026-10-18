@@ -11,9 +11,11 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import SecretStr
 from sqlalchemy import update
 
 from app.core.config import Settings
+from app.core.crypto import generate_credentials_key
 from app.core.db import Database
 from app.main import create_app
 from app.modules.approvals.models import ApprovalRequest
@@ -368,3 +370,36 @@ async def test_precheck_refusal_at_execution_answers_failed_with_app_services(
     [context] = tiered_tools.precheck.contexts
     assert context.llm is approvals_app.state.llm
     assert context.storage is approvals_app.state.storage
+
+
+async def test_execute_forwards_the_app_credentials_key_and_settings(
+    approvals_app: FastAPI,
+    approvals_client: AsyncClient,
+    seeded_db: Database,
+    seeded_users,
+    tiered_tools,
+) -> None:
+    """The route gives the tool the app's settings and their Fernet credentials key."""
+    credentials_key = generate_credentials_key()
+    settings = approvals_app.state.settings.model_copy(
+        update={"credentials_key": SecretStr(credentials_key)}
+    )
+    approvals_app.state.settings = settings
+    request_id = await _create(
+        seeded_db,
+        tiered_tools,
+        seeded_users["owner@acme.test"],
+        approve_at=datetime.now(UTC),
+        tool="route_note",
+    )
+    headers = await _owner(approvals_client)
+
+    executed = await approvals_client.post(f"{BASE}/{request_id}/execute", headers=headers)
+
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "executed"
+    [precheck_context] = tiered_tools.precheck.contexts
+    [handler_context] = tiered_tools.spy.contexts
+    for context in (precheck_context, handler_context):
+        assert context.credentials_key == credentials_key
+        assert context.settings is settings

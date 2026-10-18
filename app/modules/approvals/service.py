@@ -465,6 +465,8 @@ async def execute_approved_action(
     now: datetime | None = None,
     llm: LLMProvider | None = None,
     storage: DocumentStorage | None = None,
+    credentials_key: str | None = None,
+    settings: Settings | None = None,
 ) -> ApprovalExecution:
     """Run an approved request's stored call at most once (commits).
 
@@ -477,7 +479,9 @@ async def execute_approved_action(
     Then an atomic ``approved → executing`` claim is committed (a loser of a
     race gets :class:`ApprovalStateError`), ``execute_tool`` runs the stored
     payload with a freshly minted single-use grant (and ``llm``/``storage``
-    in the tool context) gated by the tenant's *current* module activations
+    plus ``credentials_key``/``settings`` in the tool context — without the
+    key, a tool decrypting per-user provider credentials fails its precheck
+    closed) gated by the tenant's *current* module activations
     (re-read with ``active_module_keys`` once per execution: a tool of a
     module deactivated since the approval is refused there as
     ``inactive_module``), and the request ends ``executed`` (with the
@@ -532,6 +536,8 @@ async def execute_approved_action(
         llm=llm,
         storage=storage,
         active_modules=active_modules,
+        credentials_key=credentials_key,
+        settings=settings,
     )
     if result.status == "ok":
         outcome = {
