@@ -14,8 +14,9 @@ Contract of a provider:
 
 - it receives a :class:`ScopeOptionsContext` (the caller's principal, the
   request session, the module key, the credentials key, and the settings)
-  and answers :class:`ScopeOptions` — the option values to render plus the
-  ``exclusive`` flag when the step accepts exactly one choice;
+  and answers :class:`ScopeOptions` — the option values to render, their
+  optional display ``labels``, plus the ``exclusive`` flag when the step
+  accepts exactly one choice;
 - it raises :class:`ScopeOptionsError` when the options cannot be produced
   (no stored connection, dead tokens, provider outage). The engine maps
   that — and any unexpected raise — to a fail-closed error state: the
@@ -24,8 +25,8 @@ Contract of a provider:
   the decrypted credentials it can reach through the session.
 """
 
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass, field
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,12 +59,17 @@ class ScopeOptions:
 
     ``options`` are the choice values the renderer offers and the engine
     validates answers against (replacing ``manifest.permissions``).
-    ``exclusive`` enforces exactly one choice — the google-mail MVP is
-    whole-mailbox OR one label.
+    ``labels`` maps a value to its human-readable display label (e.g. a
+    Gmail label id to the label's name); it is display only — answers are
+    always validated and persisted as the values — and a value without a
+    non-empty label shows the value itself (labels for values not offered
+    are dropped by the engine). ``exclusive`` enforces exactly one choice —
+    the google-mail MVP is whole-mailbox OR one label.
     """
 
     options: tuple[str, ...]
     exclusive: bool = False
+    labels: Mapping[str, str] = field(default_factory=dict)
 
 
 class ScopeOptionsError(Exception):

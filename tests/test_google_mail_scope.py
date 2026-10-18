@@ -274,6 +274,57 @@ async def test_scope_options_are_all_then_inbox_then_user_labels(
     assert captured["access_token"] == ACCESS_TOKEN
 
 
+async def test_scope_options_label_every_choice_with_a_display_name(
+    seeded_db: Database, oauth_key: str, google_settings: Settings
+) -> None:
+    """Fixed names for ALL/INBOX, the Gmail name for user labels; ids stay the values."""
+    await _store_connection(seeded_db, oauth_key, _fresh_blob())
+    _register_fake_provider()
+
+    async with seeded_db.sessionmaker() as session:
+        options = await google_mail_scope_options(_context(session, oauth_key, google_settings))
+
+    assert dict(options.labels) == {
+        ALL_SCOPE: "All mail",
+        "INBOX": "Inbox",
+        "Label_7": "Asistente",
+        "Label_9": "Facturas",
+    }
+
+
+async def test_scope_options_keep_inbox_named_and_unnamed_labels_unlabeled(
+    seeded_db: Database, oauth_key: str, google_settings: Settings
+) -> None:
+    """The real API names system labels by their id; nameless user labels show the id.
+
+    System labels other than INBOX stay unselectable (no widening), and a
+    user label without a usable ``name`` gets no display label, so the
+    renderer falls back to its id.
+    """
+    await _store_connection(seeded_db, oauth_key, _fresh_blob())
+    _register_fake_provider(
+        labels=[
+            {"id": "INBOX", "name": "INBOX", "type": "system"},
+            {"id": "TRASH", "name": "TRASH", "type": "system"},
+            {"id": "SPAM", "name": "SPAM", "type": "system"},
+            {"id": "Label_3", "type": "user"},
+            {"id": "Label_4", "name": "", "type": "user"},
+            {"id": "Label_5", "name": 5, "type": "user"},
+            {"id": "Label_6", "name": "Clientes/Activos", "type": "user"},
+        ]
+    )
+
+    async with seeded_db.sessionmaker() as session:
+        options = await google_mail_scope_options(_context(session, oauth_key, google_settings))
+
+    assert options.options == (ALL_SCOPE, "INBOX", "Label_3", "Label_4", "Label_5", "Label_6")
+    assert dict(options.labels) == {
+        ALL_SCOPE: "All mail",
+        "INBOX": "Inbox",
+        "Label_6": "Clientes/Activos",
+    }
+
+
 async def test_scope_options_without_a_connection_raise(
     seeded_db: Database, oauth_key: str
 ) -> None:

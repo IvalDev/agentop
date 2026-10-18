@@ -7,7 +7,9 @@ Two halves of one contract:
   ``select_scope`` step's choices from the user's REAL Gmail labels
   (``users.labelsList`` over the stored connection's access token): a fixed
   ``ALL`` option, the system label ``INBOX``, then the user's own labels in
-  API order, exactly one choice (MVP: whole mailbox OR one label). It
+  API order, exactly one choice (MVP: whole mailbox OR one label), each
+  with its display label (``ALL``/``INBOX`` by their fixed names, a user
+  label by its Gmail ``name``). It
   mirrors the calendar tools' token precheck: newest connection wins, an
   expired access token is refreshed through the oauth service and the new
   blob is persisted on the same connection, and every unusable situation —
@@ -23,10 +25,14 @@ Two halves of one contract:
   selection, a malformed/multiple selection, or a connection whose secret
   was destroyed (revoked).
 
-Option values are the opaque strings the contract carries: ``ALL``, the
-label id ``INBOX``, and user label ids (``Label_7``). Display names are not
-part of the contract (the renderer shows the raw value today); the accessor
-translates the two known names for the agent's spoken output.
+Option values are the opaque strings the contract carries and persists:
+``ALL``, the label id ``INBOX``, and user label ids (``Label_7``). Display
+names ride beside them as :attr:`ScopeOptions.labels` (G4, display only):
+the fixed :data:`_SCOPE_NAMES` for ``ALL``/``INBOX`` — the API names system
+labels by their id, so its ``INBOX`` name is never shown — and the Gmail
+``name`` of each user label as-is (a label without a usable name gets no
+display label, so the renderer shows its id). The accessor reuses the same
+fixed names for the agent's spoken output.
 """
 
 import json
@@ -72,7 +78,7 @@ INBOX_SCOPE = "INBOX"
 #: Same refresh skew the calendar precheck uses (never refresh a live token).
 EXPIRY_SKEW_SECONDS = 60
 
-#: Display names for the two known choices (the agent's spoken output).
+#: Display names for the two fixed choices (the scope picker and the agent's output).
 _SCOPE_NAMES = {ALL_SCOPE: "All mail", INBOX_SCOPE: "Inbox"}
 
 
@@ -204,12 +210,15 @@ async def _refresh_and_persist(
 def _build_options(labels: Any) -> ScopeOptions:
     """Fold the provider's label list into the exclusive choice tuple.
 
-    ``ALL`` then ``INBOX`` are fixed; only ``type == "user"`` labels follow,
-    in API order, deduplicated against what is already offered. Anything
-    malformed in the list is skipped — a malformed answer as a whole (not a
-    list) is the caller's fail-closed case, not this fold.
+    ``ALL`` then ``INBOX`` are fixed (named by :data:`_SCOPE_NAMES`); only
+    ``type == "user"`` labels follow, in API order, deduplicated against
+    what is already offered, each named by its non-empty Gmail ``name``
+    (no usable name: no display label, the id shows). Anything malformed in
+    the list is skipped — a malformed answer as a whole (not a list) is the
+    caller's fail-closed case, not this fold.
     """
     options: list[str] = [ALL_SCOPE, INBOX_SCOPE]
+    names: dict[str, str] = dict(_SCOPE_NAMES)
     if isinstance(labels, list):
         for label in labels:
             if not isinstance(label, dict) or label.get("type") != "user":
@@ -217,7 +226,10 @@ def _build_options(labels: Any) -> ScopeOptions:
             label_id = label.get("id")
             if isinstance(label_id, str) and label_id and label_id not in options:
                 options.append(label_id)
-    return ScopeOptions(options=tuple(options), exclusive=True)
+                name = label.get("name")
+                if isinstance(name, str) and name:
+                    names[label_id] = name
+    return ScopeOptions(options=tuple(options), exclusive=True, labels=names)
 
 
 async def google_mail_scope_options(context: ScopeOptionsContext) -> ScopeOptions:

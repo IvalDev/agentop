@@ -161,8 +161,29 @@ async def test_scope_select_renders_registered_dynamic_options(
             "secret": False,
             "help_text": "",
             "options": ["choice.x", "choice.y"],
+            "option_labels": {},
         }
     ]
+
+
+async def test_scope_select_renders_provider_labels_for_offered_values_only(
+    dynamic_client: AsyncClient,
+) -> None:
+    """Display labels ride beside the values; stale or blank labels are dropped."""
+    headers = await _headers(dynamic_client)
+    await _activate(dynamic_client, headers)
+    _register(
+        ScopeOptions(
+            options=("choice.x", "choice.y", "choice.z"),
+            labels={"choice.x": "Choice X", "choice.y": "", "stale.w": "Not offered"},
+        )
+    )
+
+    response = await dynamic_client.get(f"{BASE}/{DYNAMIC}", headers=headers)
+
+    field = response.json()["step"]["fields"][0]
+    assert field["options"] == ["choice.x", "choice.y", "choice.z"]
+    assert field["option_labels"] == {"choice.x": "Choice X"}
 
 
 async def test_scope_options_failure_renders_an_actionable_error_state(
@@ -178,6 +199,7 @@ async def test_scope_options_failure_renders_an_actionable_error_state(
     assert response.status_code == 200
     field = response.json()["step"]["fields"][0]
     assert field["options"] == []
+    assert field["option_labels"] == {}
     assert field["help_text"] == UNAVAILABLE
     assert "token" not in response.text
 
@@ -241,6 +263,30 @@ async def test_submit_rejects_a_static_permission_not_in_the_dynamic_options(
     )
 
     assert response.status_code == 422
+
+
+async def test_submit_validates_values_never_display_labels(
+    dynamic_client: AsyncClient,
+) -> None:
+    """Labels are display only: the allowlist stays the option values."""
+    headers = await _headers(dynamic_client)
+    await _activate(dynamic_client, headers)
+    _register(ScopeOptions(options=("choice.x",), labels={"choice.x": "Choice X"}))
+
+    by_label = await dynamic_client.post(
+        f"{BASE}/{DYNAMIC}/steps/pick",
+        json={"answers": {"scopes": ["Choice X"]}},
+        headers=headers,
+    )
+    by_value = await dynamic_client.post(
+        f"{BASE}/{DYNAMIC}/steps/pick",
+        json={"answers": {"scopes": ["choice.x"]}},
+        headers=headers,
+    )
+
+    assert by_label.status_code == 422
+    assert by_value.status_code == 200, by_value.text
+    assert by_value.json()["data"] == {"scopes": ["choice.x"]}
 
 
 async def test_exclusive_provider_enforces_exactly_one_choice(
@@ -310,6 +356,7 @@ async def test_without_a_registered_provider_the_static_contract_stays(
     )
 
     assert get_response.json()["step"]["fields"][0]["options"] == list(PERMISSIONS)
+    assert get_response.json()["step"]["fields"][0]["option_labels"] == {}
     assert rejected.status_code == 422
     assert accepted.status_code == 200, accepted.text
     assert accepted.json()["current_step"] == "verify"

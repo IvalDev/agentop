@@ -23,6 +23,7 @@ interface FieldBody {
   secret: boolean;
   help_text?: string;
   options?: string[];
+  option_labels?: Record<string, string>;
 }
 
 interface StepBody {
@@ -40,7 +41,7 @@ function stepFixture(fields: Partial<StepBody> & Pick<StepBody, 'key' | 'type'>)
     description: 'Descripción del paso de prueba.',
     ...rest,
     // The API always serialises the field defaults, so the fixtures do too.
-    fields: (rawFields ?? []).map((field) => ({ help_text: '', options: [], ...field })),
+    fields: (rawFields ?? []).map((field) => ({ help_text: '', options: [], option_labels: {}, ...field })),
   };
 }
 
@@ -194,7 +195,15 @@ describe('OnboardingPage: the generic step renderer', () => {
           help_text: 'El ID de la aplicación.',
         },
         { key: 'client_secret', label: 'Secreto', type: 'text', required: true, secret: true },
-        { key: 'region', label: 'Región', type: 'select', required: false, secret: false, options: ['eu', 'us'] },
+        {
+          key: 'region',
+          label: 'Región',
+          type: 'select',
+          required: false,
+          secret: false,
+          options: ['eu', 'us'],
+          option_labels: { eu: 'Europa', us: 'Estados Unidos' },
+        },
       ],
     });
     const { user, fetchMock } = await openWizard({
@@ -205,6 +214,8 @@ describe('OnboardingPage: the generic step renderer', () => {
     expect(screen.getByLabelText('Secreto')).toHaveAttribute('type', 'password');
     expect(screen.getByLabelText('Identificador')).toHaveAttribute('type', 'text');
     expect(screen.getByRole('combobox', { name: 'Región' })).toBeInTheDocument();
+    // A select shows the display label and keeps the value as the answer.
+    expect(screen.getByRole('option', { name: 'Estados Unidos' })).toHaveValue('us');
     expect(screen.getByText('El ID de la aplicación.')).toBeInTheDocument();
 
     await user.type(screen.getByLabelText('Identificador'), 'app-1');
@@ -279,6 +290,8 @@ describe('OnboardingPage: the generic step renderer', () => {
 
     const boxes = screen.getAllByRole('checkbox');
     expect(boxes).toHaveLength(2);
+    // Without display labels the option values are shown as-is.
+    expect(screen.getByRole('checkbox', { name: 'calendar.events' })).toBeInTheDocument();
     await user.click(boxes[0]!);
     await user.click(boxes[1]!);
     await user.click(screen.getByRole('button', { name: 'Guardar y continuar' }));
@@ -287,6 +300,42 @@ describe('OnboardingPage: the generic step renderer', () => {
     expect(postedBody(fetchMock)).toEqual({
       answers: { scopes: ['calendar.events', 'calendar.readonly'] },
     });
+  });
+
+  it('names scope_select choices by their display labels and submits the opaque values', { timeout: AXE_TEST_TIMEOUT_MS }, async () => {
+    const scopeStep = stepFixture({
+      key: 'pick_scopes',
+      type: 'scope_select',
+      title: 'Choose the mailbox scope',
+      description: 'Read the whole mailbox or only one of its labels.',
+      fields: [
+        {
+          key: 'scopes',
+          label: 'Scopes',
+          type: 'select',
+          required: true,
+          secret: false,
+          options: ['ALL', 'INBOX', 'Label_7', 'Label_9'],
+          // Label_9 has no display label: it falls back to its value.
+          option_labels: { ALL: 'All mail', INBOX: 'Inbox', Label_7: 'Asistente' },
+        },
+      ],
+    });
+    const { user, fetchMock } = await openWizard({
+      [STATE]: stateReply(stateFixture({ current_step: 'pick_scopes', step: scopeStep })),
+      [SUBMIT_SCOPES]: stateReply(COMPLETED),
+    });
+
+    const names = screen.getAllByRole('checkbox').map((box) => box.closest('label')?.textContent?.trim());
+    expect(names).toEqual(['All mail', 'Inbox', 'Asistente', 'Label_9']);
+    expect(screen.queryByRole('checkbox', { name: 'Label_7' })).not.toBeInTheDocument();
+    await expectNoAxeViolations();
+
+    await user.click(screen.getByRole('checkbox', { name: 'Asistente' }));
+    await user.click(screen.getByRole('button', { name: 'Guardar y continuar' }));
+
+    await screen.findByRole('heading', { level: 2, name: 'Configuración completada' });
+    expect(postedBody(fetchMock)).toEqual({ answers: { scopes: ['Label_7'] } });
   });
 
   it('offers a confirmed restart from the completed view and lands on the first step again', async () => {

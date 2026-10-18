@@ -51,9 +51,13 @@ style as the tester registry). When one is registered for the module, the
 engine invokes it — with the caller's principal, the request session, the
 credentials key, and the settings — every time it renders or validates the
 step, and the returned options replace the static allowlist (``exclusive``
-additionally enforces exactly one choice). A provider failure fails closed
-on both paths, never as a 500: the rendered step keeps answering 200 with
-an empty option list plus one fixed actionable ``help_text``, and a submit
+additionally enforces exactly one choice). The provider may also name its
+values (``labels``, e.g. a Gmail label id → the label's name): the view
+carries those display labels beside the step (``option_labels``) while
+answers keep being validated and persisted as the values. A provider
+failure fails closed on both paths, never as a 500: the rendered step keeps
+answering 200 with an empty option list plus one fixed actionable
+``help_text``, and a submit
 is refused with :class:`ScopeOptionsUnavailableError` (router: 409, the
 same fixed message). No provider registered = zero behavior change.
 
@@ -119,6 +123,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from typing import Any
 
@@ -199,6 +204,9 @@ class OnboardingViewState:
     a generic renderer — ``scope_select`` carries its synthesized ``scopes``
     field), or ``None`` when the flow is completed. ``data`` holds the
     non-secret answers only; secrets have no place in this view at all.
+    ``option_labels`` maps a field key to the display labels of its option
+    values (only a dynamic ``scope_select`` carries any today); an option
+    without an entry is displayed as its value.
     """
 
     module_key: str
@@ -208,6 +216,7 @@ class OnboardingViewState:
     data: dict[str, Any]
     created_at: datetime | None
     updated_at: datetime | None
+    option_labels: Mapping[str, Mapping[str, str]] = dataclass_field(default_factory=dict)
 
 
 def _is_secret(field: FieldSpec) -> bool:
@@ -267,6 +276,29 @@ def _step_definition(
         if fields != step.fields:
             return replace(step, fields=fields)
     return step
+
+
+def _option_labels(
+    step: StepSpec,
+    *,
+    scope_options: ScopeOptions | None = None,
+    scope_options_error: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Display labels of ``step``'s option values, keyed by field key.
+
+    Only a dynamic ``scope_select`` has them: the provider's ``labels``
+    restricted to the values it actually offers, non-empty strings only
+    (a stale or blank label never reaches the renderer). Static options and
+    a failed provider carry none — the renderer then shows the values.
+    """
+    if step.type != "scope_select" or scope_options is None or scope_options_error is not None:
+        return {}
+    labels: dict[str, str] = {}
+    for value in scope_options.options:
+        label = scope_options.labels.get(value)
+        if isinstance(label, str) and label:
+            labels[value] = label
+    return {"scopes": labels} if labels else {}
 
 
 def _find_step(manifest: ModuleManifest, step_key: str) -> StepSpec:
@@ -598,6 +630,9 @@ def _view(
             data={},
             created_at=None,
             updated_at=None,
+            option_labels=_option_labels(
+                first, scope_options=scope_options, scope_options_error=scope_options_error
+            ),
         )
     if state.status is OnboardingStatus.COMPLETED or state.current_step is None:
         return OnboardingViewState(
@@ -620,6 +655,9 @@ def _view(
         data=dict(state.data or {}),
         created_at=state.created_at,
         updated_at=state.updated_at,
+        option_labels=_option_labels(
+            step, scope_options=scope_options, scope_options_error=scope_options_error
+        ),
     )
 
 

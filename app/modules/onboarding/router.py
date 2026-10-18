@@ -39,6 +39,7 @@ Audit (written in the service): ``onboarding.started`` /
 and nothing else: never answers, never secrets.
 """
 
+from collections.abc import Mapping
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -128,8 +129,14 @@ def _http_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=status_code, detail=detail)
 
 
-def _field_response(field: FieldSpec) -> OnboardingFieldResponse:
-    """Public view of one field (already synthesized for the renderer)."""
+def _field_response(
+    field: FieldSpec, option_labels: Mapping[str, str] | None = None
+) -> OnboardingFieldResponse:
+    """Public view of one field (already synthesized for the renderer).
+
+    ``option_labels`` are the display labels the engine resolved for the
+    field's option values (display only; answers stay the values).
+    """
     return OnboardingFieldResponse(
         key=field.key,
         label=field.label,
@@ -138,10 +145,13 @@ def _field_response(field: FieldSpec) -> OnboardingFieldResponse:
         secret=field.secret,
         help_text=field.help_text,
         options=list(field.options),
+        option_labels=dict(option_labels or {}),
     )
 
 
-def _step_response(step: StepSpec | None) -> OnboardingStepResponse | None:
+def _step_response(
+    step: StepSpec | None, option_labels: Mapping[str, Mapping[str, str]]
+) -> OnboardingStepResponse | None:
     """Public view of the current step's declarative definition (``None`` when done)."""
     if step is None:
         return None
@@ -150,7 +160,7 @@ def _step_response(step: StepSpec | None) -> OnboardingStepResponse | None:
         type=step.type,
         title=step.title,
         description=step.description,
-        fields=[_field_response(field) for field in step.fields],
+        fields=[_field_response(field, option_labels.get(field.key)) for field in step.fields],
     )
 
 
@@ -160,7 +170,7 @@ def _state_response(view: OnboardingViewState) -> OnboardingStateResponse:
         module_key=view.module_key,
         status=view.status.value,
         current_step=view.current_step,
-        step=_step_response(view.step),
+        step=_step_response(view.step, view.option_labels),
         data=dict(view.data),
         created_at=view.created_at,
         updated_at=view.updated_at,

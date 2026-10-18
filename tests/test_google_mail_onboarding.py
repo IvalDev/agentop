@@ -292,6 +292,12 @@ async def test_full_flow_persists_the_label_choice_and_completes(
     step = body["step"]
     assert step["type"] == "scope_select"
     assert step["fields"][0]["options"] == [ALL_SCOPE, "INBOX", "Label_7"]
+    # Readable names ride beside the opaque ids (G4); SENT is never offered.
+    assert step["fields"][0]["option_labels"] == {
+        ALL_SCOPE: "All mail",
+        "INBOX": "Inbox",
+        "Label_7": "Asistente",
+    }
     assert step["fields"][0]["help_text"] == ""
 
     # Choosing a user label advances to test_connection and persists the answer.
@@ -354,7 +360,7 @@ async def test_select_scope_rejects_oauth_scopes_and_double_choices(
     mail_client: AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """OAuth permissions are not mailbox scopes; exclusive means exactly one."""
+    """OAuth permissions and label names are not mailbox scopes; exactly one id."""
     _register_fakes()
     headers = await _headers(mail_client)
     await _activate(mail_client, headers)
@@ -371,8 +377,16 @@ async def test_select_scope_rejects_oauth_scopes_and_double_choices(
         headers=headers,
     )
 
+    by_name = await mail_client.post(
+        f"{BASE}/{MODULE}/steps/select_scope",
+        json={"answers": {"scopes": ["Asistente"]}},
+        headers=headers,
+    )
+
     assert oauth_scope.status_code == 422
     assert double.status_code == 422
+    # The display name is not a value: only the label id is selectable.
+    assert by_name.status_code == 422
 
 
 # --- labels failure fails closed ---------------------------------------------
@@ -410,6 +424,7 @@ async def test_scope_step_without_a_connection_fails_closed(
     assert read.status_code == 200
     field = read.json()["step"]["fields"][0]
     assert field["options"] == []
+    assert field["option_labels"] == {}
     assert "reconnect" in field["help_text"]
     assert ACCESS_TOKEN not in read.text
     assert submit.status_code == 409
