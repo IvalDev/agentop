@@ -776,7 +776,21 @@ async def test_without_active_modules_there_is_no_module_gate(
 #: Acceptance criterion 5: every production tool is listed here on purpose, so
 #: adding one (and checking it exposes no shell, SQL, or filesystem) is a
 #: deliberate, reviewed change rather than a side effect of an import.
-BUILTIN_TOOL_ALLOWLIST = {"search_documents", "list_events", "create_event", "cancel_event"}
+#: calendar-mvp allowlist change, human-approved 2026-10-15; google-mail
+#: G1+G3 allowlist change, human-approved 2026-10-18 (six scoped Gmail
+#: tools: three free reads, three approval-gated actions).
+BUILTIN_TOOL_ALLOWLIST = {
+    "search_documents",
+    "list_events",
+    "create_event",
+    "cancel_event",
+    "search_emails",
+    "get_email",
+    "list_labels",
+    "send_email",
+    "archive_message",
+    "add_label",
+}
 
 #: Input field names that would hint at shell, SQL, or filesystem access.
 FORBIDDEN_INPUT_FIELDS = {"command", "cmd", "shell", "script", "sql", "path", "file_path"}

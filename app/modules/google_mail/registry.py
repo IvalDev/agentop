@@ -14,14 +14,17 @@ Entry points:
 - :func:`register_default_google_mail` — the production wiring: ``app.main``
   executes it once at import time (reviewed google-mail allowlist change);
   a second call raises ``ModuleRegistrationError``. It ALSO registers the
-  module's scope options provider — the production wiring of G2, folded
-  here because ``app.main`` itself is an untouched allowlist file (the
-  manifest duplicate raises first, so a second call stays a duplicate);
+  module's scope options provider (G2) AND the six chat tools on the
+  process-wide tool registry (G3) — both folds live here because the
+  reviewed ``app.main`` block calls this function once and its own comment
+  points here (the manifest duplicate raises first, so a second call stays
+  a duplicate);
 - :func:`register_google_mail_provider` / :func:`register_google_mail_tester`
-  / :func:`register_google_mail_scope_options` — wire the process-wide
-  provider, tester, and scope options registries the same explicit way;
+  / :func:`register_google_mail_scope_options` /
+  :func:`register_google_mail_tools` — wire the process-wide provider,
+  tester, scope options, and tool registries the same explicit way;
   ``app.main`` calls the first two once at import and the tests call all
-  three explicitly, importing this module alone stays free of side effects.
+  four explicitly, importing this module alone stays free of side effects.
 
 Everything here is import-safe: module imports perform **no** registration.
 """
@@ -32,8 +35,10 @@ from app.modules.google_mail.manifest import GOOGLE_MAIL_MANIFEST
 from app.modules.google_mail.provider import GoogleGmailProvider, register_provider
 from app.modules.google_mail.scope import google_mail_scope_options
 from app.modules.google_mail.testers import google_mail_connection_tester
+from app.modules.google_mail.tools import register_google_mail_tools
 from app.modules.onboarding.options import register_scope_options_provider
 from app.modules.onboarding.testers import register_tester
+from app.modules.tools.registry import default_registry as tool_default_registry
 
 
 def register_google_mail(catalog: ModuleCatalog) -> ModuleManifest:
@@ -48,18 +53,19 @@ def register_google_mail(catalog: ModuleCatalog) -> ModuleManifest:
 
 
 def register_default_google_mail() -> ModuleManifest:
-    """Register google_mail on the process-wide default catalog (production).
+    """Register google_mail on the process-wide default catalog and registries (production).
 
     Executed exactly once by the production import graph (``app.main``, the
-    google-mail G1 allowlist change): a second call raises
-    ``ModuleRegistrationError``, which is the duplicate-registration contract.
-    The manifest registers FIRST (its duplicate raises before anything else
-    runs), then the G2 scope options provider — the production wiring of the
-    dynamic ``select_scope`` choices, folded in here because the reviewed
-    ``app.main`` allowlist file stays untouched in G2.
+    google-mail allowlist change): a second call raises
+    ``ModuleRegistrationError``, which is the duplicate-registration
+    contract. The manifest registers FIRST (its duplicate raises before
+    anything else runs), then the G2 scope options provider and the G3 chat
+    tools on the process-wide tool registry — both folds keep the reviewed
+    ``app.main`` block to a single call per concern.
     """
     manifest = register_default(GOOGLE_MAIL_MANIFEST)
     register_scope_options_provider("google_mail", google_mail_scope_options)
+    register_google_mail_tools(tool_default_registry)
     return manifest
 
 
@@ -99,4 +105,5 @@ __all__ = [
     "register_google_mail_provider",
     "register_google_mail_scope_options",
     "register_google_mail_tester",
+    "register_google_mail_tools",
 ]

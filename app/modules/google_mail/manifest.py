@@ -1,4 +1,4 @@
-"""Declarative manifest of the ``google_mail`` module (Gmail MVP, google-mail M1/G2).
+"""Declarative manifest of the ``google_mail`` module (Gmail MVP, google-mail M1–G3).
 
 Pure data, no side effects: importing this module registers nothing. The
 registration functions live in :mod:`app.modules.google_mail.registry`.
@@ -8,7 +8,9 @@ es-ES strings over these keys):
 
 - two OAuth scopes (M1): ``gmail.modify`` (read + modify within the
   connected mailbox) and ``gmail.send`` (send on the user's behalf);
-- no tools yet (G3 contributes the six read/action tools; names only then);
+- six tool names (G3): the three free reads ``search_emails``,
+  ``get_email``, ``list_labels`` and the three approval-gated actions
+  ``send_email``, ``archive_message``, ``add_label`` (no delete tool);
 - three onboarding steps (G2): ``connect_google`` (``redirect`` — the OAuth
   flow of :mod:`app.modules.oauth`), ``select_scope`` (``scope_select`` —
   whole mailbox vs. one label; its choices are dynamic, fetched from the
@@ -16,8 +18,9 @@ es-ES strings over these keys):
   provider), then ``test_connection`` (verifies the stored tokens through
   the registered tester);
 - an agent profile (agent-engine-routing): how the engine router sends
-  Gmail requests to the mail engine and the minimal instructions G3 extends
-  once the tools exist.
+  Gmail requests to the mail engine, the scope semantics (whole mailbox vs
+  one label), and that every action runs only after the user confirmed it
+  (criterion 4) while reading stays free inside the scope.
 """
 
 from app.modules.catalog.manifest import AgentProfile, ModuleManifest, StepSpec
@@ -26,8 +29,17 @@ from app.modules.catalog.manifest import AgentProfile, ModuleManifest, StepSpec
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
-#: How the chat agent's mail engine is routed and instructed (minimal in G1;
-#: G3 extends the instructions for the concrete tools).
+#: The six chat tools the module contributes (G3: reads free, actions gated).
+GOOGLE_MAIL_TOOLS = (
+    "search_emails",
+    "get_email",
+    "list_labels",
+    "send_email",
+    "archive_message",
+    "add_label",
+)
+
+#: How the chat agent's mail engine is routed and instructed (G3 completes it).
 GOOGLE_MAIL_AGENT_PROFILE = AgentProfile(
     routing_description=(
         "The user's own email in Gmail: finding and reading messages inside the "
@@ -37,8 +49,18 @@ GOOGLE_MAIL_AGENT_PROFILE = AgentProfile(
     instructions="""\
 - Use only the Gmail tools, never the knowledge base.
 - Never invent emails, senders, or threads: report only what the tools returned.
-- Reading stays inside the mailbox scope the user chose; any action (send, archive, \
-label) runs only after the user confirmed it.
+- Reading (search_emails, get_email, list_labels) needs no confirmation and stays inside \
+the mailbox scope the user chose: with "All mail" you may search and read every message; \
+with one label, search_emails only returns messages under that label and get_email is \
+refused for messages outside it. search_emails returns message and thread ids: read a \
+message with get_email before describing it. list_labels shows the mailbox's labels.
+- Actions (send_email, archive_message, add_label) always wait for the user's approval \
+and run only after the user confirmed it — never claim an action happened before the \
+tool reports success. archive_message and add_label only act on messages inside the \
+scope; send_email is not restricted by the scope.
+- To reply inside a thread, pass the thread id to send_email.
+- You cannot delete or trash email: no tool does it, and add_label refuses TRASH and SPAM.
+- Confirm what was done, and report an out-of-scope refusal as the tool explained it.
 """,
 )
 
@@ -49,7 +71,7 @@ GOOGLE_MAIL_MANIFEST = ModuleManifest(
     description="Read and manage email on the user's connected Gmail account.",
     version="0.1.0",
     permissions=(GMAIL_MODIFY_SCOPE, GMAIL_SEND_SCOPE),
-    tools=(),
+    tools=GOOGLE_MAIL_TOOLS,
     onboarding=(
         StepSpec(
             key="connect_google",

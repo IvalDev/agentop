@@ -55,10 +55,12 @@ register_google_provider()
 register_calendar_tester()
 register_calendar_tools(default_registry)
 
-# Google Mail module wiring (reviewed allowlist entries, google-mail G1,
+# Google Mail module wiring (reviewed allowlist entries, google-mail G1–G3,
 # 2026-10-18): register the manifest on the process-wide catalog, plus the
-# Gmail provider factory and the connection tester. The chat tools arrive
-# with G3. Runs once at import time, like the calendar wiring above.
+# Gmail provider factory and the connection tester. The six chat tools are
+# folded into register_default_google_mail (G3), which registers them on the
+# process-wide tool registry. Runs once at import time, like the calendar
+# wiring above.
 register_default_google_mail()
 register_google_mail_provider()
 register_google_mail_tester()

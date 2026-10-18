@@ -1,0 +1,1351 @@
+"""Google Mail chat tools (G3): specs, validation, precheck, scope, approval.
+
+Contract under test (google-mail M3 / acceptance criteria 3–5):
+
+- six ToolSpecs on a LOCAL registry via ``register_google_mail_tools`` —
+  never ``default_registry`` directly (the production fold is asserted by
+  the executor allowlist and the manifest tests);
+- ``search_emails``, ``get_email``, and ``list_labels`` are EXTRACT /
+  viewer with ``ALLOW_WITHOUT_APPROVAL`` (reading needs no confirmation);
+  ``send_email``, ``archive_message``, and ``add_label`` are ACTION /
+  operator with ``REQUIRE_APPROVAL``: without an approval grant the
+  executor stops at ``approval_required`` and the Gmail provider is never
+  called; with a minted grant the handler runs (criterion 4);
+- every tool's precheck requires the persisted mailbox scope
+  (``get_effective_scope``) — no connection, no selection, or an
+  unreadable blob is one actionable ``NOT_CONFIGURED`` reason; an expired
+  access token is refreshed on demand and persisted (criterion 5);
+- app-side scope enforcement (criterion 3, risk #2): ``search_emails``
+  always filters by ``labelIds=[selection]`` unless the scope is ``ALL``;
+  ``get_email``, ``archive_message``, and ``add_label`` deny a message
+  whose ``labelIds`` do not contain the selected label with the actionable
+  ``OUT_OF_SCOPE`` reason (a precheck refusal: the executor surfaces it as
+  ``precheck_failed`` before any handler or approval path runs);
+  ``send_email`` is exempt from the label check (a new message belongs to
+  no folder) but ALWAYS requires approval;
+- there is no delete/trash tool, ever.
+"""
+
+import base64
+import json
+import time
+from email import message_from_bytes
+from email.policy import default
+from typing import Any
+from uuid import uuid4
+
+import pytest
+from pydantic import SecretStr
+from sqlalchemy import select
+
+from app.core.config import Settings
+from app.core.crypto import decrypt_credentials, encrypt_credentials, generate_credentials_key
+from app.core.db import Database
+from app.modules.approvals.grants import mint_grant
+from app.modules.approvals.service import (
+    approve_request,
+    create_approval_request,
+    execute_approved_action,
+)
+from app.modules.catalog.models import ModuleActivation
+from app.modules.connections.models import ConnectionStatus, UserConnection
+from app.modules.google_mail.provider import (
+    GmailAuthenticationError,
+    GmailProviderError,
+    provider_registry,
+    register_provider,
+)
+from app.modules.google_mail.scope import ALL_SCOPE
+from app.modules.google_mail.tools import (
+    EXPIRED,
+    NOT_CONFIGURED,
+    OUT_OF_SCOPE,
+    AddLabelInput,
+    ArchiveMessageInput,
+    SendEmailInput,
+    register_google_mail_tools,
+)
+from app.modules.identity.deps import CurrentUser
+from app.modules.identity.models import UserRole
+from app.modules.oauth import service as oauth_service
+from app.modules.onboarding.models import OnboardingState, OnboardingStatus
+from app.modules.tools.exceptions import ToolPrecheckError
+from app.modules.tools.executor import compute_action_key, execute_tool
+from app.modules.tools.registry import (
+    ApprovalPolicy,
+    ToolKind,
+    ToolRegistry,
+)
+
+JWT_SECRET = "test-secret-0123456789-abcdefghijklmnop"
+OWNER = "owner@acme.test"
+ADMIN = "admin@acme.test"
+VIEWER = "viewer@acme.test"
+
+SEARCH_INPUT: dict[str, Any] = {"query": "invoice", "max_results": 5}
+GET_INPUT: dict[str, Any] = {"message_id": "m1"}
+SEND_INPUT: dict[str, Any] = {
+    "to": ["ana@example.com"],
+    "subject": "Hola",
+    "body": "¿Cómo estás?",
+}
+ARCHIVE_INPUT: dict[str, Any] = {"message_id": "m1"}
+ADD_LABEL_INPUT: dict[str, Any] = {"message_id": "m1", "label_id": "Label_9"}
+
+READ_TOOLS_AND_INPUTS = [
+    ("search_emails", SEARCH_INPUT),
+    ("get_email", GET_INPUT),
+    ("list_labels", {}),
+]
+ACTION_TOOLS_AND_INPUTS = [
+    ("send_email", SEND_INPUT),
+    ("archive_message", ARCHIVE_INPUT),
+    ("add_label", ADD_LABEL_INPUT),
+]
+ALL_TOOLS_AND_INPUTS = READ_TOOLS_AND_INPUTS + ACTION_TOOLS_AND_INPUTS
+
+#: A full Gmail message resource (``format=full``) inside INBOX + Label_7.
+IN_SCOPE_MESSAGE: dict[str, Any] = {
+    "id": "m1",
+    "threadId": "t-1",
+    "labelIds": ["INBOX", "Label_7"],
+    "snippet": "Please pay invoice 42.",
+    "payload": {
+        "mimeType": "text/plain",
+        "headers": [
+            {"name": "From", "value": "ana@example.com"},
+            {"name": "To", "value": "me@acme.test"},
+            {"name": "Subject", "value": "Invoice 42"},
+            {"name": "Date", "value": "Fri, 16 Oct 2026 10:00:00 +0200"},
+        ],
+        "body": {"data": base64.urlsafe_b64encode(b"Please pay invoice 42.").decode("ascii")},
+    },
+}
+
+#: Same shape, but only under a label outside the ``Label_7`` scope.
+OUT_OF_SCOPE_MESSAGE: dict[str, Any] = {
+    **IN_SCOPE_MESSAGE,
+    "labelIds": ["INBOX"],
+}
+
+
+@pytest.fixture(autouse=True)
+def _clean_provider_registry() -> Any:
+    """The process-wide Gmail provider registry starts and ends empty per test."""
+    provider_registry.clear()
+    yield
+    provider_registry.clear()
+
+
+@pytest.fixture
+def oauth_key() -> str:
+    return generate_credentials_key()
+
+
+@pytest.fixture
+def mail_registry() -> ToolRegistry:
+    """A LOCAL registry holding the six google_mail tools (never the default)."""
+    registry = ToolRegistry()
+    register_google_mail_tools(registry)
+    return registry
+
+
+@pytest.fixture
+def mail_settings(oauth_key: str) -> Settings:
+    """Settings carrying the encryption key plus Google client credentials."""
+    return Settings(
+        jwt_secret=JWT_SECRET,
+        credentials_key=oauth_key,
+        google_client_id=SecretStr("gid"),
+        google_client_secret=SecretStr("gsecret"),
+    )
+
+
+class FakeGmail:
+    """In-memory GmailProvider factory double.
+
+    Records every constructed provider's access token and every call. With
+    ``explode=True`` the factory itself raises — tests use it to prove the
+    precheck never builds a provider.
+    """
+
+    def __init__(
+        self,
+        *,
+        listed: list[dict[str, Any]] | None = None,
+        message: dict[str, Any] | None = None,
+        sent: dict[str, Any] | None = None,
+        modified: dict[str, Any] | None = None,
+        labels: list[dict[str, Any]] | None = None,
+        list_error: Exception | None = None,
+        message_error: Exception | None = None,
+        send_error: Exception | None = None,
+        modify_error: Exception | None = None,
+        explode: bool = False,
+    ) -> None:
+        self.explode = explode
+        self.listed = listed if listed is not None else []
+        self.message = message if message is not None else IN_SCOPE_MESSAGE
+        self.sent = sent if sent is not None else {"id": "sent-1", "threadId": "t-9"}
+        self.modified = modified if modified is not None else {"id": "m1"}
+        self.labels = (
+            labels
+            if labels is not None
+            else [
+                {"id": "INBOX", "name": "Inbox", "type": "system"},
+                {"id": "Label_7", "name": "Asistente", "type": "user"},
+            ]
+        )
+        self.list_error = list_error
+        self.message_error = message_error
+        self.send_error = send_error
+        self.modify_error = modify_error
+        self.access_tokens: list[str] = []
+        self.list_calls: list[dict[str, Any]] = []
+        self.get_calls: list[str] = []
+        self.send_calls: list[dict[str, Any]] = []
+        self.modify_calls: list[dict[str, Any]] = []
+
+    def __call__(self, *, access_token: str) -> "FakeGmailProvider":
+        if self.explode:
+            raise AssertionError("provider factory must not be called")
+        self.access_tokens.append(access_token)
+        return FakeGmailProvider(self)
+
+
+class FakeGmailProvider:
+    """Per-call provider handed out by :class:`FakeGmail`."""
+
+    def __init__(self, factory: FakeGmail) -> None:
+        self._factory = factory
+
+    async def get_profile(self) -> dict[str, Any]:
+        return {"emailAddress": "agent@acme.test"}
+
+    async def list_labels(self) -> list[dict[str, Any]]:
+        return list(self._factory.labels)
+
+    async def list_messages(self, **kwargs: Any) -> list[dict[str, Any]]:
+        self._factory.list_calls.append(kwargs)
+        if self._factory.list_error is not None:
+            raise self._factory.list_error
+        return list(self._factory.listed)
+
+    async def get_message(self, message_id: str) -> dict[str, Any]:
+        self._factory.get_calls.append(message_id)
+        if self._factory.message_error is not None:
+            raise self._factory.message_error
+        return dict(self._factory.message)
+
+    async def send_message(self, **kwargs: Any) -> dict[str, Any]:
+        self._factory.send_calls.append(kwargs)
+        if self._factory.send_error is not None:
+            raise self._factory.send_error
+        return dict(self._factory.sent)
+
+    async def modify_message(self, **kwargs: Any) -> dict[str, Any]:
+        self._factory.modify_calls.append(kwargs)
+        if self._factory.modify_error is not None:
+            raise self._factory.modify_error
+        return dict(self._factory.modified)
+
+
+def _blob(
+    *,
+    access_token: str = "ya29.stored",
+    refresh_token: str | None = "rt-1",
+    expires_at: int | None = None,
+) -> dict[str, Any]:
+    blob: dict[str, Any] = {
+        "access_token": access_token,
+        "scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+    }
+    if refresh_token is not None:
+        blob["refresh_token"] = refresh_token
+    if expires_at is not None:
+        blob["expires_at"] = expires_at
+    return blob
+
+
+async def seed_connection(
+    db: Database,
+    user: CurrentUser,
+    *,
+    key: str,
+    blob: dict[str, Any] | None = None,
+    with_blob: bool = True,
+) -> None:
+    """Insert the user's connected google_mail row with an encrypted blob."""
+    if blob is None:
+        blob = _blob()
+    encrypted = encrypt_credentials(key, json.dumps(blob)) if with_blob else None
+    async with db.sessionmaker() as session:
+        session.add(
+            UserConnection(
+                tenant_id=user.tenant_id,
+                user_id=user.id,
+                module_key="google_mail",
+                provider="google",
+                status=ConnectionStatus.CONNECTED,
+                credentials_encrypted=encrypted,
+            )
+        )
+        await session.commit()
+
+
+async def seed_scope(db: Database, user: CurrentUser, scope_id: str) -> None:
+    """Persist the completed onboarding state carrying the mailbox scope."""
+    async with db.sessionmaker() as session:
+        session.add(
+            OnboardingState(
+                tenant_id=user.tenant_id,
+                user_id=user.id,
+                module_key="google_mail",
+                status=OnboardingStatus.COMPLETED,
+                current_step=None,
+                data={"scopes": [scope_id]},
+                secrets_encrypted=None,
+            )
+        )
+        await session.commit()
+
+
+async def run_tool(
+    db: Database,
+    user: CurrentUser,
+    registry: ToolRegistry,
+    tool: str,
+    raw_input: dict[str, Any],
+    *,
+    credentials_key: str | None = None,
+    settings: Settings | None = None,
+    active_modules: set[str] | None = None,
+    approval_grant=None,
+):
+    """One ``execute_tool`` call on a fresh session (what the agent loop does)."""
+    async with db.sessionmaker() as session:
+        return await execute_tool(
+            registry,
+            session,
+            user,
+            tool,
+            raw_input,
+            credentials_key=credentials_key,
+            settings=settings,
+            active_modules=active_modules if active_modules is not None else {"google_mail"},
+            approval_grant=approval_grant,
+        )
+
+
+async def stored_blob(db: Database, user: CurrentUser, key: str) -> dict[str, Any]:
+    """Decrypt the user's stored google_mail credentials (test assertions only)."""
+    async with db.sessionmaker() as session:
+        row = (
+            await session.execute(
+                select(UserConnection).where(
+                    UserConnection.tenant_id == user.tenant_id,
+                    UserConnection.user_id == user.id,
+                    UserConnection.module_key == "google_mail",
+                )
+            )
+        ).scalar_one()
+        assert row.credentials_encrypted is not None
+        return json.loads(decrypt_credentials(key, row.credentials_encrypted))
+
+
+# --- Spec shapes and input validation ------------------------------------------
+
+
+def test_register_google_mail_tools_registers_six_specs_on_a_local_registry() -> None:
+    """Six tools: three free reads, three approval-gated actions. No delete tool."""
+    registry = ToolRegistry()
+
+    register_google_mail_tools(registry)
+
+    assert registry.names() == [
+        "search_emails",
+        "get_email",
+        "list_labels",
+        "send_email",
+        "archive_message",
+        "add_label",
+    ]
+    assert not any("delete" in name or "trash" in name for name in registry.names())
+
+
+def test_tool_specs_declare_module_roles_kinds_and_policies(mail_registry: ToolRegistry) -> None:
+    """Reads never ask for approval; every action is REQUIRE_APPROVAL (criterion 4)."""
+    for name in ("search_emails", "get_email", "list_labels"):
+        spec = mail_registry.get(name)
+        assert (spec.kind, spec.approval_policy, spec.required_role) == (
+            ToolKind.EXTRACT,
+            ApprovalPolicy.ALLOW_WITHOUT_APPROVAL,
+            UserRole.VIEWER,
+        )
+        assert spec.module == "google_mail"
+    for name in ("send_email", "archive_message", "add_label"):
+        spec = mail_registry.get(name)
+        assert (spec.kind, spec.approval_policy, spec.required_role) == (
+            ToolKind.ACTION,
+            ApprovalPolicy.REQUIRE_APPROVAL,
+            UserRole.OPERATOR,
+        )
+        assert spec.module == "google_mail"
+    assert all(spec.precheck is not None for spec in mail_registry.list_specs())
+
+
+@pytest.mark.parametrize(
+    "raw_input",
+    [
+        {"query": ""},
+        {"query": "invoice", "max_results": 0},
+        {"query": "invoice", "max_results": 51},
+        {"query": "invoice", "extra": "smuggled"},
+        {"message_id": ""},
+    ],
+)
+async def test_search_and_get_reject_invalid_input(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, raw_input: dict
+) -> None:
+    result = await run_tool(
+        seeded_db, seeded_users[OWNER], mail_registry, "search_emails", raw_input
+    )
+
+    assert (result.status, result.error_kind) == ("error", "validation")
+    assert result.error is not None and result.error.startswith("invalid input")
+
+
+@pytest.mark.parametrize(
+    "raw_input",
+    [
+        {},
+        {"to": []},
+        {"to": ["not-an-email"], "subject": "Hi", "body": "x"},
+        {"to": ["ana@example.com"], "subject": "", "body": "x"},
+        {"to": ["ana@example.com"], "subject": "Hi", "body": ""},
+        {**SEND_INPUT, "thread_id": ""},
+        {**SEND_INPUT, "cc": [""]},
+        {**SEND_INPUT, "bcc": [""]},
+        {**SEND_INPUT, "extra": 1},
+    ],
+)
+async def test_send_email_rejects_invalid_input(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, raw_input: dict
+) -> None:
+    result = await run_tool(seeded_db, seeded_users[OWNER], mail_registry, "send_email", raw_input)
+
+    assert (result.status, result.error_kind) == ("error", "validation")
+
+
+@pytest.mark.parametrize(
+    "raw_input",
+    [
+        {},
+        {"message_id": ""},
+        {"message_id": "m1", "extra": 1},
+        {"message_id": "m1", "label_id": ""},
+    ],
+)
+async def test_message_actions_reject_invalid_input(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, raw_input: dict
+) -> None:
+    tool = "archive_message" if "label_id" not in raw_input else "add_label"
+    result = await run_tool(seeded_db, seeded_users[OWNER], mail_registry, tool, raw_input)
+
+    assert (result.status, result.error_kind) == ("error", "validation")
+
+
+async def test_list_labels_rejects_extra_input(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry
+) -> None:
+    result = await run_tool(
+        seeded_db, seeded_users[OWNER], mail_registry, "list_labels", {"query": "x"}
+    )
+
+    assert (result.status, result.error_kind) == ("error", "validation")
+
+
+# --- Precheck matrix (criterion 5) ---------------------------------------------
+
+
+@pytest.mark.parametrize("label_id", ["TRASH", "SPAM", "trash"])
+async def test_add_label_refuses_trash_and_spam_labels(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, label_id
+) -> None:
+    """No delete/trash: applying TRASH or SPAM would trash the message (Gmail purges both)."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    register_provider("google", FakeGmail(explode=True))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "add_label",
+        {"message_id": "m1", "label_id": label_id},
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "validation")
+    assert result.error is not None and "label_id" in result.error
+
+
+@pytest.mark.parametrize(("tool", "raw_input"), ALL_TOOLS_AND_INPUTS)
+async def test_without_a_selection_prechecks_not_configured(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, tool, raw_input
+) -> None:
+    """No persisted scope selection (even with a connection) is NOT_CONFIGURED."""
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    register_provider("google", FakeGmail(explode=True))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        tool,
+        raw_input,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {NOT_CONFIGURED}"
+
+
+@pytest.mark.parametrize(("tool", "raw_input"), ALL_TOOLS_AND_INPUTS)
+async def test_without_a_connection_prechecks_not_configured(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, tool, raw_input
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    register_provider("google", FakeGmail(explode=True))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        tool,
+        raw_input,
+        credentials_key=oauth_key,
+    )
+
+    assert result.error == f"precheck_failed: {NOT_CONFIGURED}"
+
+
+async def test_row_without_credentials_blob_prechecks(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key, with_blob=False)
+    register_provider("google", FakeGmail(explode=True))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.error == f"precheck_failed: {NOT_CONFIGURED}"
+
+
+async def test_unreadable_blob_prechecks_without_leaking(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """A blob encrypted under another key is 'not configured', never a 500."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=generate_credentials_key())
+    register_provider("google", FakeGmail(explode=True))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {NOT_CONFIGURED}"
+    assert oauth_key not in (result.error or "")
+
+
+async def test_expired_token_refreshes_persists_and_runs(
+    seeded_db: Database,
+    seeded_users,
+    mail_registry: ToolRegistry,
+    oauth_key,
+    mail_settings,
+    monkeypatch,
+) -> None:
+    """An expired access token is refreshed and the new blob is stored (G2 path)."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(
+        seeded_db,
+        seeded_users[OWNER],
+        key=oauth_key,
+        blob=_blob(
+            access_token="ya29.old", refresh_token="rt-keep", expires_at=int(time.time()) - 120
+        ),
+    )
+    seen: dict[str, Any] = {}
+
+    async def fake_refresh(**kwargs: Any) -> oauth_service.OAuthTokens:
+        seen["kwargs"] = kwargs
+        return oauth_service.OAuthTokens(
+            access_token="ya29.new", refresh_token=None, expires_in=3600, scopes=()
+        )
+
+    monkeypatch.setattr(oauth_service, "refresh_access_token", fake_refresh)
+    fake = FakeGmail(listed=[{"id": "m2", "labelIds": ["INBOX"]}])
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+        settings=mail_settings,
+    )
+
+    assert result.status == "ok"
+    assert seen["kwargs"] == {
+        "refresh_token": "rt-keep",
+        "client_id": "gid",
+        "client_secret": "gsecret",
+    }
+    assert fake.access_tokens == ["ya29.new"]
+    blob = await stored_blob(seeded_db, seeded_users[OWNER], oauth_key)
+    assert blob["access_token"] == "ya29.new"
+    # Google may omit the refresh token on refresh: the stored one survives.
+    assert blob["refresh_token"] == "rt-keep"
+    assert blob["expires_at"] > time.time()
+
+
+@pytest.mark.parametrize(("tool", "raw_input"), ALL_TOOLS_AND_INPUTS)
+async def test_expired_token_refresh_failure_prechecks_reconnect(
+    seeded_db: Database,
+    seeded_users,
+    mail_registry: ToolRegistry,
+    oauth_key,
+    mail_settings,
+    monkeypatch,
+    tool,
+    raw_input,
+) -> None:
+    """Every tool answers the actionable EXPIRED when the refresh is refused."""
+
+    async def refused_refresh(**kwargs: Any) -> oauth_service.OAuthTokens:
+        raise oauth_service.TokenExchangeError("token endpoint answered 400")
+
+    monkeypatch.setattr(oauth_service, "refresh_access_token", refused_refresh)
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(
+        seeded_db,
+        seeded_users[OWNER],
+        key=oauth_key,
+        blob=_blob(expires_at=int(time.time()) - 120),
+    )
+    register_provider("google", FakeGmail(explode=True))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        tool,
+        raw_input,
+        credentials_key=oauth_key,
+        settings=mail_settings,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {EXPIRED}"
+    assert "rt-1" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize(
+    ("tool", "raw_input"),
+    [("get_email", GET_INPUT), ("archive_message", ARCHIVE_INPUT), ("add_label", ADD_LABEL_INPUT)],
+)
+async def test_rejected_token_on_the_scope_check_prechecks_reconnect(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, tool, raw_input
+) -> None:
+    """A 401/403 while verifying membership is the actionable EXPIRED, never tool_failed."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(message_error=GmailAuthenticationError("Gmail API answered 401"))
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        tool,
+        raw_input,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {EXPIRED}"
+    assert fake.modify_calls == []
+
+
+# --- Scope enforcement (criterion 3, risk #2) ----------------------------------
+
+
+async def test_search_emails_filters_by_the_selected_label(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(listed=[{"id": "m1", "threadId": "t-1", "labelIds": ["Label_7"]}])
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert [message.id for message in result.output.messages] == ["m1"]
+    # The scope becomes labelIds, never a query-syntax label (risk #2).
+    assert fake.list_calls == [{"label_ids": ["Label_7"], "query": "invoice", "max_results": 5}]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "in:anywhere",
+        "-label:Label_7",
+        "label:INBOX OR label:Label_9",
+        "{in:inbox in:spam} is:unread",
+    ],
+)
+async def test_search_query_cannot_widen_the_label_scope(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, query
+) -> None:
+    """Scope-widening attempt: whatever the query says, labelIds stays the selection.
+
+    Gmail ANDs ``labelIds`` with ``q``, so the model's free text can only
+    narrow the selected label, never replace or escape it.
+    """
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        {"query": query},
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert fake.list_calls == [{"label_ids": ["Label_7"], "query": query, "max_results": 10}]
+
+
+async def test_search_emails_with_all_mail_scope_is_unfiltered(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        {"max_results": 3},
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert fake.list_calls == [{"label_ids": None, "query": None, "max_results": 3}]
+
+
+async def test_get_email_returns_a_message_inside_the_scope(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "get_email",
+        GET_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    message = result.output.message
+    assert (message.id, message.thread_id) == ("m1", "t-1")
+    assert message.label_ids == ["INBOX", "Label_7"]
+    assert message.subject == "Invoice 42"
+    assert message.sender == "ana@example.com"
+    assert message.to == ["me@acme.test"]
+    assert message.date == "Fri, 16 Oct 2026 10:00:00 +0200"
+    assert message.body == "Please pay invoice 42."
+    # One fetch in the scope precheck, one in the handler (the frozen
+    # ToolContext cannot pass the message through, and the precheck returns None).
+    assert fake.get_calls == ["m1", "m1"]
+
+
+async def test_get_email_denies_a_message_outside_the_scope(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """Criterion 3's heart: out-of-scope read is denied with an actionable reason."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(message=OUT_OF_SCOPE_MESSAGE)
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "get_email",
+        GET_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {OUT_OF_SCOPE}"
+
+
+async def test_get_email_with_all_mail_scope_reads_any_message(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """ALL skips the label-membership check entirely."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(message=OUT_OF_SCOPE_MESSAGE)
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "get_email",
+        GET_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert result.output.message.label_ids == ["INBOX"]
+
+
+async def test_archive_message_inside_the_scope_removes_inbox(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    grant = mint_grant(
+        uuid4(),
+        compute_action_key("archive_message", ArchiveMessageInput.model_validate(ARCHIVE_INPUT)),
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "archive_message",
+        ARCHIVE_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert result.status == "ok"
+    assert (result.output.archived, result.output.message_id) == (True, "m1")
+    # The precheck's verification fetch plus the handler's modify.
+    assert fake.get_calls == ["m1"]
+    assert fake.modify_calls == [
+        {"message_id": "m1", "add_label_ids": None, "remove_label_ids": ["INBOX"]}
+    ]
+
+
+async def test_archive_message_outside_the_scope_is_denied_before_any_modify(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """Criterion 3: no archive of a message outside the selected label."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(message=OUT_OF_SCOPE_MESSAGE)
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "archive_message",
+        ARCHIVE_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {OUT_OF_SCOPE}"
+    assert fake.modify_calls == []
+
+
+async def test_add_label_inside_the_scope_applies_any_label(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """The CONSTRAINT is the message; the label itself may be any label."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    grant = mint_grant(
+        uuid4(),
+        compute_action_key("add_label", AddLabelInput.model_validate(ADD_LABEL_INPUT)),
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "add_label",
+        ADD_LABEL_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert result.status == "ok"
+    assert (result.output.labeled, result.output.label_id) == (True, "Label_9")
+    assert fake.modify_calls == [
+        {"message_id": "m1", "add_label_ids": ["Label_9"], "remove_label_ids": None}
+    ]
+
+
+async def test_add_label_outside_the_scope_is_denied_before_any_modify(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(message=OUT_OF_SCOPE_MESSAGE)
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "add_label",
+        ADD_LABEL_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {OUT_OF_SCOPE}"
+    assert fake.modify_calls == []
+
+
+async def test_send_email_is_exempt_from_the_label_check(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """A new message belongs to no folder: sending works under a label scope."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    grant = mint_grant(
+        uuid4(), compute_action_key("send_email", SendEmailInput.model_validate(SEND_INPUT))
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert result.status == "ok"
+    assert (result.output.id, result.output.thread_id) == ("sent-1", "t-9")
+    assert fake.get_calls == []  # no label membership fetch for send
+    assert len(fake.send_calls) == 1
+
+
+# --- Approval gate (criterion 4) -----------------------------------------------
+
+
+@pytest.mark.parametrize(("tool", "raw_input"), ACTION_TOOLS_AND_INPUTS)
+async def test_action_without_grant_is_approval_required_and_never_calls_gmail(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, tool, raw_input
+) -> None:
+    """No approval → approval_required, and the provider is never touched."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        tool,
+        raw_input,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "approval_required"
+    payload = result.approval_request
+    assert payload is not None
+    assert payload.tool_name == tool
+    assert payload.required_role == "operator"
+    assert fake.send_calls == []
+    assert fake.modify_calls == []
+
+
+@pytest.mark.parametrize(("tool", "raw_input"), ACTION_TOOLS_AND_INPUTS)
+async def test_action_with_minted_grant_executes(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, tool, raw_input
+) -> None:
+    """A live grant bound to this tool+input runs the handler exactly once."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    input_model = {
+        "send_email": SendEmailInput,
+        "archive_message": ArchiveMessageInput,
+        "add_label": AddLabelInput,
+    }[tool]
+    grant = mint_grant(uuid4(), compute_action_key(tool, input_model.model_validate(raw_input)))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        tool,
+        raw_input,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert result.status == "ok"
+    assert len(fake.send_calls) + len(fake.modify_calls) == 1
+
+
+async def test_granted_archive_of_an_out_of_scope_message_is_still_refused(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """The precheck re-runs before the approved handler: approval never widens scope."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(message=OUT_OF_SCOPE_MESSAGE)
+    register_provider("google", fake)
+    grant = mint_grant(
+        uuid4(),
+        compute_action_key("archive_message", ArchiveMessageInput.model_validate(ARCHIVE_INPUT)),
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "archive_message",
+        ARCHIVE_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {OUT_OF_SCOPE}"
+    assert fake.modify_calls == []
+
+
+async def test_grant_for_another_input_is_refused(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    grant = mint_grant(
+        uuid4(), compute_action_key("send_email", SendEmailInput.model_validate(SEND_INPUT))
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        {**SEND_INPUT, "subject": "Different"},
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "forbidden")
+    assert fake.send_calls == []
+
+
+async def test_read_tools_execute_without_any_grant(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """Criterion 4's other half: reading never asks for approval."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+
+    for tool, raw_input in READ_TOOLS_AND_INPUTS:
+        result = await run_tool(
+            seeded_db,
+            seeded_users[OWNER],
+            mail_registry,
+            tool,
+            raw_input,
+            credentials_key=oauth_key,
+        )
+        assert result.status == "ok", tool
+
+
+async def test_approved_archive_executes_through_the_approvals_service(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, mail_settings
+) -> None:
+    """Criterion 4 end to end: request → human approval → approvals execute → Gmail modify."""
+    owner = seeded_users[OWNER]
+    await seed_scope(seeded_db, owner, "Label_7")
+    await seed_connection(seeded_db, owner, key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    async with seeded_db.sessionmaker() as session:
+        session.add(ModuleActivation(tenant_id=owner.tenant_id, module_key="google_mail"))
+        request = await create_approval_request(
+            session, mail_registry, owner, "archive_message", ARCHIVE_INPUT, settings=mail_settings
+        )
+        await session.commit()
+        request_id = request.id
+    assert fake.modify_calls == []  # pending: nothing ran yet
+    async with seeded_db.sessionmaker() as session:
+        await approve_request(session, owner, request_id)
+
+    async with seeded_db.sessionmaker() as session:
+        execution = await execute_approved_action(
+            session,
+            mail_registry,
+            owner,
+            request_id,
+            credentials_key=oauth_key,
+            settings=mail_settings,
+        )
+
+    assert execution.result.status == "ok", execution.result.error
+    assert fake.modify_calls == [
+        {"message_id": "m1", "add_label_ids": None, "remove_label_ids": ["INBOX"]}
+    ]
+
+
+# --- send_email MIME (RFC 822 via stdlib) ---------------------------------------
+
+
+async def test_send_email_builds_rfc822_mime_and_passes_thread_id(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    raw_input = {
+        "to": ["ana@example.com", "bruno@example.com"],
+        "cc": ["caro@example.com"],
+        "bcc": ["dan@example.com"],
+        "subject": "Invoice 42",
+        "body": "Please pay invoice 42.",
+        "thread_id": "t-9",
+    }
+    grant = mint_grant(
+        uuid4(), compute_action_key("send_email", SendEmailInput.model_validate(raw_input))
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        raw_input,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert result.status == "ok"
+    [call] = fake.send_calls
+    assert call["thread_id"] == "t-9"
+    padded = call["raw_mime_b64url"] + "=" * (-len(call["raw_mime_b64url"]) % 4)
+    mime = message_from_bytes(base64.urlsafe_b64decode(padded), policy=default)
+    assert mime["To"] == "ana@example.com, bruno@example.com"
+    assert mime["Cc"] == "caro@example.com"
+    assert mime["Bcc"] == "dan@example.com"
+    assert mime["Subject"] == "Invoice 42"
+    assert mime.get_content().strip() == "Please pay invoice 42."
+
+
+async def test_send_email_omits_thread_id_when_not_replying(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    grant = mint_grant(
+        uuid4(), compute_action_key("send_email", SendEmailInput.model_validate(SEND_INPUT))
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert result.status == "ok"
+    [call] = fake.send_calls
+    assert call["thread_id"] is None
+
+
+# --- list_labels and failure mapping --------------------------------------------
+
+
+async def test_list_labels_returns_id_and_name_pairs(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(
+        labels=[
+            {"id": "INBOX", "name": "Inbox", "type": "system"},
+            {"id": "Label_7", "name": "Asistente", "type": "user"},
+            {"type": "user"},  # malformed entry: skipped
+        ]
+    )
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "list_labels",
+        {},
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert [(label.id, label.name) for label in result.output.labels] == [
+        ("INBOX", "Inbox"),
+        ("Label_7", "Asistente"),
+    ]
+
+
+async def test_provider_failure_is_a_masked_tool_failure(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """A mid-call Gmail failure never 500s and never leaks the token."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(send_error=GmailProviderError("Gmail API answered 500"))
+    register_provider("google", fake)
+    grant = mint_grant(
+        uuid4(), compute_action_key("send_email", SendEmailInput.model_validate(SEND_INPUT))
+    )
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=grant,
+    )
+
+    assert (result.status, result.error, result.error_kind) == ("error", "tool_failed", "execution")
+    assert "ya29" not in result.model_dump_json()
+
+
+# --- Executor integration -------------------------------------------------------
+
+
+async def test_inactive_module_is_refused_before_the_precheck(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    register_provider("google", FakeGmail(explode=True))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+        active_modules=set(),
+    )
+
+    assert (result.status, result.error, result.error_kind) == (
+        "error",
+        "inactive_module",
+        "inactive_module",
+    )
+
+
+async def test_viewer_may_not_invoke_actions(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[VIEWER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[VIEWER], key=oauth_key)
+    register_provider("google", FakeGmail(explode=True))
+
+    for tool, raw_input in ACTION_TOOLS_AND_INPUTS:
+        result = await run_tool(
+            seeded_db,
+            seeded_users[VIEWER],
+            mail_registry,
+            tool,
+            raw_input,
+            credentials_key=oauth_key,
+        )
+        assert (result.status, result.error, result.error_kind) == (
+            "error",
+            "forbidden",
+            "forbidden",
+        )
+
+
+def test_precheck_reasons_are_distinct_and_actionable() -> None:
+    """Three separate English reasons the model can relay to the user."""
+    reasons = {NOT_CONFIGURED, EXPIRED, OUT_OF_SCOPE}
+    assert len(reasons) == 3
+    for reason in reasons:
+        assert reason.strip()
+        assert reason == reason.strip()
+        assert "Settings > Tools" in reason
+
+
+def test_precheck_error_carries_the_out_of_scope_reason() -> None:
+    """The denial reason reaches the user through the precheck error shape."""
+    error = ToolPrecheckError(OUT_OF_SCOPE)
+
+    assert error.reason == OUT_OF_SCOPE
