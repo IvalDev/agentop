@@ -26,7 +26,9 @@ current step, a submit to a completed flow, and a failed connection test are
 409; invalid answers are 422 (detail names field keys, never values);
 ``redirect`` placeholders and ``test_connection`` steps without a registered
 tester are 501 (capability absent in this foundations slice); a tester that
-raises is 502; a missing/unusable encryption key fails closed with 500.
+raises is 502; a failed dynamic scope options provider is 409 with the same
+fixed actionable message the rendered step carries; a missing/unusable
+encryption key fails closed with 500.
 Catalog, settings, and the tester registry come from ``app.state`` (same
 pattern as the catalog and connections routers), so test apps swap them per
 fixture.
@@ -59,6 +61,7 @@ from app.modules.onboarding.exceptions import (
     OnboardingEncryptionError,
     OnboardingError,
     RedirectStepError,
+    ScopeOptionsUnavailableError,
     TesterNotRegisteredError,
     WrongStepError,
 )
@@ -106,6 +109,7 @@ _HTTP_STATUS: dict[type[Exception], tuple[int, str]] = {
     ConnectionTestFailedError: (409, "connection test failed"),
     ConnectionTestError: (502, "connection test could not complete"),
     OnboardingEncryptionError: (500, "credentials encryption is not configured"),
+    ScopeOptionsUnavailableError: (409, "scope options could not be loaded"),
 }
 
 
@@ -115,9 +119,11 @@ def _http_error(exc: Exception) -> HTTPException:
     Answer-validation errors keep the service's message as ``detail``: it
     names the offending field *keys* and constraints (never submitted values,
     which may be secrets), which the future renderer turns into field errors.
+    A failed scope options provider keeps its fixed actionable message too
+    (the same one the rendered step carries — never provider internals).
     """
     status_code, detail = _HTTP_STATUS.get(type(exc), (500, "internal error"))
-    if isinstance(exc, OnboardingAnswersError):
+    if isinstance(exc, OnboardingAnswersError | ScopeOptionsUnavailableError):
         detail = str(exc)
     return HTTPException(status_code=status_code, detail=detail)
 
@@ -170,11 +176,26 @@ def _credentials_key(settings: Settings) -> str | None:
 
 @router.get("/{module_key}", response_model=OnboardingStateResponse)
 async def get_onboarding_state(
-    module_key: str, session: SessionDep, user: CurrentUserDep, catalog: ModuleCatalogDep
+    module_key: str,
+    session: SessionDep,
+    user: CurrentUserDep,
+    catalog: ModuleCatalogDep,
+    settings: SettingsDep,
 ) -> OnboardingStateResponse:
-    """The caller's own onboarding state and the current step to render."""
+    """The caller's own onboarding state and the current step to render.
+
+    ``settings`` (and its credentials key) reach a registered scope options
+    provider when the rendered step is a dynamic ``scope_select``.
+    """
     try:
-        view = await get_state(session, catalog=catalog, caller=user, module_key=module_key)
+        view = await get_state(
+            session,
+            catalog=catalog,
+            caller=user,
+            module_key=module_key,
+            credentials_key=_credentials_key(settings),
+            settings=settings,
+        )
     except (ModuleCatalogError, OnboardingError) as exc:
         raise _http_error(exc) from exc
     return _state_response(view)
@@ -202,6 +223,7 @@ async def submit_onboarding_step(
             module_key=module_key,
             step_key=step_key,
             answers=payload.answers,
+            settings=settings,
         )
     except (ModuleCatalogError, OnboardingError) as exc:
         raise _http_error(exc) from exc
@@ -210,11 +232,22 @@ async def submit_onboarding_step(
 
 @router.post("/{module_key}/restart", response_model=OnboardingStateResponse)
 async def restart_onboarding(
-    module_key: str, session: SessionDep, user: CurrentUserDep, catalog: ModuleCatalogDep
+    module_key: str,
+    session: SessionDep,
+    user: CurrentUserDep,
+    catalog: ModuleCatalogDep,
+    settings: SettingsDep,
 ) -> OnboardingStateResponse:
     """Reset the caller's completed flow to its first step (no-op otherwise)."""
     try:
-        view = await restart(session, catalog=catalog, caller=user, module_key=module_key)
+        view = await restart(
+            session,
+            catalog=catalog,
+            caller=user,
+            module_key=module_key,
+            credentials_key=_credentials_key(settings),
+            settings=settings,
+        )
     except (ModuleCatalogError, OnboardingError) as exc:
         raise _http_error(exc) from exc
     return _state_response(view)

@@ -1,4 +1,4 @@
-"""Declarative manifest of the ``google_mail`` module (Gmail MVP, google-mail M1).
+"""Declarative manifest of the ``google_mail`` module (Gmail MVP, google-mail M1/G2).
 
 Pure data, no side effects: importing this module registers nothing. The
 registration functions live in :mod:`app.modules.google_mail.registry`.
@@ -9,11 +9,12 @@ es-ES strings over these keys):
 - two OAuth scopes (M1): ``gmail.modify`` (read + modify within the
   connected mailbox) and ``gmail.send`` (send on the user's behalf);
 - no tools yet (G3 contributes the six read/action tools; names only then);
-- two onboarding steps in G1: ``connect_google`` (``redirect`` — the OAuth
-  flow of :mod:`app.modules.oauth`) followed by ``test_connection``
-  (verifies the stored tokens through the registered tester). The
-  ``scope_select`` step (whole mailbox vs. one label) is task G2 and must
-  not appear here yet;
+- three onboarding steps (G2): ``connect_google`` (``redirect`` — the OAuth
+  flow of :mod:`app.modules.oauth`), ``select_scope`` (``scope_select`` —
+  whole mailbox vs. one label; its choices are dynamic, fetched from the
+  stored connection's real Gmail labels through the module's scope options
+  provider), then ``test_connection`` (verifies the stored tokens through
+  the registered tester);
 - an agent profile (agent-engine-routing): how the engine router sends
   Gmail requests to the mail engine and the minimal instructions G3 extends
   once the tools exist.
@@ -55,6 +56,12 @@ GOOGLE_MAIL_MANIFEST = ModuleManifest(
             type="redirect",
             title="Connect with Google",
             description="Authorize access to your Google Mail account.",
+        ),
+        StepSpec(
+            key="select_scope",
+            type="scope_select",
+            title="Choose the mailbox scope",
+            description="Read the whole mailbox or only one of its labels.",
         ),
         StepSpec(
             key="test_connection",

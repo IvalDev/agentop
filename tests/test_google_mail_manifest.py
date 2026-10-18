@@ -1,18 +1,16 @@
-"""Google Mail module manifest registration tests (google-mail G1).
+"""Google Mail module manifest registration tests (google-mail G1/G2).
 
 The production import graph registers the google_mail module: ``app.main``
 runs the reviewed allowlist change at import time, so ``default_catalog``
 carries the manifest alongside the calendar one.
 
-Contract under test (google-mail M1 / G1):
+Contract under test (google-mail M1 / G2):
 
 - ``register_google_mail`` stores the manifest on a given catalog with the
-  two onboarding steps (``connect_google`` redirect, then
-  ``test_connection``), the gmail.modify + gmail.send scopes, **no** tools
-  (G3 fills them), and the 0.1.0 version — without disturbing the
-  process-wide catalog;
-- no ``scope_select`` step ships in G1: choosing the mailbox scope belongs
-  to task G2;
+  three onboarding steps (``connect_google`` redirect, ``select_scope``
+  mailbox choice, then ``test_connection``), the gmail.modify + gmail.send
+  scopes, **no** tools (G3 fills them), and the 0.1.0 version — without
+  disturbing the process-wide catalog;
 - ``register_default_google_mail`` is executed exactly once by the
   production import graph, so a second call is a registration duplicate.
 """
@@ -45,10 +43,9 @@ def test_google_mail_manifest_registers_on_a_local_catalog() -> None:
     assert manifest.tools == ()
     assert [(step.key, step.type) for step in manifest.onboarding] == [
         ("connect_google", "redirect"),
+        ("select_scope", "scope_select"),
         ("test_connection", "test_connection"),
     ]
-    # scope_select belongs to G2 (mailbox/label choice), never to G1.
-    assert "scope_select" not in [step.type for step in manifest.onboarding]
     assert all(step.title.strip() and step.description.strip() for step in manifest.onboarding)
     # A local registration shares the same manifest object as production,
     # which the import graph registers (reviewed allowlist change).
