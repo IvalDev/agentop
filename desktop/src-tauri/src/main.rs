@@ -1,11 +1,12 @@
 mod config;
 mod navigation;
+mod notifications;
 mod shortcut;
 
 use tauri::{
     menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    webview::{NewWindowResponse, WebviewWindowBuilder},
+    webview::{NewWindowResponse, PageLoadEvent, WebviewWindowBuilder},
     Manager, WebviewUrl,
 };
 
@@ -22,11 +23,19 @@ struct TrayMenu {
     autostart: CheckMenuItem<tauri::Wry>,
 }
 
-fn show_main(app: &tauri::AppHandle) {
+pub(crate) fn show_main(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+/// Receives the SPA's completed-response event through the bridge script
+/// (`notifications::bridge_script`): decides on the native side whether the
+/// window is out of sight and notifies the user.
+#[tauri::command]
+async fn assistant_response_done(app: tauri::AppHandle, preview: Option<String>) {
+    notifications::notify_response_done(&app, preview);
 }
 
 fn toggle_main(app: &tauri::AppHandle) {
@@ -200,7 +209,11 @@ fn build_tray(app: &tauri::AppHandle, always_on_top: bool, autostart: bool) -> t
 /// `on_navigation` is only available on the builder; the attributes match the
 /// previous declaration (440x700, centered, resizable). Closing the window
 /// hides it: the tray keeps the widget alive and only "Salir" exits.
-fn build_main_window(app: &mut tauri::App, preferences: &Preferences) -> tauri::Result<()> {
+fn build_main_window(
+    app: &mut tauri::App,
+    preferences: &Preferences,
+    test_response_notification: bool,
+) -> tauri::Result<()> {
     let widget_url = current_widget_url();
 
     let navigation_handle = app.handle().clone();
@@ -208,12 +221,13 @@ fn build_main_window(app: &mut tauri::App, preferences: &Preferences) -> tauri::
     let new_window_handle = navigation_handle.clone();
     let new_window_server = widget_url.clone();
 
-    let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(widget_url))
+    let mut builder = WebviewWindowBuilder::new(app, "main", WebviewUrl::External(widget_url))
         .title("Asistente")
         .inner_size(440.0, 700.0)
         .resizable(true)
         .center()
         .always_on_top(preferences.always_on_top)
+        .initialization_script(notifications::bridge_script())
         .on_navigation(
             move |target| match navigation_decision(target, &navigation_server) {
                 NavigationDecision::Allow => true,
@@ -234,8 +248,20 @@ fn build_main_window(app: &mut tauri::App, preferences: &Preferences) -> tauri::
                 open_external(&new_window_handle, &target);
             }
             NewWindowResponse::Deny
-        })
-        .build()?;
+        });
+
+    if test_response_notification {
+        // Once the page is ready, hide the window and send the event the SPA
+        // sends when a response completes: the whole real path then runs
+        // (bridge script -> command -> notification) without chatting.
+        builder = builder.on_page_load(|window, payload| {
+            if payload.event() == PageLoadEvent::Finished {
+                notifications::test_response_notification(&window);
+            }
+        });
+    }
+
+    let window = builder.build()?;
 
     let close_handle = window.clone();
     window.on_window_event(move |event| {
@@ -277,6 +303,7 @@ fn register_global_shortcut(app: &tauri::AppHandle) {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let test_notification = args.iter().any(|a| a == "--test-notification");
+    let test_response_notification = args.iter().any(|a| a == "--test-response-notification");
 
     // The native shortcut only exists on X11. On Wayland the plugin is not even
     // initialized (its setup opens an X11 connection) and the supported path is
@@ -321,11 +348,20 @@ fn main() {
     };
 
     builder
+        .invoke_handler(tauri::generate_handler![assistant_response_done])
         .setup(move |app| {
             let handle = app.handle().clone();
             let preferences_state = current_preferences_state();
 
-            build_main_window(app, &preferences_state.preferences)?;
+            // Registered before the first notification is shown: only then do
+            // the notifications offer the click reported as `tap`.
+            notifications::register_action_handler(&handle);
+
+            build_main_window(
+                app,
+                &preferences_state.preferences,
+                test_response_notification,
+            )?;
 
             // First run: the autostart key is absent, so the resolved default
             // (enabled) is persisted before reconciling, keeping the file and
