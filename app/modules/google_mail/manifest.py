@@ -20,7 +20,9 @@ es-ES strings over these keys):
 - an agent profile (agent-engine-routing): how the engine router sends
   Gmail requests to the mail engine, the scope semantics (whole mailbox vs
   one label), and that every action runs only after the user confirmed it
-  (criterion 4) while reading stays free inside the scope.
+  (criterion 4) while reading stays free inside the scope; search results
+  already describe each hit, so ``get_email`` is only for the full body
+  (G3.1).
 """
 
 from app.modules.catalog.manifest import AgentProfile, ModuleManifest, StepSpec
@@ -52,8 +54,9 @@ GOOGLE_MAIL_AGENT_PROFILE = AgentProfile(
 - Reading (search_emails, get_email, list_labels) needs no confirmation and stays inside \
 the mailbox scope the user chose: with "All mail" you may search and read every message; \
 with one label, search_emails only returns messages under that label and get_email is \
-refused for messages outside it. search_emails returns message and thread ids: read a \
-message with get_email before describing it. list_labels shows the mailbox's labels.
+refused for messages outside it. search_emails returns each message's id, thread id, \
+labels, subject, sender, date, and snippet: describe or choose messages from that, and call \
+get_email only when you need a message's full body. list_labels shows the mailbox's labels.
 - Actions (send_email, archive_message, add_label) always wait for the user's approval \
 and run only after the user confirmed it — never claim an action happened before the \
 tool reports success. archive_message and add_label only act on messages inside the \

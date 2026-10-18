@@ -4,8 +4,9 @@ Contract under test (the tester's and tools' HTTP seam, mirroring
 ``tests/test_calendar_provider.py``):
 
 - :class:`GmailProvider` is a runtime-checkable protocol with
-  ``get_profile`` and ``list_labels`` (G2) plus the four G3 operations:
-  ``list_messages``, ``get_message``, ``send_message``, ``modify_message``;
+  ``get_profile`` and ``list_labels`` (G2) plus the G3 operations:
+  ``list_messages``, ``get_message``, ``get_message_metadata``,
+  ``send_message``, ``modify_message``;
   the Google adapter implements all of them;
 - ``get_profile`` calls the Gmail API ``users.getProfile`` endpoint with a
   Bearer header and nothing else, and returns the payload including the
@@ -14,10 +15,15 @@ Contract under test (the tester's and tools' HTTP seam, mirroring
   when given, repeated ``labelIds`` (never query-syntax labels) and ``q``
   (free text only); an omitted ``messages`` key is the API's empty answer;
 - ``get_message`` GETs ``users.messagesGet`` with ``format=full``;
+  ``get_message_metadata`` GETs the same endpoint with ``format=metadata``
+  and repeated ``metadataHeaders`` (``Subject``, ``From``, ``Date``) — the
+  per-hit read behind the enriched ``search_emails`` (G3.1);
 - ``send_message`` POSTs ``users.messagesSend`` with the base64url ``raw``
   MIME and an optional ``threadId``; ``modify_message`` POSTs
   ``users.messagesModify`` with ``addLabelIds``/``removeLabelIds``;
 - 401/403 → :class:`GmailAuthenticationError` (the tester answers False);
+  404 → :class:`GmailNotFoundError` (a :class:`GmailProviderError`
+  subclass, so a search can skip a message deleted between list and get);
   any other failure → :class:`GmailProviderError` (the engine surfaces 502);
   a non-JSON body or a payload missing its key field is a provider error
   too — never a token leak, never a 500 from the tools layer;
@@ -35,6 +41,7 @@ from app.modules.google_mail.provider import (
     GOOGLE_GMAIL_MESSAGES_URL,
     GOOGLE_GMAIL_PROFILE_URL,
     GmailAuthenticationError,
+    GmailNotFoundError,
     GmailProvider,
     GmailProviderError,
     GoogleGmailProvider,
@@ -259,6 +266,100 @@ async def test_get_message_rejects_non_json_body() -> None:
         provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
         with pytest.raises(GmailProviderError, match="non-JSON"):
             await provider.get_message("m1")
+
+
+# --- get_message_metadata (users.messagesGet, format=metadata) -------------------
+
+
+async def test_get_message_metadata_requests_the_three_headers_and_returns_the_payload() -> None:
+    seen: dict[str, Any] = {}
+    payload = {
+        "id": "m1",
+        "threadId": "t-1",
+        "labelIds": ["INBOX"],
+        "snippet": "Please pay invoice 42.",
+        "payload": {"headers": [{"name": "Subject", "value": "Invoice 42"}]},
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url.copy_with(query=None))
+        seen["method"] = request.method
+        seen["authorization"] = request.headers["Authorization"]
+        seen["format"] = request.url.params.get("format")
+        seen["headers"] = request.url.params.get_list("metadataHeaders")
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        message = await provider.get_message_metadata("m1")
+
+    assert message == payload
+    assert seen["method"] == "GET"
+    assert seen["url"] == f"{GOOGLE_GMAIL_MESSAGES_URL}/m1"
+    assert seen["authorization"] == f"Bearer {ACCESS_TOKEN}"
+    # Metadata only: the body is never downloaded for a search hit.
+    assert seen["format"] == "metadata"
+    assert seen["headers"] == ["Subject", "From", "Date"]
+
+
+async def test_get_message_metadata_maps_404_to_not_found_error() -> None:
+    """A message deleted between list and get is distinguishable from other failures."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"status": "NOT_FOUND"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailNotFoundError) as caught:
+            await provider.get_message_metadata("m1")
+
+    # Still a provider error: callers that do not care keep their mapping.
+    assert isinstance(caught.value, GmailProviderError)
+
+
+async def test_get_message_metadata_requires_an_id_in_the_payload() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"labelIds": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="id"):
+            await provider.get_message_metadata("m1")
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_get_message_metadata_maps_auth_statuses_to_authentication_error(
+    status: int,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"status": "UNAUTHENTICATED"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailAuthenticationError):
+            await provider.get_message_metadata("m1")
+
+
+async def test_get_message_metadata_maps_other_errors_to_provider_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="boom")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError) as caught:
+            await provider.get_message_metadata("m1")
+
+    assert not isinstance(caught.value, GmailNotFoundError)
+
+
+async def test_get_message_metadata_rejects_non_json_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>not json</html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="non-JSON"):
+            await provider.get_message_metadata("m1")
 
 
 # --- send_message (users.messagesSend) ------------------------------------------

@@ -4,8 +4,9 @@ The connection tester, the scope options hook, and the G3 chat tools talk to
 this seam, never to Google directly:
 
 - :class:`GmailProvider` — the runtime-checkable protocol every adapter
-  fulfils: ``get_profile`` and ``list_labels`` (G1/G2) plus the four G3
-  operations ``list_messages``, ``get_message``, ``send_message``, and
+  fulfils: ``get_profile`` and ``list_labels`` (G1/G2) plus the G3
+  operations ``list_messages``, ``get_message``, ``get_message_metadata``
+  (G3.1: the per-hit read of the enriched search), ``send_message``, and
   ``modify_message``;
 - :class:`GoogleGmailProvider` — the MVP adapter: ``get_profile`` reads the
   mailbox profile through the Gmail API with a Bearer header and nothing
@@ -22,7 +23,10 @@ this seam, never to Google directly:
 
 Errors split by who must react: :class:`GmailAuthenticationError` (401/403
 — the stored tokens are dead or revoked) makes the tester answer ``False``
-and the scope options hook fail closed; :class:`GmailProviderError` and
+and the scope options hook fail closed; :class:`GmailNotFoundError` (404) is
+a :class:`GmailProviderError` the search uses to skip a message deleted
+between list and get (every other caller keeps the provider-error mapping);
+:class:`GmailProviderError` and
 transport errors mean "the call could not run", so the tester lets them
 propagate (engine: 502) while the scope options hook maps them to
 :class:`ScopeOptionsError
@@ -46,6 +50,9 @@ GOOGLE_GMAIL_LABELS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/labels
 #: Gmail API ``users.messages`` collection endpoint (G3: list/send).
 GOOGLE_GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 
+#: Headers a ``format=metadata`` read asks for (G3.1: what a search hit shows).
+METADATA_HEADERS = ("Subject", "From", "Date")
+
 
 class GmailProviderError(Exception):
     """The provider answered in a way the caller cannot use (engine: 502)."""
@@ -53,6 +60,10 @@ class GmailProviderError(Exception):
 
 class GmailAuthenticationError(GmailProviderError):
     """The provider rejected the stored tokens (401/403) — connection is dead."""
+
+
+class GmailNotFoundError(GmailProviderError):
+    """The requested resource does not exist (404) — e.g. a message deleted meanwhile."""
 
 
 @runtime_checkable
@@ -72,6 +83,8 @@ class GmailProvider(Protocol):
     ) -> list[dict[str, Any]]: ...
 
     async def get_message(self, message_id: str) -> dict[str, Any]: ...
+
+    async def get_message_metadata(self, message_id: str) -> dict[str, Any]: ...
 
     async def send_message(
         self, *, raw_mime_b64url: str, thread_id: str | None = None
@@ -114,9 +127,11 @@ class GoogleGmailProvider:
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> None:
-        """Map 401/403 to the auth error and any other failure to a provider error."""
+        """Map 401/403 to the auth error, 404 to not-found, and the rest to a provider error."""
         if response.status_code in (401, 403):
             raise GmailAuthenticationError(f"Gmail API answered {response.status_code}")
+        if response.status_code == 404:
+            raise GmailNotFoundError("Gmail API answered 404")
         if response.is_error:
             raise GmailProviderError(f"Gmail API answered {response.status_code}")
 
@@ -228,6 +243,26 @@ class GoogleGmailProvider:
         self._raise_for_status(response)
         return self._require_id(self._json_object(response))
 
+    async def get_message_metadata(self, message_id: str) -> dict[str, Any]:
+        """Read one message's metadata (``users.messagesGet``, ``format=metadata``).
+
+        Cheaper than ``format=full``: no body is downloaded, only ``labelIds``,
+        ``snippet``, and the :data:`METADATA_HEADERS` (repeated
+        ``metadataHeaders`` parameters) under ``payload.headers``.
+
+        Raises:
+            GmailAuthenticationError: the API answered 401/403.
+            GmailNotFoundError: the API answered 404 (deleted meanwhile).
+            GmailProviderError: any other non-2xx status, a non-JSON body,
+                or a payload without a string ``id``.
+            httpx.RequestError: the API could not be reached (engine: 502).
+        """
+        url = f"{GOOGLE_GMAIL_MESSAGES_URL}/{quote(message_id, safe='')}"
+        params = {"format": "metadata", "metadataHeaders": list(METADATA_HEADERS)}
+        response = await self._request("GET", url, params=params)
+        self._raise_for_status(response)
+        return self._require_id(self._json_object(response))
+
     async def send_message(
         self, *, raw_mime_b64url: str, thread_id: str | None = None
     ) -> dict[str, Any]:
@@ -309,7 +344,9 @@ __all__ = [
     "GOOGLE_GMAIL_LABELS_URL",
     "GOOGLE_GMAIL_MESSAGES_URL",
     "GOOGLE_GMAIL_PROFILE_URL",
+    "METADATA_HEADERS",
     "GmailAuthenticationError",
+    "GmailNotFoundError",
     "GmailProvider",
     "GmailProviderError",
     "GoogleGmailProvider",

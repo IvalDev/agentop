@@ -15,7 +15,11 @@ Tool shapes (M3 — the approval policies differ on purpose, criterion 4):
   bounded message search (optional free-text ``query``, 1–50 results);
   ALWAYS filtered by the scope's ``labelIds`` unless the user chose the
   whole mailbox (``ALL``) — Google never filters per label, our backend
-  does (risk #2);
+  does (risk #2). Each hit is then described by one ``format=metadata``
+  read (subject, sender, date, snippet — G3.1), at most
+  :data:`METADATA_CONCURRENCY` at once and in Gmail's order: a hit deleted
+  meanwhile (404) is skipped, and a hit whose metadata lacks the selected
+  label is dropped (defense in depth);
 - ``get_email`` — ``EXTRACT`` / viewer, no approval: one full message,
   refused with the actionable ``OUT_OF_SCOPE`` reason when the message's
   ``labelIds`` do not contain the selected label (criterion 3's heart);
@@ -66,6 +70,7 @@ The handler of ``get_email`` then fetches the message once more to return
 it (the precheck/handler contract has no channel to pass data through).
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -91,6 +96,7 @@ from app.modules.connections.service import create_or_update
 from app.modules.google_mail.manifest import GOOGLE_MAIL_MANIFEST
 from app.modules.google_mail.provider import (
     GmailAuthenticationError,
+    GmailNotFoundError,
     GmailProvider,
     get_provider,
 )
@@ -126,6 +132,8 @@ EXPIRY_SKEW_SECONDS = 60
 
 MAX_RESULTS_DEFAULT = 10
 MAX_RESULTS_LIMIT = 50
+#: How many search hits ``search_emails`` reads (``format=metadata``) at once.
+METADATA_CONCURRENCY = 10
 MAX_RECIPIENTS = 20
 MAX_SUBJECT_LENGTH = 998  # RFC 5322 line-length budget for a subject.
 MAX_BODY_LENGTH = 100_000
@@ -153,15 +161,20 @@ class SearchEmailsInput(BaseModel):
 
 
 class EmailSummary(BaseModel):
-    """One search hit (the Gmail message resource, trimmed).
+    """One search hit, described from its ``format=metadata`` read (G3.1).
 
-    Gmail's ``users.messagesList`` answers only ``id`` and ``threadId``;
-    ``label_ids`` and ``snippet`` fill only when the API includes them.
+    Gmail's ``users.messagesList`` answers only ``id`` and ``threadId``, so
+    the search reads each hit's labels, snippet, and ``Subject``/``From``/
+    ``Date`` headers: enough to describe or pick the message. ``get_email``
+    is only needed for the full body.
     """
 
     id: str
     thread_id: str | None = None
     label_ids: list[str] = Field(default_factory=list)
+    subject: str | None = None
+    sender: str | None = None
+    date: str | None = None
     snippet: str | None = None
 
 
@@ -522,18 +535,6 @@ def _build_raw_mime(
 # --- Message flattening ----------------------------------------------------------
 
 
-def _map_summary(item: dict[str, Any]) -> EmailSummary:
-    """Flatten one ``users.messagesList`` entry into an :class:`EmailSummary`."""
-    thread_id = item.get("threadId")
-    snippet = item.get("snippet")
-    return EmailSummary(
-        id=str(item.get("id", "")),
-        thread_id=thread_id if isinstance(thread_id, str) else None,
-        label_ids=_message_label_ids(item),
-        snippet=snippet if isinstance(snippet, str) else None,
-    )
-
-
 def _decode_body_data(data: str) -> str:
     """base64url-decode one MIME part body (never raises into the model)."""
     padded = data + "=" * (-len(data) % 4)
@@ -557,7 +558,7 @@ def _plain_text_body(part: Any) -> str | None:
 
 
 def _header_map(payload: dict[str, Any]) -> dict[str, str]:
-    """Lowercased header name → value of one ``format=full`` payload."""
+    """Lowercased header name → value of one ``format=full``/``metadata`` payload."""
     headers = payload.get("headers")
     if not isinstance(headers, list):
         return {}
@@ -566,6 +567,23 @@ def _header_map(payload: dict[str, Any]) -> dict[str, str]:
         for header in headers
         if isinstance(header, dict)
     }
+
+
+def _map_summary(item: dict[str, Any]) -> EmailSummary:
+    """Flatten one ``format=metadata`` message resource into an :class:`EmailSummary`."""
+    payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
+    headers = _header_map(payload)
+    thread_id = item.get("threadId")
+    snippet = item.get("snippet")
+    return EmailSummary(
+        id=str(item.get("id", "")),
+        thread_id=thread_id if isinstance(thread_id, str) else None,
+        label_ids=_message_label_ids(item),
+        subject=headers.get("subject") or None,
+        sender=headers.get("from") or None,
+        date=headers.get("date") or None,
+        snippet=snippet if isinstance(snippet, str) else None,
+    )
 
 
 def _map_message(item: dict[str, Any]) -> EmailMessage:
@@ -590,19 +608,64 @@ def _map_message(item: dict[str, Any]) -> EmailMessage:
 # --- Handlers --------------------------------------------------------------------
 
 
+async def _read_hits_metadata(
+    provider: GmailProvider, message_ids: list[str]
+) -> list[dict[str, Any] | None]:
+    """Read every hit's metadata, at most :data:`METADATA_CONCURRENCY` at once.
+
+    The answers keep ``message_ids``' order (Gmail's ranking) whatever order
+    the reads finish in; ``None`` marks a hit deleted between the list and
+    its read (404). Any other failure aborts the whole search: the pending
+    reads are cancelled and the error reaches the executor's masked
+    ``tool_failed`` (never a 500, never a token leak).
+    """
+    semaphore = asyncio.Semaphore(METADATA_CONCURRENCY)
+
+    async def read(message_id: str) -> dict[str, Any] | None:
+        async with semaphore:
+            try:
+                return await provider.get_message_metadata(message_id)
+            except GmailNotFoundError:
+                return None
+
+    reads = [asyncio.create_task(read(message_id)) for message_id in message_ids]
+    try:
+        return await asyncio.gather(*reads)
+    except Exception:
+        for pending in reads:
+            pending.cancel()
+        raise
+
+
 async def search_emails_handler(
     context: ToolContext, validated_input: SearchEmailsInput
 ) -> SearchEmailsOutput:
-    """Search inside the scope: ``labelIds`` always (unless ``ALL``)."""
+    """Search inside the scope (``labelIds`` unless ``ALL``), then describe each hit.
+
+    One ``format=metadata`` read per hit fills subject, sender, date, and
+    snippet (G3.1). A hit whose metadata lacks the selected label is dropped:
+    ``labelIds`` already filtered the list, so this defense costs one check.
+    """
     selection, row, access_token = await _scoped_connection(context)
     provider = _provider_for(row, access_token)
     label_ids = None if selection.scope_id == ALL_SCOPE else [selection.scope_id]
     items = await provider.list_messages(
         label_ids=label_ids, query=validated_input.query, max_results=validated_input.max_results
     )
-    return SearchEmailsOutput(
-        messages=[_map_summary(item) for item in items if isinstance(item, dict)]
-    )
+    message_ids = [
+        item["id"]
+        for item in items
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
+    ]
+    summaries: list[EmailSummary] = []
+    for hit in await _read_hits_metadata(provider, message_ids):
+        if hit is None:
+            continue  # deleted between the list and its read
+        if not _in_scope(selection, _message_label_ids(hit)):
+            logger.warning("google_mail search dropped a hit outside the selected label")
+            continue
+        summaries.append(_map_summary(hit))
+    return SearchEmailsOutput(messages=summaries)
 
 
 async def get_email_handler(context: ToolContext, validated_input: GetEmailInput) -> GetEmailOutput:
@@ -687,8 +750,10 @@ SEARCH_EMAILS = ToolSpec(
     name="search_emails",
     description=(
         "Search the user's Gmail messages inside the allowed mailbox scope: optional "
-        "free-text query plus a bounded result count; each result carries the message "
-        "id and thread id (read one with get_email). Reading never asks for confirmation."
+        "free-text query plus a bounded result count. Each result already carries the "
+        "message id, thread id, labels, subject, sender, date, and snippet, so describe "
+        "or pick messages from it; call get_email only for a message's full body. "
+        "Reading never asks for confirmation."
     ),
     kind=ToolKind.EXTRACT,
     approval_policy=ApprovalPolicy.ALLOW_WITHOUT_APPROVAL,
@@ -801,6 +866,7 @@ __all__ = [
     "EXPIRED",
     "GET_EMAIL",
     "LIST_LABELS",
+    "METADATA_CONCURRENCY",
     "MODULE_KEY",
     "NOT_CONFIGURED",
     "OUT_OF_SCOPE",

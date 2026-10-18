@@ -14,7 +14,9 @@ Contract under test (google-mail M1 / M2 / M3):
 - ``register_default_google_mail`` is executed exactly once by the
   production import graph, so a second call is a registration duplicate;
 - the agent profile instructs the mail engine about scope semantics and
-  that every action awaits the user's confirmation (criterion 4).
+  that every action awaits the user's confirmation (criterion 4), and that
+  ``search_emails`` already describes each hit while ``get_email`` is only
+  for the full body (G3.1).
 """
 
 import pytest
@@ -99,6 +101,21 @@ def test_agent_profile_explains_scope_and_user_confirmation() -> None:
         assert tool in text, tool
     assert "needs no confirmation" in text
     assert "delete" in text and "trash" in text
+
+
+def test_agent_profile_says_search_already_describes_each_hit() -> None:
+    """G3.1: search_emails answers subject/sender/date/snippet; get_email is for the body.
+
+    The old "read a message with get_email before describing it" rule would
+    cost the model one extra tool round per hit, so it must be gone.
+    """
+    profile = GOOGLE_MAIL_MANIFEST.agent
+    assert profile is not None
+    text = " ".join(profile.instructions.lower().split())
+
+    assert "subject, sender, date, and snippet" in text
+    assert "full body" in text
+    assert "before describing it" not in text
 
 
 def test_production_registers_google_mail_once_at_import() -> None:

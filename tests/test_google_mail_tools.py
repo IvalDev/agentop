@@ -23,9 +23,16 @@ Contract under test (google-mail M3 / acceptance criteria 3–5):
   ``precheck_failed`` before any handler or approval path runs);
   ``send_email`` is exempt from the label check (a new message belongs to
   no folder) but ALWAYS requires approval;
+- enriched search (G3.1): ``search_emails`` reads every hit's metadata
+  (``format=metadata``) concurrently within ``METADATA_CONCURRENCY`` and
+  answers subject, sender, date, and snippet in Gmail's order; a hit
+  deleted between list and get (404) is skipped, a hit whose metadata
+  lacks the selected label is dropped (defense in depth), and any other
+  failure is a masked ``tool_failed``;
 - there is no delete/trash tool, ever.
 """
 
+import asyncio
 import base64
 import json
 import time
@@ -34,6 +41,7 @@ from email.policy import default
 from typing import Any
 from uuid import uuid4
 
+import httpx
 import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
@@ -51,6 +59,7 @@ from app.modules.catalog.models import ModuleActivation
 from app.modules.connections.models import ConnectionStatus, UserConnection
 from app.modules.google_mail.provider import (
     GmailAuthenticationError,
+    GmailNotFoundError,
     GmailProviderError,
     provider_registry,
     register_provider,
@@ -58,8 +67,10 @@ from app.modules.google_mail.provider import (
 from app.modules.google_mail.scope import ALL_SCOPE
 from app.modules.google_mail.tools import (
     EXPIRED,
+    METADATA_CONCURRENCY,
     NOT_CONFIGURED,
     OUT_OF_SCOPE,
+    SEARCH_EMAILS,
     AddLabelInput,
     ArchiveMessageInput,
     SendEmailInput,
@@ -177,14 +188,23 @@ class FakeGmail:
         sent: dict[str, Any] | None = None,
         modified: dict[str, Any] | None = None,
         labels: list[dict[str, Any]] | None = None,
+        metadata: dict[str, dict[str, Any]] | None = None,
         list_error: Exception | None = None,
         message_error: Exception | None = None,
+        metadata_errors: dict[str, Exception] | None = None,
+        metadata_delays: dict[str, int] | None = None,
         send_error: Exception | None = None,
         modify_error: Exception | None = None,
         explode: bool = False,
     ) -> None:
         self.explode = explode
         self.listed = listed if listed is not None else []
+        # Per-id ``format=metadata`` resources; an id without an entry answers
+        # its listed entry (enough for tests that only check the list call).
+        self.metadata = metadata if metadata is not None else {}
+        self.metadata_errors = metadata_errors if metadata_errors is not None else {}
+        # Per-id event-loop yields before answering (out-of-order completion).
+        self.metadata_delays = metadata_delays if metadata_delays is not None else {}
         self.message = message if message is not None else IN_SCOPE_MESSAGE
         self.sent = sent if sent is not None else {"id": "sent-1", "threadId": "t-9"}
         self.modified = modified if modified is not None else {"id": "m1"}
@@ -203,6 +223,10 @@ class FakeGmail:
         self.access_tokens: list[str] = []
         self.list_calls: list[dict[str, Any]] = []
         self.get_calls: list[str] = []
+        self.metadata_calls: list[str] = []
+        self.metadata_cancelled: list[str] = []
+        self.metadata_in_flight = 0
+        self.metadata_max_in_flight = 0
         self.send_calls: list[dict[str, Any]] = []
         self.modify_calls: list[dict[str, Any]] = []
 
@@ -236,6 +260,29 @@ class FakeGmailProvider:
         if self._factory.message_error is not None:
             raise self._factory.message_error
         return dict(self._factory.message)
+
+    async def get_message_metadata(self, message_id: str) -> dict[str, Any]:
+        factory = self._factory
+        factory.metadata_calls.append(message_id)
+        factory.metadata_in_flight += 1
+        factory.metadata_max_in_flight = max(
+            factory.metadata_max_in_flight, factory.metadata_in_flight
+        )
+        try:
+            # Always yield once so concurrent fetches overlap observably.
+            for _ in range(1 + factory.metadata_delays.get(message_id, 0)):
+                await asyncio.sleep(0)
+            if message_id in factory.metadata_errors:
+                raise factory.metadata_errors[message_id]
+            if message_id in factory.metadata:
+                return dict(factory.metadata[message_id])
+            listed = next(item for item in factory.listed if item.get("id") == message_id)
+            return dict(listed)
+        except asyncio.CancelledError:
+            factory.metadata_cancelled.append(message_id)
+            raise
+        finally:
+            factory.metadata_in_flight -= 1
 
     async def send_message(self, **kwargs: Any) -> dict[str, Any]:
         self._factory.send_calls.append(kwargs)
@@ -759,7 +806,10 @@ async def test_search_emails_with_all_mail_scope_is_unfiltered(
 ) -> None:
     await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
     await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
-    fake = FakeGmail()
+    fake = FakeGmail(
+        listed=[{"id": "m1", "threadId": "t-m1"}],
+        metadata={"m1": _metadata("m1", label_ids=["INBOX"])},
+    )
     register_provider("google", fake)
 
     result = await run_tool(
@@ -773,6 +823,308 @@ async def test_search_emails_with_all_mail_scope_is_unfiltered(
 
     assert result.status == "ok"
     assert fake.list_calls == [{"label_ids": None, "query": None, "max_results": 3}]
+    # ALL skips the per-hit label check: a hit under any label is returned.
+    assert [message.id for message in result.output.messages] == ["m1"]
+
+
+# --- Enriched search (G3.1): one metadata read per hit -------------------------
+
+
+def _metadata(
+    message_id: str,
+    *,
+    label_ids: list[str],
+    subject: str = "Invoice 42",
+    sender: str = "ana@example.com",
+    date: str = "Fri, 16 Oct 2026 10:00:00 +0200",
+    snippet: str = "Please pay invoice 42.",
+) -> dict[str, Any]:
+    """A ``format=metadata`` Gmail message resource: headers, never a body."""
+    return {
+        "id": message_id,
+        "threadId": f"t-{message_id}",
+        "labelIds": label_ids,
+        "snippet": snippet,
+        "payload": {
+            "mimeType": "text/plain",
+            "headers": [
+                {"name": "Subject", "value": subject},
+                {"name": "From", "value": sender},
+                {"name": "Date", "value": date},
+            ],
+        },
+    }
+
+
+async def test_search_emails_returns_subject_sender_date_and_snippet_per_hit(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """One search call tells the model what each hit is about (no get_email per hit)."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(
+        # What users.messagesList really answers: ids only.
+        listed=[{"id": "m1", "threadId": "t-m1"}, {"id": "m2", "threadId": "t-m2"}],
+        metadata={
+            "m1": _metadata("m1", label_ids=["INBOX", "Label_7"]),
+            "m2": _metadata(
+                "m2",
+                label_ids=["Label_7"],
+                subject="Lunch",
+                sender="Bruno <bruno@example.com>",
+                date="Sat, 17 Oct 2026 12:30:00 +0200",
+                snippet="Tomorrow at noon?",
+            ),
+        },
+    )
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert [message.model_dump() for message in result.output.messages] == [
+        {
+            "id": "m1",
+            "thread_id": "t-m1",
+            "label_ids": ["INBOX", "Label_7"],
+            "subject": "Invoice 42",
+            "sender": "ana@example.com",
+            "date": "Fri, 16 Oct 2026 10:00:00 +0200",
+            "snippet": "Please pay invoice 42.",
+        },
+        {
+            "id": "m2",
+            "thread_id": "t-m2",
+            "label_ids": ["Label_7"],
+            "subject": "Lunch",
+            "sender": "Bruno <bruno@example.com>",
+            "date": "Sat, 17 Oct 2026 12:30:00 +0200",
+            "snippet": "Tomorrow at noon?",
+        },
+    ]
+    assert fake.metadata_calls == ["m1", "m2"]
+    assert fake.get_calls == []  # never the full message (body) for a search hit
+
+
+async def test_search_emails_keeps_gmail_order_when_metadata_answers_out_of_order(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    ids = ["m1", "m2", "m3", "m4"]
+    fake = FakeGmail(
+        listed=[{"id": message_id} for message_id in ids],
+        metadata={
+            message_id: _metadata(message_id, label_ids=["INBOX"], subject=f"Subject {message_id}")
+            for message_id in ids
+        },
+        # m1 answers last and m4 first: the output still follows Gmail's ranking.
+        metadata_delays={"m1": 6, "m2": 4, "m3": 2},
+    )
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert [(message.id, message.subject) for message in result.output.messages] == [
+        (message_id, f"Subject {message_id}") for message_id in ids
+    ]
+
+
+async def test_search_emails_fetches_metadata_concurrently_within_the_bound(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """Hits are read concurrently, never more than METADATA_CONCURRENCY at once."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(listed=[{"id": f"m{index}"} for index in range(25)])
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        {"max_results": 25},
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert len(result.output.messages) == 25
+    assert 1 < METADATA_CONCURRENCY < 25
+    assert fake.metadata_max_in_flight == METADATA_CONCURRENCY
+
+
+async def test_search_emails_skips_a_hit_deleted_between_list_and_get(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """A 404 on one metadata read drops that hit; the search still succeeds."""
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(
+        listed=[{"id": "m1"}, {"id": "m2"}, {"id": "m3"}],
+        metadata={
+            message_id: _metadata(message_id, label_ids=["Label_7"])
+            for message_id in ("m1", "m2", "m3")
+        },
+        metadata_errors={"m2": GmailNotFoundError("Gmail API answered 404")},
+    )
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert [message.id for message in result.output.messages] == ["m1", "m3"]
+
+
+async def test_search_emails_drops_a_hit_whose_labels_miss_the_scope(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """Defense in depth: labelIds filters the list, and the metadata re-checks each hit.
+
+    Gmail should never list a message outside ``labelIds``; if it ever
+    does (or the label moved between list and get), the hit is dropped.
+    """
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(
+        listed=[{"id": "m1"}, {"id": "m2"}],
+        metadata={
+            "m1": _metadata("m1", label_ids=["INBOX", "Label_7"]),
+            "m2": _metadata("m2", label_ids=["INBOX"], subject="Outside the scope"),
+        },
+    )
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert [message.id for message in result.output.messages] == ["m1"]
+    assert "Outside the scope" not in result.model_dump_json()
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_search_emails_rejected_token_on_a_metadata_read_fails_masked(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, status
+) -> None:
+    """A 401/403 on any hit aborts the whole search: no partial page, no token leak.
+
+    The executor masks every handler exception as ``tool_failed`` (only a
+    precheck can answer the ``EXPIRED`` reason), exactly like a 401 on the
+    list call itself.
+    """
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(
+        listed=[{"id": "m1"}, {"id": "m2"}],
+        metadata={"m1": _metadata("m1", label_ids=["Label_7"])},
+        metadata_errors={"m2": GmailAuthenticationError(f"Gmail API answered {status}")},
+    )
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error, result.error_kind) == ("error", "tool_failed", "execution")
+    assert result.output is None
+    assert "ya29" not in result.model_dump_json()
+
+
+async def test_search_emails_failure_cancels_the_pending_metadata_reads(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """An aborted search leaves no read running against Gmail in the background."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(
+        listed=[{"id": "m1"}, {"id": "m2"}],
+        metadata_errors={"m1": GmailProviderError("Gmail API answered 500")},
+        metadata_delays={"m2": 1_000},  # still pending when m1 fails
+    )
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+    await asyncio.sleep(0)  # let the cancellation reach the pending read
+
+    assert result.error == "tool_failed"
+    assert fake.metadata_cancelled == ["m2"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [GmailProviderError("Gmail API answered 500"), httpx.ConnectError("connection refused")],
+)
+async def test_search_emails_metadata_failure_is_a_masked_tool_failure(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, error
+) -> None:
+    """Any other metadata failure follows the module mapping: never a 500, never a leak."""
+    await seed_scope(seeded_db, seeded_users[OWNER], ALL_SCOPE)
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = FakeGmail(listed=[{"id": "m1"}, {"id": "m2"}], metadata_errors={"m1": error})
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "search_emails",
+        SEARCH_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error, result.error_kind) == ("error", "tool_failed", "execution")
+    assert "ya29" not in result.model_dump_json()
+
+
+def test_search_emails_description_says_hits_are_already_described() -> None:
+    """The model learns search answers subject/sender/date/snippet; get_email is the body."""
+    description = SEARCH_EMAILS.description.lower()
+
+    for field in ("subject", "sender", "date", "snippet"):
+        assert field in description, field
+    assert "get_email" in description
+    assert "full body" in description
 
 
 async def test_get_email_returns_a_message_inside_the_scope(
