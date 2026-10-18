@@ -9,10 +9,15 @@ database). The contract under test (agent-engine-routing T4 / D1 / D4):
   ``ROUTER_HISTORY_TURNS`` user/assistant turns and the new message, each
   clipped to ``ROUTER_TEXT_MAX_CHARS`` and neutralized;
 - the reply selects only a key from the closed set (exactly, or as the one
-  key it names as a whole word); an empty, unknown, or ambiguous reply, a
-  reply with tool calls, or a model failure falls back to ``knowledge``.
+  key it names as a whole word); an empty, unknown, or ambiguous reply, or a
+  reply with tool calls, falls back to ``knowledge`` without another call;
+- a model failure (``LLMError``) is retried exactly once after
+  ``ROUTER_RETRY_DELAY_SECONDS`` with the same messages; the retry's reply is
+  judged like a first one and the decision says it was retried; a second
+  failure falls back to ``knowledge``. Nothing is logged but the failure.
 """
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -22,6 +27,7 @@ from app.modules.agent.llm import AssistantMessage, ChatMessage, FakeLLMProvider
 from app.modules.agent.prompt import neutralize
 from app.modules.agent.routing import (
     ROUTER_HISTORY_TURNS,
+    ROUTER_RETRY_DELAY_SECONDS,
     ROUTER_TEXT_MAX_CHARS,
     RouteDecision,
     route_message,
@@ -50,19 +56,35 @@ def turn(role: str, content: str) -> SimpleNamespace:
     return SimpleNamespace(role=role, content=content)
 
 
-async def route(script, history=(), message: str = QUESTION) -> tuple[RouteDecision, list]:
-    """Route ``message`` over :data:`ENGINES` with ``script`` as the model's replies."""
+async def route(
+    script, history=(), message: str = QUESTION, pauses: list[float] | None = None
+) -> tuple[RouteDecision, list]:
+    """Route ``message`` over :data:`ENGINES` with ``script`` as the model's replies.
+
+    Retry pauses are recorded in ``pauses`` instead of slept.
+    """
+    recorded = [] if pauses is None else pauses
+
+    async def pause(seconds: float) -> None:
+        recorded.append(seconds)
+
     llm = FakeLLMProvider(script)
-    decision = await route_message(llm, ENGINES, message, list(history))
+    decision = await route_message(llm, ENGINES, message, list(history), sleep=pause)
     return decision, llm.calls
 
 
-def chosen(engine) -> RouteDecision:
-    return RouteDecision(engine=engine, routed=True, fallback=False, reason=None)
+def chosen(engine, *, retried: bool = False) -> RouteDecision:
+    return RouteDecision(engine=engine, routed=True, fallback=False, reason=None, retried=retried)
 
 
-def fell_back(reason: str) -> RouteDecision:
-    return RouteDecision(engine=KNOWLEDGE, routed=True, fallback=True, reason=reason)
+def fell_back(reason: str, *, retried: bool = False) -> RouteDecision:
+    return RouteDecision(
+        engine=KNOWLEDGE, routed=True, fallback=True, reason=reason, retried=retried
+    )
+
+
+def router_down(messages: list[ChatMessage], tools: list[dict]) -> AssistantMessage:
+    raise LLMError("ollama chat timed out")
 
 
 async def test_a_single_engine_is_chosen_without_calling_the_model() -> None:
@@ -128,9 +150,12 @@ async def test_an_ambiguous_or_unknown_reply_falls_back_to_knowledge(
     text: str, reason: str
 ) -> None:
     """The decision never leaves the closed set: anything unclear means knowledge."""
-    decision, _calls = await route([reply(text)])
+    pauses: list[float] = []
+
+    decision, calls = await route([reply(text)], pauses=pauses)
 
     assert decision == fell_back(reason)
+    assert (len(calls), pauses) == (1, []), "an unusable reply is never retried"
 
 
 async def test_a_reply_with_tool_calls_falls_back_to_knowledge() -> None:
@@ -138,22 +163,57 @@ async def test_a_reply_with_tool_calls_falls_back_to_knowledge() -> None:
     script = [
         AssistantMessage(content="calendar", tool_calls=(ToolCall("list_events", {}),)),
     ]
+    pauses: list[float] = []
 
-    decision, _calls = await route(script)
+    decision, calls = await route(script, pauses=pauses)
 
     assert decision == fell_back("tool_call_reply")
+    assert (len(calls), pauses) == (1, []), "a tool-call reply is never retried"
 
 
-async def test_a_model_failure_falls_back_to_knowledge() -> None:
-    """``LLMError`` never fails the run: the router answers knowledge."""
+async def test_a_model_failure_is_retried_once_and_a_good_retry_routes_normally() -> None:
+    """One ``LLMError`` costs a pause and one more identical call, not the engine."""
+    pauses: list[float] = []
 
-    def router_down(messages: list[ChatMessage], tools: list[dict]) -> AssistantMessage:
-        raise LLMError("ollama chat timed out")
+    decision, calls = await route([router_down, reply("calendar")], pauses=pauses)
 
-    decision, calls = await route([router_down])
+    assert decision == chosen(CALENDAR, retried=True)
+    assert pauses == [ROUTER_RETRY_DELAY_SECONDS]
+    first, retry = calls
+    assert retry.messages == first.messages
+    assert first.tools == retry.tools == []
 
-    assert decision == fell_back("llm_error")
-    assert len(calls) == 1
+
+async def test_a_retry_with_an_unusable_reply_falls_back_without_another_call() -> None:
+    """The retry's reply is judged like a first one; there is no second retry."""
+    pauses: list[float] = []
+
+    decision, calls = await route([router_down, reply("the weather")], pauses=pauses)
+
+    assert decision == fell_back("unrecognized_reply", retried=True)
+    assert (len(calls), pauses) == (2, [ROUTER_RETRY_DELAY_SECONDS])
+
+
+async def test_two_model_failures_fall_back_to_knowledge(caplog: pytest.LogCaptureFixture) -> None:
+    """``LLMError`` never fails the run: after the one retry the router answers knowledge.
+
+    Each failed attempt logs its failure, never the message, history, or reply text.
+    """
+    history = [turn("user", "Can you check my calendar?")]
+    pauses: list[float] = []
+
+    with caplog.at_level(logging.INFO, logger="app.modules.agent.routing"):
+        decision, calls = await route(
+            [router_down, router_down, reply("calendar")], history=history, pauses=pauses
+        )
+
+    assert decision == fell_back("llm_error", retried=True)
+    assert (len(calls), pauses) == (2, [ROUTER_RETRY_DELAY_SECONDS])
+    failures = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(failures) == 2
+    assert all("ollama chat timed out" in r.getMessage() for r in failures)
+    logged = " ".join(r.getMessage() for r in caplog.records)
+    assert QUESTION not in logged and "check my calendar" not in logged
 
 
 async def test_the_router_call_lists_the_engines_and_offers_no_tools() -> None:

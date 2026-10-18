@@ -15,26 +15,32 @@ The router is cheap and conservative:
   :data:`ROUTER_HISTORY_TURNS` user/assistant turns and the new message are
   clipped to :data:`ROUTER_TEXT_MAX_CHARS` and neutralized like any client
   text;
+- a model failure (:class:`~app.modules.agent.llm.LLMError`) is retried
+  exactly once, after :data:`ROUTER_RETRY_DELAY_SECONDS`, with the same
+  messages; the decision then says it was ``retried`` (audited as
+  ``router_retried``). A reply, usable or not, is never retried;
 - the reply can only select a key from that closed set: the exact key once
   wrapping (case, quotes, backticks, emphasis, punctuation) is stripped, or
   the single key it names as a whole word. Anything else falls back to
   ``knowledge`` with a reason for the audit: ``ambiguous_reply`` (two or more
   keys), ``unrecognized_reply`` (no key, or an empty reply),
   ``tool_call_reply`` (the model called a tool), or ``llm_error`` (the model
-  failed). A router failure never fails the run.
+  failed on the call and on its retry). A router failure never fails the run.
 
 Picking an engine never widens permissions: the engines are already filtered
 by the user's role and the tenant's active modules, and the executor checks
-both again on every call. Nothing here logs message, history, or reply text.
+both again on every call. Nothing here logs message, history, or reply text:
+each failed call logs only its error.
 """
 
+import asyncio
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 
 from app.modules.agent.engines import KNOWLEDGE, KNOWLEDGE_ENGINE, Engine
-from app.modules.agent.llm import ChatMessage, LLMError, LLMProvider
+from app.modules.agent.llm import AssistantMessage, ChatMessage, LLMError, LLMProvider
 from app.modules.agent.prompt import HistoryTurn, neutralize
 
 logger = logging.getLogger(__name__)
@@ -43,6 +49,8 @@ logger = logging.getLogger(__name__)
 ROUTER_HISTORY_TURNS = 6
 #: Cap on each history turn and on the new message as the router sees them.
 ROUTER_TEXT_MAX_CHARS = 500
+#: Pause before the router's single retry after a model failure (seconds).
+ROUTER_RETRY_DELAY_SECONDS = 0.5
 _HISTORY_ROLES = frozenset({"user", "assistant"})
 #: What a model may wrap around a bare key: whitespace, quotes, backticks,
 #: emphasis, brackets, and punctuation.
@@ -68,13 +76,16 @@ class RouteDecision:
 
     ``routed`` is ``True`` when the model was asked (two or more engines);
     ``fallback`` is ``True`` when its answer was unusable and ``knowledge``
-    was used instead, with ``reason`` saying why (``None`` otherwise).
+    was used instead, with ``reason`` saying why (``None`` otherwise);
+    ``retried`` is ``True`` when the first call failed and the router asked
+    once more, whatever that retry gave.
     """
 
     engine: Engine
     routed: bool
     fallback: bool
     reason: str | None = None
+    retried: bool = False
 
 
 async def route_message(
@@ -82,21 +93,44 @@ async def route_message(
     engines: Sequence[Engine],
     message: str,
     history: Sequence[HistoryTurn],
+    *,
+    sleep: Callable[[float], Awaitable[object]] = asyncio.sleep,
 ) -> RouteDecision:
-    """Pick the engine for ``message`` among ``engines`` (see the module docstring)."""
+    """Pick the engine for ``message`` among ``engines`` (see the module docstring).
+
+    ``sleep`` waits out :data:`ROUTER_RETRY_DELAY_SECONDS` before the retry
+    (injectable so tests never wait).
+    """
     if len(engines) <= 1:
         return RouteDecision(engines[0] if engines else KNOWLEDGE, routed=False, fallback=False)
-    try:
-        reply = await llm.chat(_router_messages(engines, message, history), [])
-    except LLMError as exc:
-        logger.warning("engine router unavailable, using knowledge: %s", exc)
-        return _fallback(engines, "llm_error")
+    reply, retried = await _ask(llm, _router_messages(engines, message, history), sleep)
+    if reply is None:
+        return _fallback(engines, "llm_error", retried=retried)
     if reply.tool_calls:
-        return _fallback(engines, "tool_call_reply")
+        return _fallback(engines, "tool_call_reply", retried=retried)
     named = _named_engines(reply.content, engines)
     if len(named) == 1:
-        return RouteDecision(named[0], routed=True, fallback=False)
-    return _fallback(engines, "ambiguous_reply" if named else "unrecognized_reply")
+        return RouteDecision(named[0], routed=True, fallback=False, retried=retried)
+    reason = "ambiguous_reply" if named else "unrecognized_reply"
+    return _fallback(engines, reason, retried=retried)
+
+
+async def _ask(
+    llm: LLMProvider,
+    messages: list[ChatMessage],
+    sleep: Callable[[float], Awaitable[object]],
+) -> tuple[AssistantMessage | None, bool]:
+    """The router's reply (``None`` when both calls failed) and whether it was retried."""
+    try:
+        return await llm.chat(messages, []), False
+    except LLMError as exc:
+        logger.warning("engine router call failed, retrying once: %s", exc)
+    await sleep(ROUTER_RETRY_DELAY_SECONDS)
+    try:
+        return await llm.chat(messages, []), True
+    except LLMError as exc:
+        logger.warning("engine router unavailable after a retry, using knowledge: %s", exc)
+        return None, True
 
 
 def _clip(text: str) -> str:
@@ -128,7 +162,7 @@ def _named_engines(text: str, engines: Sequence[Engine]) -> list[Engine]:
     return [engine for engine in engines if re.search(rf"\b{re.escape(engine.key)}\b", reply)]
 
 
-def _fallback(engines: Sequence[Engine], reason: str) -> RouteDecision:
+def _fallback(engines: Sequence[Engine], reason: str, *, retried: bool) -> RouteDecision:
     logger.info("engine router fell back to knowledge: %s", reason)
     engine = next((engine for engine in engines if engine.key == KNOWLEDGE_ENGINE), KNOWLEDGE)
-    return RouteDecision(engine, routed=True, fallback=True, reason=reason)
+    return RouteDecision(engine, routed=True, fallback=True, reason=reason, retried=retried)
