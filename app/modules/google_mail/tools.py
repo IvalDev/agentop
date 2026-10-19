@@ -50,6 +50,10 @@ Gmail) is never touched — and only the approvals service mints the
 single-use grant that later unlocks exactly that tool + input
 (``action_key``), re-running the precheck right before the handler.
 ``tests/test_google_mail_tools.py`` proves both halves per action tool.
+The three actions also set ``requester_only_approval`` (G7): the handler
+runs with the identity of whoever executes the approved call, so only the
+requester may approve, reject, or execute it — another user of the tenant
+would otherwise act on their own mailbox.
 
 Shared precheck (never a 500, never leaks the blob or tokens): the G2
 accessor :func:`~app.modules.google_mail.scope.get_effective_scope` must
@@ -813,6 +817,8 @@ SEND_EMAIL = ToolSpec(
     output_model=SendEmailOutput,
     precheck=google_mail_precheck,
     module=MODULE_KEY,
+    # Runs on the requester's own Gmail connection: only they may decide it (G7).
+    requester_only_approval=True,
 )
 
 ARCHIVE_MESSAGE = ToolSpec(
@@ -829,6 +835,8 @@ ARCHIVE_MESSAGE = ToolSpec(
     output_model=ArchiveMessageOutput,
     precheck=_scoped_message_precheck,
     module=MODULE_KEY,
+    # Runs on the requester's own Gmail connection: only they may decide it (G7).
+    requester_only_approval=True,
 )
 
 ADD_LABEL = ToolSpec(
@@ -845,6 +853,8 @@ ADD_LABEL = ToolSpec(
     output_model=AddLabelOutput,
     precheck=_scoped_message_precheck,
     module=MODULE_KEY,
+    # Runs on the requester's own Gmail connection: only they may decide it (G7).
+    requester_only_approval=True,
 )
 
 

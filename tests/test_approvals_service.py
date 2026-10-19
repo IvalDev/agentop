@@ -3,7 +3,9 @@
 Every test drives a test-only ``send_note`` ACTION tool on a local registry
 (see ``approval_tools`` in conftest) and an injected clock, so TTL behavior
 is deterministic and no production tool is involved. Per-request approver
-roles and prechecks use the test-only ``route_note`` (``tiered_tools``).
+roles and prechecks use the test-only ``route_note`` (``tiered_tools``), and
+requester-only decisions (google-mail G7) the test-only ``mine_note``
+(``mine_tools``).
 """
 
 import asyncio
@@ -41,6 +43,7 @@ from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import UserRole
 from app.modules.tools.exceptions import ToolApprovalRoleError
 from app.modules.tools.executor import compute_action_key
+from app.modules.tools.registry import ToolRegistry
 
 T0 = datetime(2026, 10, 13, 9, 0, tzinfo=UTC)
 TTL_SECONDS = 3600
@@ -71,14 +74,30 @@ async def _create(
         return request.id
 
 
-async def _approve(db: Database, user: CurrentUser, request_id: UUID, now: datetime = T0):
+async def _approve(
+    db: Database,
+    user: CurrentUser,
+    request_id: UUID,
+    now: datetime = T0,
+    *,
+    registry: ToolRegistry | None = None,
+):
     async with db.sessionmaker() as session:
-        return await approve_request(session, user, request_id, now=now)
+        return await approve_request(session, user, request_id, now=now, registry=registry)
 
 
-async def _reject(db: Database, user: CurrentUser, request_id: UUID, now: datetime = T0):
+async def _reject(
+    db: Database,
+    user: CurrentUser,
+    request_id: UUID,
+    now: datetime = T0,
+    *,
+    registry: ToolRegistry | None = None,
+):
     async with db.sessionmaker() as session:
-        return await reject_request(session, user, request_id, reason="not now", now=now)
+        return await reject_request(
+            session, user, request_id, reason="not now", now=now, registry=registry
+        )
 
 
 async def _execute(db: Database, tools, user: CurrentUser, request_id: UUID, now: datetime = T0):
@@ -693,3 +712,143 @@ async def test_approved_execution_without_a_credentials_key_leaves_the_context_u
     [handler_context] = tiered_tools.spy.contexts
     for context in (precheck_context, handler_context):
         assert (context.credentials_key, context.settings) == (None, None)
+
+
+# --- Requester-only decisions (google-mail G7) --------------------------------
+
+
+@pytest.fixture
+def mine_tools(approval_tools):
+    """``approval_tools`` plus ``mine_note``: ``send_note`` acting on the requester's own account.
+
+    Admin-gated like ``send_note``, so both the admin and the owner satisfy its
+    role and only ``requested_by`` tells them apart.
+    """
+    send_note = approval_tools.registry.get("send_note")
+    approval_tools.registry.register(
+        replace(send_note, name="mine_note", requester_only_approval=True)
+    )
+    return approval_tools
+
+
+async def test_requester_only_tool_cannot_be_decided_by_another_user(
+    seeded_db: Database, seeded_users, mine_tools, audit_log
+) -> None:
+    """A higher role of the same tenant is still not the requester: forbidden, audited."""
+    admin, owner = seeded_users[ADMIN], seeded_users[OWNER]
+    request_id = await _create(seeded_db, mine_tools, admin, tool="mine_note")
+
+    with pytest.raises(ApprovalForbiddenError):
+        await _approve(seeded_db, owner, request_id, registry=mine_tools.registry)
+    with pytest.raises(ApprovalForbiddenError):
+        await _reject(seeded_db, owner, request_id, registry=mine_tools.registry)
+
+    assert (await _reload(seeded_db, admin, request_id)).status is ApprovalStatus.PENDING
+    denials = await audit_log(seeded_db, action="approval.denied")
+    assert [(event.actor_user_id, event.payload, event.result) for event in denials] == [
+        (owner.id, {"operation": operation}, {"error": "forbidden", "reason": "requester_only"})
+        for operation in ("approve", "reject")
+    ]
+
+
+async def test_requester_only_tool_cannot_be_executed_by_another_user(
+    seeded_db: Database, seeded_users, mine_tools
+) -> None:
+    """Even approved by its requester, another user's execute is refused before anything runs."""
+    admin, owner = seeded_users[ADMIN], seeded_users[OWNER]
+    request_id = await _create(seeded_db, mine_tools, admin, tool="mine_note")
+    await _approve(seeded_db, admin, request_id, registry=mine_tools.registry)
+
+    with pytest.raises(ApprovalForbiddenError):
+        await _execute(seeded_db, mine_tools, owner, request_id)
+    # Forbidden wins over the TTL too, exactly like the role check: nothing is marked.
+    with pytest.raises(ApprovalForbiddenError):
+        await _execute(seeded_db, mine_tools, owner, request_id, now=EXPIRY)
+
+    assert (await _reload(seeded_db, admin, request_id)).status is ApprovalStatus.APPROVED
+    assert mine_tools.spy.calls == []
+
+
+async def test_requester_decides_and_executes_a_requester_only_tool(
+    seeded_db: Database, seeded_users, mine_tools
+) -> None:
+    """The requester approves (or rejects) and executes as with any other tool."""
+    admin = seeded_users[ADMIN]
+    approved_id = await _create(seeded_db, mine_tools, admin, tool="mine_note")
+    rejected_id = await _create(seeded_db, mine_tools, admin, tool="mine_note")
+
+    approved = await _approve(seeded_db, admin, approved_id, registry=mine_tools.registry)
+    rejected = await _reject(seeded_db, admin, rejected_id, registry=mine_tools.registry)
+    outcome = await _execute(seeded_db, mine_tools, admin, approved_id)
+
+    assert (approved.status, approved.decided_by) == (ApprovalStatus.APPROVED, admin.id)
+    assert (rejected.status, rejected.decided_by) == (ApprovalStatus.REJECTED, admin.id)
+    assert outcome.request.status is ApprovalStatus.EXECUTED
+    assert outcome.request.executed_by == admin.id
+    [(tenant_id, user, _)] = mine_tools.spy.calls
+    assert (tenant_id, user.id) == (admin.tenant_id, admin.id)
+
+
+async def test_requester_only_tool_still_needs_the_role(
+    seeded_db: Database, seeded_users, mine_tools
+) -> None:
+    """Being the requester is necessary, not sufficient: a demoted requester is forbidden."""
+    admin = seeded_users[ADMIN]
+    request_id = await _create(seeded_db, mine_tools, admin, tool="mine_note")
+    demoted = replace(admin, role=UserRole.VIEWER)
+
+    with pytest.raises(ApprovalForbiddenError):
+        await _approve(seeded_db, demoted, request_id, registry=mine_tools.registry)
+    await _approve(seeded_db, admin, request_id, registry=mine_tools.registry)
+    with pytest.raises(ApprovalForbiddenError):
+        await _execute(seeded_db, mine_tools, demoted, request_id)
+
+    assert (await _reload(seeded_db, admin, request_id)).status is ApprovalStatus.APPROVED
+    assert mine_tools.spy.calls == []
+
+
+async def test_requester_only_does_not_hide_the_request_from_readers(
+    seeded_db: Database, seeded_users, mine_tools
+) -> None:
+    """Reads and listing keep the role rule: the flag only restricts decisions."""
+    admin, owner = seeded_users[ADMIN], seeded_users[OWNER]
+    request_id = await _create(seeded_db, mine_tools, admin, tool="mine_note")
+
+    async with seeded_db.sessionmaker() as session:
+        listed = await list_approval_requests(session, owner)
+        request = await get_approval_request(session, owner, request_id)
+
+    assert [item.id for item in listed] == [request_id]
+    assert request.requested_by == admin.id
+
+
+async def test_tools_without_the_flag_keep_any_satisfying_role_as_decider(
+    seeded_db: Database, seeded_users, mine_tools
+) -> None:
+    """With the registry known, an unflagged tool is still decided by any satisfying role."""
+    admin, owner = seeded_users[ADMIN], seeded_users[OWNER]
+    approved_id = await _create(seeded_db, mine_tools, admin)
+    rejected_id = await _create(seeded_db, mine_tools, admin)
+
+    approved = await _approve(seeded_db, owner, approved_id, registry=mine_tools.registry)
+    rejected = await _reject(seeded_db, owner, rejected_id, registry=mine_tools.registry)
+    outcome = await _execute(seeded_db, mine_tools, owner, approved_id)
+
+    assert approved.decided_by == rejected.decided_by == owner.id
+    assert outcome.request.status is ApprovalStatus.EXECUTED
+    assert outcome.request.executed_by == owner.id
+
+
+async def test_a_tool_missing_from_the_registry_is_decided_only_by_its_requester(
+    seeded_db: Database, seeded_users, mine_tools
+) -> None:
+    """Fail closed: when the tool's rule cannot be read, only the requester may decide."""
+    admin, owner = seeded_users[ADMIN], seeded_users[OWNER]
+    request_id = await _create(seeded_db, mine_tools, admin)
+    without_the_tool = ToolRegistry()
+
+    with pytest.raises(ApprovalForbiddenError):
+        await _approve(seeded_db, owner, request_id, registry=without_the_tool)
+    rejected = await _reject(seeded_db, admin, request_id, registry=without_the_tool)
+
+    assert rejected.status is ApprovalStatus.REJECTED

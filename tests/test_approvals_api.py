@@ -5,6 +5,7 @@ HTTP create endpoint) against the test-only ``send_note`` tool registered on
 a local registry that replaces ``app.state.tool_registry``.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -403,3 +404,39 @@ async def test_execute_forwards_the_app_credentials_key_and_settings(
     for context in (precheck_context, handler_context):
         assert context.credentials_key == credentials_key
         assert context.settings is settings
+
+
+# --- Requester-only decisions (google-mail G7) ----------------------------------
+
+
+async def test_only_the_requester_decides_and_executes_a_requester_only_tool(
+    approvals_client: AsyncClient, seeded_db: Database, seeded_users, approval_tools
+) -> None:
+    """Another user of the tenant gets 403 on approve, reject, and execute; reads still work."""
+    approval_tools.registry.register(
+        replace(
+            approval_tools.registry.get("send_note"),
+            name="mine_note",
+            requester_only_approval=True,
+        )
+    )
+    request_id = await _create(
+        seeded_db, approval_tools, seeded_users["admin@acme.test"], tool="mine_note"
+    )
+    owner, admin = await _owner(approvals_client), await _admin(approvals_client)
+
+    for action in ("approve", "reject", "execute"):
+        response = await approvals_client.post(f"{BASE}/{request_id}/{action}", headers=owner)
+        assert (response.status_code, response.json()) == (403, {"detail": "forbidden"}), action
+    fetched = await approvals_client.get(f"{BASE}/{request_id}", headers=owner)
+    assert (fetched.status_code, fetched.json()["status"]) == (200, "pending")
+
+    approved = await approvals_client.post(f"{BASE}/{request_id}/approve", headers=admin)
+    stolen = await approvals_client.post(f"{BASE}/{request_id}/execute", headers=owner)
+    executed = await approvals_client.post(f"{BASE}/{request_id}/execute", headers=admin)
+
+    assert approved.json()["status"] == "approved"
+    assert stolen.status_code == 403
+    assert (executed.status_code, executed.json()["status"]) == (200, "executed")
+    [(_, user, _)] = approval_tools.spy.calls
+    assert user.id == seeded_users["admin@acme.test"].id

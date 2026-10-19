@@ -11,7 +11,7 @@ HTTP mapping (one place, :data:`_HTTP_STATUS`):
 service error                           HTTP
 ====================================== ====================================
 ``ApprovalNotFoundError``               404 (unknown *and* other-tenant ids)
-``ApprovalForbiddenError``              403 (role below the tool's requirement)
+``ApprovalForbiddenError``              403 (role below the requirement, or not the requester)
 ``ApprovalStateError``                  409 (already decided/executed, not approved)
 ``ApprovalBindingError``                409 (stored call or approver role no longer matches)
 ``ApprovalExpiredError``                410 Gone (TTL elapsed; request is ``expired``)
@@ -21,7 +21,11 @@ Every route needs a role satisfying the request's stored required role —
 the approver role resolved for that exact call, which a tool may raise per
 request (requester included): list silently omits the other requests, while
 get, approve, reject, and execute answer 403 (404 still wins for unknown and
-other-tenant ids). A tool that ran but failed — a precheck refusal included
+other-tenant ids). For a requester-only tool (``ToolSpec.requester_only_approval``,
+e.g. the Gmail actions, which run on the caller's own connection) approve,
+reject, and execute also answer 403 to anyone but the requester; the
+decision routes pass the app's tool registry so the service can read it.
+A tool that ran but failed — a precheck refusal included
 (``execution_error`` ``precheck_failed: <reason>``) — still answers 200 with
 status ``failed`` and ``execution_error``: the approval was consumed either
 way. Execution gives the tool the app's chat model (``app.state.llm``),
@@ -147,10 +151,12 @@ async def get_approval(
 
 
 @router.post("/{approval_id}/approve", response_model=ApprovalResponse)
-async def approve(approval_id: UUID, session: SessionDep, user: CurrentUserDep) -> ApprovalResponse:
-    """Approve a pending request (role satisfying the tool's requirement)."""
+async def approve(
+    approval_id: UUID, session: SessionDep, registry: ToolRegistryDep, user: CurrentUserDep
+) -> ApprovalResponse:
+    """Approve a pending request (its role; for a requester-only tool, its requester)."""
     try:
-        return _response(await approve_request(session, user, approval_id))
+        return _response(await approve_request(session, user, approval_id, registry=registry))
     except ApprovalError as exc:
         raise _http_error(exc) from exc
 
@@ -159,13 +165,16 @@ async def approve(approval_id: UUID, session: SessionDep, user: CurrentUserDep) 
 async def reject(
     approval_id: UUID,
     session: SessionDep,
+    registry: ToolRegistryDep,
     user: CurrentUserDep,
     body: ApprovalRejectRequest | None = None,
 ) -> ApprovalResponse:
-    """Reject a pending request with an optional reason (same roles as approve)."""
+    """Reject a pending request with an optional reason (same rules as approve)."""
     reason = body.reason if body is not None else None
     try:
-        return _response(await reject_request(session, user, approval_id, reason=reason))
+        return _response(
+            await reject_request(session, user, approval_id, reason=reason, registry=registry)
+        )
     except ApprovalError as exc:
         raise _http_error(exc) from exc
 

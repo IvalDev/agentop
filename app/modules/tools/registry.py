@@ -56,6 +56,20 @@ Optional hooks (T11)::
   :class:`~app.modules.tools.exceptions.ToolPrecheckError` with a short,
   user-safe reason; it must not change state.
 
+Requester-only approval (google-mail G7)::
+
+    requester_only_approval: bool = False
+
+- ``requester_only_approval`` (``REQUIRE_APPROVAL`` tools only) marks a tool
+  that acts on the *requester's own* account — a per-user provider
+  connection such as their Gmail mailbox. The handler always runs with the
+  identity of whoever executes the approved call, so for such a tool another
+  user of the tenant would act on *their* account instead. With the flag set
+  only the request's ``requested_by`` may approve, reject, or execute it (and
+  still needs the stored approver role); reads and listing are unchanged
+  (see :mod:`app.modules.approvals.service`). Declarative on purpose: the
+  approvals service reads it from the registry, never from the request.
+
 Registration invariants are enforced by :meth:`ToolRegistry.register` and
 raise :class:`ToolRegistrationError`; lookups raise
 :class:`ToolNotFoundError`. Single-process MVP: no thread-safety guarantees.
@@ -156,7 +170,8 @@ class ToolSpec:
     that is never gated by tenant activation, a non-``None`` key must match
     the tool-name identifier pattern (checked at registration);
     ``approval_role`` and ``precheck`` are the optional hooks described in
-    the module docstring.
+    the module docstring, as is ``requester_only_approval`` (who may decide
+    and execute an approval of this tool).
     """
 
     name: str
@@ -170,6 +185,7 @@ class ToolSpec:
     approval_role: ApprovalRoleResolver | None = None
     precheck: ToolPrecheck | None = None
     module: str | None = None
+    requester_only_approval: bool = False
 
 
 class ToolRegistry:
@@ -185,8 +201,8 @@ class ToolRegistry:
             ToolRegistrationError: duplicate or invalid name, missing or
                 non-Pydantic ``input_model``, non-callable handler or hook,
                 an ``ACTION`` tool that is not ``REQUIRE_APPROVAL``, an
-                ``approval_role`` on a tool that is not ``REQUIRE_APPROVAL``,
-                or an invalid ``module`` key.
+                ``approval_role`` or ``requester_only_approval`` on a tool
+                that is not ``REQUIRE_APPROVAL``, or an invalid ``module`` key.
         """
         if not isinstance(spec.name, str) or not _NAME_PATTERN.fullmatch(spec.name):
             raise ToolRegistrationError(
@@ -227,6 +243,14 @@ class ToolRegistry:
         ):
             raise ToolRegistrationError(
                 f"tool {spec.name!r}: approval_role needs approval_policy=REQUIRE_APPROVAL"
+            )
+        if (
+            spec.requester_only_approval
+            and spec.approval_policy is not ApprovalPolicy.REQUIRE_APPROVAL
+        ):
+            raise ToolRegistrationError(
+                f"tool {spec.name!r}: requester_only_approval needs "
+                "approval_policy=REQUIRE_APPROVAL"
             )
         self._specs[spec.name] = spec
 

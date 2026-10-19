@@ -29,6 +29,10 @@ Contract under test (google-mail M3 / acceptance criteria 3–5):
   deleted between list and get (404) is skipped, a hit whose metadata
   lacks the selected label is dropped (defense in depth), and any other
   failure is a masked ``tool_failed``;
+- requester-only decisions (G7): the three actions act on the requester's
+  own Gmail connection, so only the user who requested one may approve,
+  reject, or execute it — another user of the tenant would otherwise send
+  from (or modify) their own mailbox;
 - there is no delete/trash tool, ever.
 """
 
@@ -49,11 +53,13 @@ from sqlalchemy import select
 from app.core.config import Settings
 from app.core.crypto import decrypt_credentials, encrypt_credentials, generate_credentials_key
 from app.core.db import Database
+from app.modules.approvals.exceptions import ApprovalForbiddenError
 from app.modules.approvals.grants import mint_grant
 from app.modules.approvals.service import (
     approve_request,
     create_approval_request,
     execute_approved_action,
+    reject_request,
 )
 from app.modules.catalog.models import ModuleActivation
 from app.modules.connections.models import ConnectionStatus, UserConnection
@@ -439,6 +445,14 @@ def test_tool_specs_declare_module_roles_kinds_and_policies(mail_registry: ToolR
         )
         assert spec.module == "google_mail"
     assert all(spec.precheck is not None for spec in mail_registry.list_specs())
+
+
+def test_mailbox_actions_are_decided_only_by_their_requester(mail_registry: ToolRegistry) -> None:
+    """G7: each action runs on the requester's own connection; reads need no decision at all."""
+    for name in ("search_emails", "get_email", "list_labels"):
+        assert mail_registry.get(name).requester_only_approval is False, name
+    for name in ("send_email", "archive_message", "add_label"):
+        assert mail_registry.get(name).requester_only_approval is True, name
 
 
 @pytest.mark.parametrize(
@@ -1505,6 +1519,57 @@ async def test_approved_archive_executes_through_the_approvals_service(
     assert fake.modify_calls == [
         {"message_id": "m1", "add_label_ids": None, "remove_label_ids": ["INBOX"]}
     ]
+
+
+async def test_another_user_cannot_decide_or_execute_a_mailbox_action(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, mail_settings
+) -> None:
+    """G7: an admin of the same tenant cannot approve, reject, or run the owner's send."""
+    owner, admin = seeded_users[OWNER], seeded_users[ADMIN]
+    for user in (owner, admin):
+        await seed_scope(seeded_db, user, ALL_SCOPE)
+        await seed_connection(seeded_db, user, key=oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    async with seeded_db.sessionmaker() as session:
+        session.add(ModuleActivation(tenant_id=owner.tenant_id, module_key="google_mail"))
+        request = await create_approval_request(
+            session, mail_registry, owner, "send_email", SEND_INPUT, settings=mail_settings
+        )
+        await session.commit()
+        request_id = request.id
+
+    async with seeded_db.sessionmaker() as session:
+        with pytest.raises(ApprovalForbiddenError):
+            await approve_request(session, admin, request_id, registry=mail_registry)
+        with pytest.raises(ApprovalForbiddenError):
+            await reject_request(session, admin, request_id, registry=mail_registry)
+        await approve_request(session, owner, request_id, registry=mail_registry)
+    async with seeded_db.sessionmaker() as session:
+        with pytest.raises(ApprovalForbiddenError):
+            await execute_approved_action(
+                session,
+                mail_registry,
+                admin,
+                request_id,
+                credentials_key=oauth_key,
+                settings=mail_settings,
+            )
+    assert fake.send_calls == []
+
+    async with seeded_db.sessionmaker() as session:
+        execution = await execute_approved_action(
+            session,
+            mail_registry,
+            owner,
+            request_id,
+            credentials_key=oauth_key,
+            settings=mail_settings,
+        )
+
+    assert execution.result.status == "ok", execution.result.error
+    assert execution.request.executed_by == owner.id
+    assert len(fake.send_calls) == 1
 
 
 # --- send_email MIME (RFC 822 via stdlib) ---------------------------------------
