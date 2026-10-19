@@ -444,6 +444,113 @@ async def test_openai_stream_failures_raise_llm_error(response: httpx.Response) 
             pass
 
 
+#: A provider error body (Groq's shape) whose free text echoes user content.
+TOOL_USE_FAILED = {
+    "error": {
+        "message": "Tool call validation failed: send_email to ana@example.com SECRET-7f3a",
+        "type": "invalid_request_error",
+        "code": "tool_use_failed",
+        "failed_generation": '{"name": "send_email", "arguments": {"body": "SECRET-7f3a"}}',
+    }
+}
+LEAKS = ("SECRET-7f3a", "ana@example.com", "send_email", "validation", "failed_generation")
+
+
+def _streamed(status: int, body: object) -> httpx.Response:
+    """A response whose body is unread until consumed, as over a real network."""
+
+    async def chunks():
+        yield json.dumps(body).encode()
+
+    return httpx.Response(status, headers={"content-type": "application/json"}, content=chunks())
+
+
+async def _stream_error(provider) -> str:
+    with pytest.raises(LLMError) as raised:
+        async for _ in provider.stream_chat(CONVERSATION, TOOLS):
+            pass
+    return str(raised.value)
+
+
+async def test_openai_http_error_names_the_provider_error_type_and_code_only() -> None:
+    """The provider's error type and code reach the error text; its message never does."""
+    with pytest.raises(LLMError) as raised:
+        await _openai(lambda request: _streamed(400, TOOL_USE_FAILED)).chat(CONVERSATION, [])
+
+    text = str(raised.value)
+    assert text == (
+        "chat completions request failed: request failed "
+        "(HTTP 400, type=invalid_request_error, code=tool_use_failed)"
+    )
+    assert not any(leak in text for leak in LEAKS)
+
+
+async def test_openai_stream_http_error_names_the_provider_error_type_and_code_only() -> None:
+    """A streamed request reads the error body first, so its type and code are kept too."""
+    text = await _stream_error(_openai(lambda request: _streamed(400, TOOL_USE_FAILED)))
+
+    assert text == (
+        "chat completions stream failed: request failed "
+        "(HTTP 400, type=invalid_request_error, code=tool_use_failed)"
+    )
+    assert not any(leak in text for leak in LEAKS)
+
+
+async def test_openai_http_error_keeps_the_status_hint_next_to_the_error_code() -> None:
+    body = {"error": {"message": "Invalid API Key", "type": "invalid_request_error"}}
+
+    with pytest.raises(LLMError) as raised:
+        await _openai(lambda request: _streamed(401, body)).chat(CONVERSATION, TOOLS)
+
+    assert str(raised.value) == (
+        "chat completions request failed: authentication failed "
+        "(HTTP 401, type=invalid_request_error)"
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"error": {"message": "x", "type": "has spaces SECRET-7f3a", "code": "x" * 65}},
+        {"error": {"type": "invalid_request_error\nSECRET-7f3a", "code": ""}},
+        {"error": {"type": 7, "code": ["tool_use_failed"]}},
+        {"error": "SECRET-7f3a in a plain string"},
+        {"detail": {"type": "invalid_request_error"}},
+        ["SECRET-7f3a"],
+    ],
+    ids=["unsafe-values", "newline-and-empty", "not-strings", "string-error", "no-error", "list"],
+)
+async def test_openai_http_error_drops_unsafe_error_fields(body: object) -> None:
+    """Anything but a short identifier-like string is left out, never echoed."""
+    with pytest.raises(LLMError) as raised:
+        await _openai(lambda request: _streamed(400, body)).chat(CONVERSATION, TOOLS)
+
+    assert str(raised.value) == "chat completions request failed: request failed (HTTP 400)"
+
+
+async def test_openai_http_error_with_a_non_json_body_names_only_the_status() -> None:
+    response = httpx.Response(502, content=b"<html>SECRET-7f3a bad gateway</html>")
+
+    text = await _stream_error(_openai(lambda request: response))
+
+    assert text == "chat completions stream failed: request failed (HTTP 502)"
+
+
+async def test_ollama_http_errors_use_the_same_safe_error_detail() -> None:
+    """Ollama's plain-text error never shows; a JSON error object gives its type and code."""
+    plain = {"error": "model 'SECRET-7f3a' not found"}
+    typed = {"error": {"message": "SECRET-7f3a", "type": "api_error", "code": "bad_model"}}
+
+    with pytest.raises(LLMError) as raised:
+        await _ollama(lambda request: _streamed(404, plain)).chat(CONVERSATION, TOOLS)
+    streamed = await _stream_error(_ollama(lambda request: _streamed(400, typed)))
+
+    assert str(raised.value) == "ollama chat failed: endpoint or model not found (HTTP 404)"
+    assert streamed == (
+        "ollama chat stream failed: request failed (HTTP 400, type=api_error, code=bad_model)"
+    )
+
+
 def test_openai_provider_never_shows_its_key() -> None:
     """``repr`` and attribute dumps of the provider keep the key masked."""
     provider = _openai(lambda request: httpx.Response(200))

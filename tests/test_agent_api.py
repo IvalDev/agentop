@@ -372,7 +372,9 @@ async def test_both_endpoints_route_the_message_to_one_engine(
     assert response.status_code == 200, response.text
     router_call, agent_call = llm.calls
     assert router_call.tools == []
-    assert router_call.messages[-1].content == "What do I have on the 20th?"
+    assert (
+        "\n<<<LATEST MESSAGE>>>\nWhat do I have on the 20th?\n" in router_call.messages[-1].content
+    )
     assert {tool["function"]["name"] for tool in agent_call.tools} == {
         "list_events",
         "create_event",

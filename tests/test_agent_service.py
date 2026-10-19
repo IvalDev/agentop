@@ -373,7 +373,8 @@ async def test_router_sends_a_calendar_message_to_the_calendar_engine_only(
     ]
     router_call, *agent_calls = llm.calls
     assert router_call.tools == []
-    assert router_call.messages[-1].content == "What's on the 20th?"
+    assert [message.role for message in router_call.messages] == ["system", "user"]
+    assert "\n<<<LATEST MESSAGE>>>\nWhat's on the 20th?\n" in router_call.messages[-1].content
     calendar_policy = module_engine(CALENDAR_MANIFEST).system_prompt
     for agent_call in agent_calls:
         assert tool_names(agent_call) == {"check_calendar"}
