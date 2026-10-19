@@ -207,8 +207,9 @@ def create_app() -> FastAPI:
     application.state.llm = build_llm_provider(settings)
     application.state.tool_registry = default_registry
     application.state.module_catalog = default_catalog
-    # calendar-mvp: app.modules.calendar is deliberately not imported here —
-    # default_catalog stays empty until the reviewed allowlist change (T1 decision).
+    # default_catalog already holds the calendar manifest: the calendar wiring
+    # at the top of this module registers it once at import time (reviewed
+    # allowlist change).
     # Per-module connection testers for onboarding's test_connection steps
     # (empty in production; module packages register theirs at import time).
     application.state.connection_testers = connection_testers

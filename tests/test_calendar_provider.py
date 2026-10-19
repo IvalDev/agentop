@@ -7,11 +7,12 @@ Contract under test (T1 + T3):
   implements all three (T3 turned the create/cancel stubs into real calls);
 - ``list_events`` calls the Calendar API with a Bearer header and nothing
   else, percent-encodes the calendar id into the path, requests
-  ``singleEvents=true`` + ``orderBy=startTime``, and returns the ``items``
-  list;
-- ``create_event`` POSTs an event body (summary, ``dateTime`` start/end,
-  optional description and attendees as ``{email}`` objects) to the events
-  collection and returns the created payload; ``delete_event`` DELETEs one
+  ``singleEvents=true`` + ``orderBy=startTime``, sends ``timeZone`` only when
+  a ``time_zone`` is given, and returns the ``items`` list;
+- ``create_event`` POSTs an event body (summary, ``dateTime`` start/end plus
+  ``timeZone`` when given, optional description and attendees as ``{email}``
+  objects) to the events collection and returns the created payload;
+  ``delete_event`` DELETEs one
   event resource and accepts a 204 (or any 2xx) as success;
 - 401/403 → :class:`CalendarAuthenticationError` (the tester answers False);
   any other failure → :class:`CalendarProviderError` (the engine surfaces
@@ -73,8 +74,24 @@ async def test_list_events_sends_bearer_path_and_query_params() -> None:
     assert "maxResults=7" in seen["url"]
     assert "singleEvents=true" in seen["url"]
     assert "orderBy=startTime" in seen["url"]
+    assert "timeZone" not in seen["url"]  # no time_zone given: Google's default applies
     # Nothing but the Bearer credential: no cookies, no API key.
     assert "key=" not in seen["url"]
+
+
+async def test_list_events_sends_the_time_zone_query_param_when_given() -> None:
+    """Google then expresses the returned event times in the user's zone."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["params"] = dict(request.url.params)
+        return httpx.Response(200, json={"items": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        await provider.list_events(time_zone="Europe/Madrid")
+
+    assert seen["params"]["timeZone"] == "Europe/Madrid"
 
 
 async def test_list_events_passes_the_time_range_as_timemin_timemax() -> None:
@@ -166,6 +183,29 @@ async def test_create_event_posts_event_body_and_returns_payload() -> None:
         "end": {"dateTime": "2026-10-20T10:30:00+02:00"},
         "description": "Daily sync",
         "attendees": [{"email": "ana@example.com"}, {"email": "luis@example.com"}],
+    }
+
+
+async def test_create_event_sends_the_time_zone_on_start_and_end_when_given() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"id": "evt4"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleCalendarProvider(ACCESS_TOKEN, client=client)
+        await provider.create_event(
+            summary="Lunch",
+            start="2026-10-26T14:00:00+01:00",
+            end="2026-10-26T15:00:00+01:00",
+            time_zone="Europe/Madrid",
+        )
+
+    assert seen["body"] == {
+        "summary": "Lunch",
+        "start": {"dateTime": "2026-10-26T14:00:00+01:00", "timeZone": "Europe/Madrid"},
+        "end": {"dateTime": "2026-10-26T15:00:00+01:00", "timeZone": "Europe/Madrid"},
     }
 
 

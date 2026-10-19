@@ -9,10 +9,14 @@ shipping a new module is a reviewed code change, never a data entry.
 Registration invariants are enforced by :meth:`ModuleCatalog.register`:
 
 - ``key`` is a lowercase identifier (``calendar`` / ``google_mail``),
-  unique in the catalog;
+  unique in the catalog, and not reserved (``knowledge`` names the agent's
+  built-in engine);
 - ``name`` and ``description`` are non-blank (both are shown to admins);
 - every onboarding step has a non-empty, unique ``key`` and a ``type`` of
-  ``form``, ``redirect``, ``scope_select``, or ``test_connection``.
+  ``form``, ``redirect``, ``scope_select``, or ``test_connection``;
+- an ``agent`` profile, when present, has a non-blank
+  ``routing_description`` of at most 300 characters and non-blank
+  ``instructions`` of at most 2000 characters.
 
 Invalid manifests raise :class:`~app.modules.catalog.exceptions.ModuleRegistrationError`;
 lookups raise :class:`~app.modules.catalog.exceptions.UnknownModuleError`.
@@ -28,6 +32,12 @@ from app.modules.catalog.manifest import STEP_TYPES, ModuleManifest
 # Lowercase identifier-ish keys such as ``calendar`` / ``google_mail``.
 _KEY_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
+#: Keys no module may take: ``knowledge`` is the agent's built-in engine.
+RESERVED_MODULE_KEYS: frozenset[str] = frozenset({"knowledge"})
+#: Limits of an :class:`~app.modules.catalog.manifest.AgentProfile` (they ride in prompts).
+ROUTING_DESCRIPTION_MAX_CHARS = 300
+AGENT_INSTRUCTIONS_MAX_CHARS = 2000
+
 
 class ModuleCatalog:
     """Key-keyed collection of validated module manifests."""
@@ -39,14 +49,19 @@ class ModuleCatalog:
         """Validate ``manifest`` against every invariant, then store it.
 
         Raises:
-            ModuleRegistrationError: duplicate or invalid ``key``, blank
-                ``name`` or ``description``, or an onboarding step with an
-                empty key, a duplicate key, or an unsupported type.
+            ModuleRegistrationError: duplicate, invalid, or reserved ``key``,
+                blank ``name`` or ``description``, an onboarding step with an
+                empty key, a duplicate key, or an unsupported type, or an
+                ``agent`` profile with a blank or too long field.
         """
         if not isinstance(manifest.key, str) or not _KEY_PATTERN.fullmatch(manifest.key):
             raise ModuleRegistrationError(
                 f"invalid module key {manifest.key!r}: expected lowercase identifier "
                 "like 'calendar'"
+            )
+        if manifest.key in RESERVED_MODULE_KEYS:
+            raise ModuleRegistrationError(
+                f"module key {manifest.key!r} is reserved for the agent's built-in engine"
             )
         if manifest.key in self._manifests:
             raise ModuleRegistrationError(f"duplicate module key: {manifest.key!r}")
@@ -70,6 +85,8 @@ class ModuleCatalog:
                     f"module {manifest.key!r} step {step.key!r} has invalid type {step.type!r}: "
                     "expected form, redirect, scope_select, or test_connection"
                 )
+        if manifest.agent is not None:
+            _check_agent_profile(manifest)
         self._manifests[manifest.key] = manifest
 
     def get(self, key: str) -> ModuleManifest:
@@ -90,6 +107,25 @@ class ModuleCatalog:
     def keys(self) -> list[str]:
         """Return every registered module key in registration order."""
         return list(self._manifests)
+
+
+def _check_agent_profile(manifest: ModuleManifest) -> None:
+    """Raise ``ModuleRegistrationError`` unless both profile fields are non-blank and short."""
+    profile = manifest.agent
+    limits = (
+        ("routing_description", ROUTING_DESCRIPTION_MAX_CHARS),
+        ("instructions", AGENT_INSTRUCTIONS_MAX_CHARS),
+    )
+    for field, limit in limits:
+        value = getattr(profile, field, None)
+        if not isinstance(value, str) or not value.strip():
+            raise ModuleRegistrationError(
+                f"module {manifest.key!r} needs a non-empty agent {field}"
+            )
+        if len(value) > limit:
+            raise ModuleRegistrationError(
+                f"module {manifest.key!r} agent {field} exceeds {limit} characters"
+            )
 
 
 #: Process-wide catalog populated by module packages at import (none in T1).

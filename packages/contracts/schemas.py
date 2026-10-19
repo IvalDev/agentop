@@ -315,6 +315,8 @@ class ChatRequest(BaseModel):
     """Body of ``POST /api/v1/chat`` and ``/api/v1/chat/stream``.
 
     The tenant always comes from the authenticated user, never the body.
+    ``timezone`` is deliberately not validated here: an unknown name is
+    not an error, the run falls back to UTC and audits the fallback.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -322,6 +324,14 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=CHAT_MESSAGE_MAX_CHARS)
     history: list[ChatHistoryMessage] = Field(
         default_factory=list, max_length=CHAT_HISTORY_MAX_MESSAGES
+    )
+    timezone: str | None = Field(
+        default=None,
+        max_length=64,
+        description=(
+            "The user's IANA timezone, e.g. 'Europe/Madrid' (the browser's "
+            "Intl.DateTimeFormat zone). Missing or unknown means UTC."
+        ),
     )
 
 

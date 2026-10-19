@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 import { chunkBytes, doneFrame, installChatApi, sseFrame } from '../test/fakeChat';
-import { parseChatEvent, readServerSentEvents, streamChat, type ServerSentEvent } from './chat';
+import {
+  browserTimeZone,
+  parseChatEvent,
+  readServerSentEvents,
+  streamChat,
+  type ServerSentEvent,
+} from './chat';
 import { createApiClient } from './client';
 
 function bodyOf(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
@@ -9,6 +15,19 @@ function bodyOf(chunks: Uint8Array[]): ReadableStream<Uint8Array> {
       chunks.forEach((chunk) => controller.enqueue(chunk));
       controller.close();
     },
+  });
+}
+
+/** Make `Intl.DateTimeFormat().resolvedOptions()` report `timeZone` (or throw). */
+function stubTimeZone(timeZone: string | Error) {
+  const real = Intl.DateTimeFormat.prototype.resolvedOptions;
+  vi.spyOn(Intl.DateTimeFormat.prototype, 'resolvedOptions').mockImplementation(function (
+    this: Intl.DateTimeFormat,
+  ) {
+    if (timeZone instanceof Error) {
+      throw timeZone;
+    }
+    return { ...real.call(this), timeZone };
   });
 }
 
@@ -106,5 +125,43 @@ describe('streamChat', () => {
     const init = fetchMock.mock.calls[0]![1]!;
     expect(new Headers(init.headers).get('Authorization')).toBe('Bearer viewer-token');
     expect(new Headers(init.headers).get('Accept')).toBe('text/event-stream');
+  });
+
+  it('sends the browser time zone so the agent knows the local date', async () => {
+    stubTimeZone('Europe/Madrid');
+    const { requests } = installChatApi('viewer', [doneFrame('Hola')]);
+    const api = createApiClient({ getToken: () => 'viewer-token', onUnauthorized: vi.fn() });
+
+    await collect(streamChat(api, 'Hoy', [], new AbortController().signal));
+
+    expect(requests[0]).toMatchObject({ message: 'Hoy', history: [], timezone: 'Europe/Madrid' });
+  });
+
+  it('omits the time zone when the browser cannot resolve one', async () => {
+    stubTimeZone(new RangeError('no time zone data'));
+    const { requests } = installChatApi('viewer', [doneFrame('Hola')]);
+    const api = createApiClient({ getToken: () => 'viewer-token', onUnauthorized: vi.fn() });
+
+    await collect(streamChat(api, 'Hoy', [], new AbortController().signal));
+
+    expect(requests[0]).toEqual({ message: 'Hoy', history: [], signal: expect.anything() });
+    expect(requests[0]).not.toHaveProperty('timezone');
+  });
+});
+
+describe('browserTimeZone', () => {
+  it('returns the IANA name the browser resolves', () => {
+    stubTimeZone('America/Argentina/Buenos_Aires');
+
+    expect(browserTimeZone()).toBe('America/Argentina/Buenos_Aires');
+  });
+
+  it('returns undefined when the zone is empty or the lookup throws', () => {
+    stubTimeZone('');
+    expect(browserTimeZone()).toBeUndefined();
+
+    vi.restoreAllMocks();
+    stubTimeZone(new RangeError('no time zone data'));
+    expect(browserTimeZone()).toBeUndefined();
   });
 });

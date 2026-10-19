@@ -3,11 +3,17 @@
 The model is the scripted :class:`FakeLLMProvider`; tools are the test-only
 ``approval_tools`` (``peek_note`` viewer AUTO, ``queue_note`` operator ACTION,
 ``send_note`` admin ACTION) plus the production ``search_documents``, on the
-seeded two-tenant SQLite database.
+seeded two-tenant SQLite database. Runs whose deps carry no module catalog
+get only the ``knowledge`` engine, so their scripts have no router reply;
+the engine-routing section gives the run a catalog with the calendar module,
+and then the first scripted reply is the router's.
 """
 
 import json
 import logging
+import re
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -18,6 +24,7 @@ from sqlalchemy import select
 
 from app.core.config import Settings
 from app.core.db import Database
+from app.modules.agent.engines import KNOWLEDGE, module_engine
 from app.modules.agent.llm import (
     AssistantMessage,
     ChatMessage,
@@ -26,15 +33,21 @@ from app.modules.agent.llm import (
     OpenAICompatibleChatProvider,
     ToolCall,
 )
+from app.modules.agent.prompt import SYSTEM_PROMPT
 from app.modules.agent.service import (
     MAX_TOOL_CALLS_PER_STEP,
     STEP_LIMIT_ANSWER,
     AgentDeps,
+    AgentRun,
     run_agent,
 )
+from app.modules.agent.user_time import render_time_context, resolve_user_time
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
+from app.modules.calendar.manifest import CALENDAR_MANIFEST
+from app.modules.calendar.registry import register_calendar
 from app.modules.catalog.models import ModuleActivation
+from app.modules.catalog.registry import ModuleCatalog
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.models import UserRole
@@ -75,9 +88,27 @@ def deps(registry: ToolRegistry, llm, storage=None, **settings) -> AgentDeps:
     )
 
 
-async def run(db: Database, user, agent_deps: AgentDeps, message: str = "Help", history=()):
+def routed_deps(registry: ToolRegistry, llm, storage=None) -> AgentDeps:
+    """Deps whose catalog holds the calendar module (its engine, once active and visible)."""
+    catalog = ModuleCatalog()
+    register_calendar(catalog)
+    return replace(deps(registry, llm, storage), catalog=catalog)
+
+
+def tool_names(model_call) -> set[str]:
+    return {tool["function"]["name"] for tool in model_call.tools}
+
+
+async def run(
+    db: Database,
+    user,
+    agent_deps: AgentDeps,
+    message: str = "Help",
+    history=(),
+    timezone: str | None = None,
+):
     async with db.sessionmaker() as session:
-        return await run_agent(session, user, message, list(history), agent_deps)
+        return await run_agent(session, user, message, list(history), agent_deps, timezone=timezone)
 
 
 async def seed(db: Database, tenant_id: int, filename: str, contents: list[str]) -> str:
@@ -206,17 +237,24 @@ async def test_tool_calls_run_through_the_executor_as_the_agent(
 async def test_model_cannot_reach_tools_above_the_users_role(
     seeded_db: Database, seeded_users, registry, approval_tools, audit_log
 ) -> None:
-    """A hidden tool requested anyway is refused by the backend, not the prompt."""
+    """A hidden tool requested anyway is refused by the backend, not the prompt.
+
+    The run never offered it, so the loop refuses it like an unknown tool
+    before the executor (whose role check stays as a second gate).
+    """
     viewer = seeded_users[VIEWER]
     llm = FakeLLMProvider([call("send_note", NOTE), answer("I cannot do that.")])
 
     response = await run(seeded_db, viewer, deps(registry, llm))
 
-    assert [(item.status, item.error) for item in response.tool_calls] == [("error", "forbidden")]
-    assert "forbidden" in tool_message(llm, 1).content
+    assert [(item.status, item.error) for item in response.tool_calls] == [
+        ("error", "unknown_tool")
+    ]
+    assert "unknown_tool" in tool_message(llm, 1).content
     assert approval_tools.spy.calls == []
-    [denied] = await audit_log(seeded_db, action="tool.denied")
-    assert (denied.actor_type, denied.correlation_id) == (ActorType.AGENT, response.run_id)
+    [refused] = await audit_log(seeded_db, action="tool.not_found")
+    assert (refused.actor_type, refused.correlation_id) == (ActorType.AGENT, response.run_id)
+    assert refused.result == {"error": "unknown tool", "reason": "not_offered_by_engine"}
     async with seeded_db.sessionmaker() as session:
         assert (await session.execute(select(ApprovalRequest))).scalars().all() == []
 
@@ -224,47 +262,262 @@ async def test_model_cannot_reach_tools_above_the_users_role(
 async def test_module_tools_are_offered_only_when_the_tenant_activated_the_module(
     seeded_db: Database, seeded_users, registry, approval_tools
 ) -> None:
-    """The offer filter follows tenant activation: hidden while off, shown once on."""
+    """The offer filter follows tenant activation: hidden while off, routable once on."""
     viewer = seeded_users[VIEWER]
     register_calendar_tool(registry, approval_tools.spy)
 
     hidden_llm = FakeLLMProvider([answer("Hello")])
-    await run(seeded_db, viewer, deps(registry, hidden_llm))
-    hidden = {tool["function"]["name"] for tool in hidden_llm.calls[0].tools}
+    await run(seeded_db, viewer, routed_deps(registry, hidden_llm))
+    [hidden_call] = hidden_llm.calls  # one engine only: no router call
+    hidden = tool_names(hidden_call)
     assert "check_calendar" not in hidden
     assert {"peek_note", "search_documents"} <= hidden
 
     await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
-    shown_llm = FakeLLMProvider([answer("Hello")])
-    await run(seeded_db, viewer, deps(registry, shown_llm))
-    shown = {tool["function"]["name"] for tool in shown_llm.calls[0].tools}
-    assert "check_calendar" in shown
+    shown_llm = FakeLLMProvider([answer("calendar"), answer("Hello")])
+    await run(seeded_db, viewer, routed_deps(registry, shown_llm))
+    assert tool_names(shown_llm.calls[1]) == {"check_calendar"}
 
 
 async def test_calling_an_inactive_module_tool_is_refused_until_the_module_is_active(
     seeded_db: Database, seeded_users, registry, approval_tools, audit_log
 ) -> None:
-    """The loop passes the tenant's active set to the executor; activation flips the result."""
+    """An inactive module's tool is never offered, so a call is refused; activation allows it."""
     viewer = seeded_users[VIEWER]
     register_calendar_tool(registry, approval_tools.spy)
     refused_llm = FakeLLMProvider([call("check_calendar", NOTE), answer("Not available.")])
 
-    response = await run(seeded_db, viewer, deps(registry, refused_llm))
+    response = await run(seeded_db, viewer, routed_deps(registry, refused_llm))
 
     assert [(i.tool_name, i.status, i.error) for i in response.tool_calls] == [
-        ("check_calendar", "error", "inactive_module")
+        ("check_calendar", "error", "unknown_tool")
     ]
     assert approval_tools.spy.calls == []
-    assert "inactive_module" in tool_message(refused_llm, 1).content
-    [refused] = await audit_log(seeded_db, action="tool.inactive_module")
+    assert "unknown_tool" in tool_message(refused_llm, 1).content
+    [refused] = await audit_log(seeded_db, action="tool.not_found")
     assert (refused.actor_type, refused.correlation_id) == (ActorType.AGENT, response.run_id)
 
     await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
-    allowed_llm = FakeLLMProvider([call("check_calendar", NOTE), answer("Done.")])
-    allowed = await run(seeded_db, viewer, deps(registry, allowed_llm))
+    allowed_llm = FakeLLMProvider([answer("calendar"), call("check_calendar", NOTE), answer("ok")])
+    allowed = await run(seeded_db, viewer, routed_deps(registry, allowed_llm))
 
     assert [(i.tool_name, i.status) for i in allowed.tool_calls] == [("check_calendar", "ok")]
     assert len(approval_tools.spy.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("engine", "expected_tools"),
+    [
+        (None, {"peek_note", "search_documents"}),
+        (KNOWLEDGE, {"peek_note", "search_documents"}),
+        (module_engine(CALENDAR_MANIFEST), {"check_calendar"}),
+    ],
+    ids=["routed-without-catalog", "knowledge", "calendar"],
+)
+async def test_an_engine_run_sends_only_its_tools_and_its_policy(
+    seeded_db: Database, seeded_users, registry, approval_tools, engine, expected_tools
+) -> None:
+    """A given engine skips the router; without one and without a catalog, knowledge."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    user_time = resolve_user_time("Europe/Madrid", now=datetime(2026, 10, 16, 8, 7, tzinfo=UTC))
+    llm = FakeLLMProvider([answer("Hello")])
+    agent_deps = deps(registry, llm)
+
+    async with seeded_db.sessionmaker() as session:
+        agent_run = AgentRun(
+            session,
+            viewer,
+            "What do I have on the 20th?",
+            [],
+            agent_deps,
+            active_modules={"calendar"},
+            user_time=user_time,
+            engine=engine,
+        )
+        async for _event in agent_run.events():
+            pass
+
+    assert agent_deps.catalog is None  # hand-built deps keep working without a catalog
+    [model_call] = llm.calls
+    assert {tool["function"]["name"] for tool in model_call.tools} == expected_tools
+    policy = SYSTEM_PROMPT if engine is None else engine.system_prompt
+    system = model_call.messages[0]
+    assert system.role == "system"
+    assert system.content == f"{policy.rstrip()}\n\n{render_time_context(user_time)}"
+    if engine is not None and engine.module == "calendar":
+        assert "search_documents" not in system.content
+        assert CALENDAR_MANIFEST.agent.instructions.strip() in system.content
+
+
+# --- Engine routing ----------------------------------------------------------------
+
+
+async def test_router_sends_a_calendar_message_to_the_calendar_engine_only(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """Router reply ``calendar``: the agent sees only calendar tools and the calendar policy."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
+    llm = FakeLLMProvider(
+        [answer("calendar"), call("check_calendar", NOTE), answer("You have one meeting.")]
+    )
+
+    response = await run(seeded_db, viewer, routed_deps(registry, llm), "What's on the 20th?")
+
+    assert response.answer == "You have one meeting."
+    assert [(item.tool_name, item.status) for item in response.tool_calls] == [
+        ("check_calendar", "ok")
+    ]
+    router_call, *agent_calls = llm.calls
+    assert router_call.tools == []
+    assert router_call.messages[-1].content == "What's on the 20th?"
+    calendar_policy = module_engine(CALENDAR_MANIFEST).system_prompt
+    for agent_call in agent_calls:
+        assert tool_names(agent_call) == {"check_calendar"}
+        system = agent_call.messages[0].content
+        assert system.startswith(calendar_policy.rstrip())
+        assert "search_documents" not in system
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert started.result == {
+        "tools": ["check_calendar"],
+        "engine": "calendar",
+        "routed": True,
+        "router_fallback": False,
+    }
+
+
+async def test_router_sends_a_document_question_to_knowledge_with_citations(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """Router reply ``knowledge``: core tools and the grounding policy; citations still work."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
+    await seed(seeded_db, viewer.tenant_id, "invoice.txt", ["The invoice total is 1,250 EUR."])
+    llm = FakeLLMProvider(
+        [
+            answer("knowledge"),
+            call("search_documents", {"query": "invoice total"}),
+            answer("The total is 1,250 EUR [1]."),
+        ]
+    )
+
+    response = await run(seeded_db, viewer, routed_deps(registry, llm), "Invoice total?")
+
+    assert [citation.number for citation in response.citations] == [1]
+    assert response.citations[0].document_filename == "invoice.txt"
+    _router_call, *agent_calls = llm.calls
+    for agent_call in agent_calls:
+        assert tool_names(agent_call) == {"peek_note", "search_documents"}
+        assert agent_call.messages[0].content.startswith(SYSTEM_PROMPT.rstrip())
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert started.result == {
+        "tools": ["peek_note", "search_documents"],
+        "engine": "knowledge",
+        "routed": True,
+        "router_fallback": False,
+    }
+
+
+def _router_down(messages: list[ChatMessage], tools: list[dict]) -> AssistantMessage:
+    raise LLMError("ollama chat timed out")
+
+
+@pytest.mark.parametrize(
+    ("router_reply", "reason"),
+    [(_router_down, "llm_error"), (answer("the weather"), "unrecognized_reply")],
+    ids=["model-down", "unrecognized"],
+)
+async def test_router_failure_falls_back_to_knowledge_and_is_audited(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log, router_reply, reason
+) -> None:
+    """A dead or confused router never fails the run: knowledge answers, the audit says why."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
+    llm = FakeLLMProvider([router_reply, answer("Hello.")])
+
+    response = await run(seeded_db, viewer, routed_deps(registry, llm))
+
+    assert (response.answer, response.stop_reason) == ("Hello.", "completed")
+    assert tool_names(llm.calls[1]) == {"peek_note", "search_documents"}
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert started.result == {
+        "tools": ["peek_note", "search_documents"],
+        "engine": "knowledge",
+        "routed": True,
+        "router_fallback": True,
+        "router_reason": reason,
+    }
+    assert await audit_log(seeded_db, action="agent.run_failed") == []
+
+
+@pytest.mark.parametrize(
+    ("router_reply", "tool", "arguments"),
+    [
+        ("calendar", "search_documents", {"query": "invoice total"}),
+        ("knowledge", "check_calendar", NOTE),
+    ],
+    ids=["calendar-run-calls-search", "knowledge-run-calls-calendar"],
+)
+async def test_a_tool_the_engine_did_not_offer_is_refused_and_never_runs(
+    seeded_db: Database,
+    seeded_users,
+    registry,
+    approval_tools,
+    audit_log,
+    router_reply,
+    tool,
+    arguments,
+) -> None:
+    """Engine isolation is enforced by the loop: an unoffered call is an unknown tool."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
+    await seed(seeded_db, viewer.tenant_id, "invoice.txt", ["The invoice total is 1,250 EUR."])
+    llm = FakeLLMProvider([answer(router_reply), call(tool, arguments), answer("Sorry [1].")])
+
+    response = await run(seeded_db, viewer, routed_deps(registry, llm))
+
+    assert [(item.tool_name, item.status, item.error) for item in response.tool_calls] == [
+        (tool, "error", "unknown_tool")
+    ]
+    assert "unknown_tool" in tool_message(llm, 2).content
+    assert response.sources == response.citations == []
+    assert approval_tools.spy.calls == []
+    [refused] = await audit_log(seeded_db, action="tool.not_found")
+    assert (refused.tool_name, refused.actor_type) == (tool, ActorType.AGENT)
+    assert refused.correlation_id == response.run_id
+    assert refused.payload == {"input_fields": sorted(arguments)}
+    assert refused.result == {"error": "unknown tool", "reason": "not_offered_by_engine"}
+    assert await audit_log(seeded_db, action="tool.executed") == []
+
+
+async def test_without_active_modules_there_is_no_router_call(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """A catalog alone adds nothing: one engine, one model call per step, as before."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+
+    response = await run(seeded_db, viewer, routed_deps(registry, llm))
+
+    assert response.answer == "Done."
+    assert len(llm.calls) == 2
+    assert all(
+        tool_names(model_call) == {"peek_note", "search_documents"} for model_call in llm.calls
+    )
+    assert llm.calls[0].messages[0].content.startswith(SYSTEM_PROMPT.rstrip())
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert started.result == {
+        "tools": ["peek_note", "search_documents"],
+        "engine": "knowledge",
+        "routed": False,
+        "router_fallback": False,
+    }
 
 
 # --- Approvals -------------------------------------------------------------------
@@ -677,8 +930,98 @@ async def test_run_audit_keeps_metadata_but_never_conversation_text(
     for text in (message, reply, "Earlier private remark", "Earlier private reply"):
         assert text not in stored
     [started] = [e for e in events if e.action == "agent.run_started"]
-    assert started.payload == {"message_chars": len(message), "history_messages": 2}
+    local_time = started.payload["local_time"]
+    assert started.payload == {
+        "message_chars": len(message),
+        "history_messages": 2,
+        "timezone": "UTC",
+        "local_time": local_time,
+        "timezone_fallback": True,
+    }
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\+00:00", local_time)
     [completed] = [e for e in events if e.action == "agent.run_completed"]
     assert completed.result["answer_chars"] == len(response.answer)
     assert completed.result["citations"] == 0
     assert "answer" not in completed.result
+
+
+# --- User time context ----------------------------------------------------------------
+
+
+async def test_run_puts_the_users_time_in_prompt_audit_and_tool_context(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """One resolved time feeds the system message, ``agent.run_started``, and every tool."""
+    viewer = seeded_users[VIEWER]
+    user_time = resolve_user_time("Europe/Madrid", now=datetime(2026, 10, 16, 8, 7, tzinfo=UTC))
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+
+    async with seeded_db.sessionmaker() as session:
+        agent_run = AgentRun(
+            session,
+            viewer,
+            "Help",
+            [],
+            deps(registry, llm),
+            active_modules=set(),
+            user_time=user_time,
+        )
+        async for _event in agent_run.events():
+            pass
+
+    for model_call in llm.calls:
+        system = model_call.messages[0]
+        assert system.role == "system"
+        assert system.content.endswith(f"\n\n{render_time_context(user_time)}")
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert started.payload == {
+        "message_chars": len("Help"),
+        "history_messages": 0,
+        "timezone": "Europe/Madrid",
+        "local_time": "2026-10-16T10:07:00+02:00",
+        "timezone_fallback": False,
+    }
+    [context] = approval_tools.spy.contexts
+    assert context.timezone == "Europe/Madrid"
+
+
+async def test_run_agent_resolves_the_requested_timezone(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log
+) -> None:
+    """``run_agent(timezone=...)`` reaches the prompt, the audit, and the tools."""
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+    before = datetime.now(UTC).replace(microsecond=0)
+
+    await run(seeded_db, seeded_users[VIEWER], deps(registry, llm), timezone="Asia/Tokyo")
+
+    after = datetime.now(UTC)
+    assert "(Asia/Tokyo, UTC+09:00)" in llm.calls[0].messages[0].content
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert (started.payload["timezone"], started.payload["timezone_fallback"]) == (
+        "Asia/Tokyo",
+        False,
+    )
+    local_time = datetime.fromisoformat(started.payload["local_time"])
+    assert local_time.utcoffset() == timedelta(hours=9)
+    assert before <= local_time <= after
+    [context] = approval_tools.spy.contexts
+    assert context.timezone == "Asia/Tokyo"
+
+
+@pytest.mark.parametrize("timezone", [None, "Not/AZone"], ids=["absent", "unknown"])
+async def test_runs_without_a_usable_timezone_fall_back_to_utc(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log, timezone
+) -> None:
+    """No zone or an unknown one: the run proceeds in UTC and says so everywhere."""
+    llm = FakeLLMProvider([call("peek_note", NOTE), answer("Done.")])
+
+    response = await run(seeded_db, seeded_users[VIEWER], deps(registry, llm), timezone=timezone)
+
+    assert response.answer == "Done."
+    system = llm.calls[0].messages[0].content
+    assert "(UTC, UTC+00:00)" in system
+    assert "The user's timezone is unknown" in system
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert (started.payload["timezone"], started.payload["timezone_fallback"]) == ("UTC", True)
+    [context] = approval_tools.spy.contexts
+    assert context.timezone == "UTC"

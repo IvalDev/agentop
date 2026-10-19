@@ -3,17 +3,27 @@
 One chat request is one *run*, identified by ``run_id`` (a UUID that is also
 the audit correlation id of everything the run does):
 
-1. The conversation is the system policy, the client's capped user/assistant
-   history, and the new message (:func:`~app.modules.agent.prompt.build_messages`).
-   The model is offered only the tools whose required role the user
+1. The run first picks its engine (:mod:`~app.modules.agent.engines`): the
+   engine router (:func:`~app.modules.agent.routing.route_message`) asks the
+   model once to classify the message among the engines the user may get,
+   and skips that call when there is only one (``knowledge``, e.g. a tenant
+   without active modules); a run given an engine skips routing. The
+   conversation is then the engine's system policy followed by the user's
+   current date, time, and timezone (:mod:`~app.modules.agent.user_time`;
+   UTC when the client sent no usable timezone), the client's capped
+   user/assistant history, and the new message
+   (:func:`~app.modules.agent.prompt.build_messages`). The model is offered
+   only the engine's tools among those whose required role the user
    satisfies and whose module (when the tool declares one) the tenant has
    active, with JSON schemas from their input models.
 2. A reply without tool calls is the final answer. Otherwise each call (at
-   most :data:`MAX_TOOL_CALLS_PER_STEP` per reply) runs through
+   most :data:`MAX_TOOL_CALLS_PER_STEP` per reply) to a tool the run offered
+   runs through
    :func:`~app.modules.tools.executor.execute_tool` as actor ``agent`` with
    the run id as correlation id (tools get the run's ``llm``, document
-   ``storage``, the app ``settings``, and the per-user-connection
-   ``credentials_key`` in their context), its result goes back as a ``tool`` message,
+   ``storage``, the app ``settings``, the per-user-connection
+   ``credentials_key``, and the user's resolved ``timezone`` in their
+   context), its result goes back as a ``tool`` message,
    and the model is asked again — at most ``Settings.agent_max_steps`` model
    calls per run. When that budget is spent the run stops with
    :data:`STEP_LIMIT_ANSWER`; calls requested on the last step never run.
@@ -33,11 +43,20 @@ Audit (actor = the user, ``actor_type`` agent, correlation = run id):
 ``agent.run_started``, then exactly one of ``agent.run_completed``,
 ``agent.step_limit``, or ``agent.run_failed``; ``agent.invalid_tool_call``
 for calls refused before the executor (non-object arguments, over the
-per-step cap); every executed call adds the executor's ``tool.*`` event, and
+per-step cap); a call to a tool the run did not offer is refused before the
+executor too, audited like the executor's unknown tool (``tool.not_found``,
+input field names, reason ``not_offered_by_engine``) and shown to the model
+as ``unknown_tool``, so one engine never runs another's tools; every
+executed call adds the executor's ``tool.*`` event, and
 every approval request the run submits adds its ``approval.created`` event
 (also ``agent`` with the run id; later ``approval.*`` events of that request
 are correlated by the request id). Run events carry metadata only (sizes,
-counts, tool names, approval ids): the message, history, and answer text are
+counts, tool names, approval ids, and on ``agent.run_started`` the user's
+resolved ``timezone``, ``local_time`` with its UTC offset, and whether the
+run fell back to UTC as ``timezone_fallback`` in its payload; the offered
+``tools``, the ``engine`` key, whether the router was asked (``routed``),
+whether it fell back to ``knowledge`` (``router_fallback``), and then why
+(``router_reason``) in its result): the message, history, and answer text are
 never written to the audit log.
 
 Transactions: the loop commits only the approval requests it creates
@@ -55,6 +74,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.modules.agent.citations import CitationIndex
+from app.modules.agent.engines import Engine, available_engines, visible_specs
 from app.modules.agent.llm import (
     AssistantMessage,
     ChatMessage,
@@ -66,16 +86,20 @@ from app.modules.agent.llm import (
 from app.modules.agent.prompt import (
     HistoryTurn,
     build_messages,
+    check_history_roles,
     fit_passages,
     render_passages,
     render_pending_approval,
     render_tool_error,
     render_tool_output,
 )
+from app.modules.agent.routing import RouteDecision, route_message
+from app.modules.agent.user_time import UserTime, render_time_context, resolve_user_time
 from app.modules.approvals.exceptions import ApprovalError
 from app.modules.approvals.service import create_approval_request
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
+from app.modules.catalog.registry import ModuleCatalog
 from app.modules.catalog.service import active_module_keys
 from app.modules.documents.storage import DocumentStorage
 from app.modules.retrieval.embeddings import EmbeddingProvider
@@ -85,7 +109,6 @@ from app.modules.tools.executor import (
     ApprovalRequestPayload,
     ToolExecutionResult,
     execute_tool,
-    role_satisfies,
 )
 from app.modules.tools.registry import ToolRegistry, ToolUser
 from packages.contracts.schemas import ChatResponse, PendingApproval, ToolCallSummary
@@ -137,6 +160,9 @@ class AgentDeps:
     #: Fernet key for per-user provider connections (calendar-mvp T3/D3);
     #: ``None`` fails the calendar tools closed with a precheck error.
     credentials_key: str | None = None
+    #: Module catalog the engines read their agent profiles from
+    #: (``app.state.module_catalog``); ``None`` leaves only ``knowledge``.
+    catalog: ModuleCatalog | None = None
 
 
 def new_run_id() -> str:
@@ -145,7 +171,10 @@ def new_run_id() -> str:
 
 
 def tool_schemas(
-    registry: ToolRegistry, user: ToolUser, active_modules: set[str]
+    registry: ToolRegistry,
+    user: ToolUser,
+    active_modules: set[str],
+    engine: Engine | None = None,
 ) -> list[dict[str, Any]]:
     """Function schemas of the tools ``user`` may use (what the model sees).
 
@@ -153,14 +182,12 @@ def tool_schemas(
     and its module is available: core tools (``spec.module is None``)
     always, module tools only when ``spec.module`` is one of the tenant's
     ``active_modules`` (from
-    :func:`~app.modules.catalog.service.active_module_keys`).
+    :func:`~app.modules.catalog.service.active_module_keys`). An ``engine``
+    then keeps only its own tools (core tools for ``knowledge``, the
+    module's tools for a module engine); ``None`` offers every visible tool.
     """
     schemas = []
-    for spec in registry.list_specs():
-        if not role_satisfies(user, spec.required_role):
-            continue
-        if spec.module is not None and spec.module not in active_modules:
-            continue
+    for spec in visible_specs(registry, user, active_modules, engine):
         assert spec.input_model is not None  # registration invariant
         schemas.append(
             {
@@ -182,7 +209,15 @@ def _clip_name(name: str) -> str:
 class AgentRun:
     """State and event stream of one agent run (see the module docstring).
 
-    Raises ``ValueError`` at construction for a privileged history role.
+    ``user_time`` is the requesting user's resolved time (see
+    :func:`~app.modules.agent.user_time.resolve_user_time`); ``None`` means
+    no timezone was sent and the run uses UTC as a fallback. ``engine``
+    (see :mod:`~app.modules.agent.engines`) fixes the run's system prompt
+    and tools; ``None`` lets :meth:`events` route the message among the
+    engines available from ``deps.catalog``. The conversation and the tool
+    offer are built once the engine is known, at the start of
+    :meth:`events`. Raises ``ValueError`` at construction for a privileged
+    history role.
     """
 
     def __init__(
@@ -194,16 +229,22 @@ class AgentRun:
         deps: AgentDeps,
         *,
         active_modules: set[str],
+        user_time: UserTime | None = None,
+        engine: Engine | None = None,
     ) -> None:
         self.run_id = new_run_id()
         self._session = session
         self._user = user
         self._deps = deps
         self._message = message
-        self._history_count = len(history)
-        self._messages = build_messages(message, history)
+        check_history_roles(history)
+        self._history = list(history)
+        self._user_time = user_time if user_time is not None else resolve_user_time(None)
         self._active_modules = active_modules
-        self._tools = tool_schemas(deps.registry, user, active_modules)
+        self._engine = engine
+        self._messages: list[ChatMessage] = []
+        self._tools: list[dict[str, Any]] = []
+        self._offered: frozenset[str] = frozenset()
         self._citations = CitationIndex()
         self._approvals: dict[str, PendingApproval] = {}
         self._summaries: list[ToolCallSummary] = []
@@ -227,13 +268,30 @@ class AgentRun:
     async def events(self, *, stream: bool = False) -> AsyncIterator[AgentEvent]:
         """Run the loop, yielding typed events; ``stream`` adds ``token`` deltas.
 
-        Model failures are audited as ``agent.run_failed`` and re-raised
-        (:class:`LLMError` for backend problems).
+        The engine is chosen first (a router failure falls back to
+        ``knowledge`` and never fails the run). Model failures of the loop are
+        audited as ``agent.run_failed`` and re-raised (:class:`LLMError` for
+        backend problems).
         """
+        decision = await self._prepare()
+        started: dict[str, Any] = {
+            "tools": [tool["function"]["name"] for tool in self._tools],
+            "engine": decision.engine.key,
+            "routed": decision.routed,
+            "router_fallback": decision.fallback,
+        }
+        if decision.fallback:
+            started["router_reason"] = decision.reason
         await self._audit(
             "agent.run_started",
-            payload={"message_chars": len(self._message), "history_messages": self._history_count},
-            result={"tools": [tool["function"]["name"] for tool in self._tools]},
+            payload={
+                "message_chars": len(self._message),
+                "history_messages": len(self._history),
+                "timezone": self._user_time.timezone,
+                "local_time": self._user_time.now.isoformat(timespec="seconds"),
+                "timezone_fallback": self._user_time.fallback,
+            },
+            result=started,
         )
         yield AgentEvent("run_started", {"run_id": self.run_id})
         try:
@@ -253,6 +311,30 @@ class AgentRun:
             },
         )
         yield AgentEvent("done", response.model_dump(mode="json"))
+
+    async def _prepare(self) -> RouteDecision:
+        """Pick the engine (routing unless one was given), then build its conversation."""
+        if self._engine is not None:
+            decision = RouteDecision(self._engine, routed=False, fallback=False)
+        else:
+            engines = available_engines(
+                catalog=self._deps.catalog,
+                registry=self._deps.registry,
+                user=self._user,
+                active_modules=self._active_modules,
+            )
+            decision = await route_message(self._deps.llm, engines, self._message, self._history)
+        self._messages = build_messages(
+            self._message,
+            self._history,
+            time_context=render_time_context(self._user_time),
+            system_prompt=decision.engine.system_prompt,
+        )
+        self._tools = tool_schemas(
+            self._deps.registry, self._user, self._active_modules, decision.engine
+        )
+        self._offered = frozenset(tool["function"]["name"] for tool in self._tools)
+        return decision
 
     async def _loop(self, stream: bool) -> AsyncIterator[AgentEvent]:
         max_steps = self._deps.settings.agent_max_steps
@@ -296,7 +378,11 @@ class AgentRun:
     async def _dispatch(
         self, call_id: str, call: ToolCall, over_cap: bool
     ) -> AsyncIterator[AgentEvent]:
-        """Run one tool call and append its ``tool`` message to the conversation."""
+        """Run one tool call and append its ``tool`` message to the conversation.
+
+        Only tools this run offered reach the executor; any other name is
+        refused as an unknown tool (see :meth:`_refuse_not_offered`).
+        """
         name = _clip_name(call.name)
         yield AgentEvent("tool_call", {"call_id": call_id, "tool_name": name})
         new_approval: PendingApproval | None = None
@@ -310,6 +396,8 @@ class AgentRun:
             await self._audit("agent.invalid_tool_call", tool_name=name, result={"error": error})
             summary = ToolCallSummary(call_id=call_id, tool_name=name, status="error", error=error)
             content = render_tool_error(name, error, detail)
+        elif call.name not in self._offered:
+            summary, content = await self._refuse_not_offered(call_id, name, call.arguments)
         else:
             result = await execute_tool(
                 self._deps.registry,
@@ -325,6 +413,7 @@ class AgentRun:
                 active_modules=self._active_modules,
                 credentials_key=self._deps.credentials_key,
                 settings=self._deps.settings,
+                timezone=self._user_time.timezone,
             )
             summary, content, new_approval = await self._handle(call_id, name, result)
         self._summaries.append(summary)
@@ -359,6 +448,30 @@ class AgentRun:
             detail = result.error if code in _DETAILED_CODES else None
         summary = ToolCallSummary(call_id=call_id, tool_name=name, status="error", error=code)
         return summary, render_tool_error(name, code, detail), None
+
+    async def _refuse_not_offered(
+        self, call_id: str, name: str, arguments: dict[str, Any]
+    ) -> tuple[ToolCallSummary, str]:
+        """Refuse a tool this run did not offer exactly as the executor refuses an unknown one.
+
+        Same audit action and shape as the executor's ``tool.not_found``
+        (input field names only, never values) plus the reason, and the
+        same ``unknown_tool`` code for the model and the client.
+        """
+        await persist_event(
+            self._session,
+            tenant_id=self._user.tenant_id,
+            action="tool.not_found",
+            actor_user_id=self._user.id,
+            actor_type=ActorType.AGENT,
+            tool_name=name,
+            payload={"input_fields": sorted(map(str, arguments))},
+            result={"error": "unknown tool", "reason": "not_offered_by_engine"},
+            correlation_id=self.run_id,
+        )
+        code = _ERROR_CODES["not_found"]
+        summary = ToolCallSummary(call_id=call_id, tool_name=name, status="error", error=code)
+        return summary, render_tool_error(name, code)
 
     def _render_output(self, name: str, output: Any) -> str:
         if isinstance(output, SearchDocumentsOutput):
@@ -445,15 +558,27 @@ async def run_agent(
     message: str,
     history: Sequence[HistoryTurn],
     deps: AgentDeps,
+    *,
+    timezone: str | None = None,
 ) -> ChatResponse:
     """Run the agent to completion and return its response (no streaming).
 
-    The tenant's active module keys are read once per run and gate both the
-    tools the model is offered and every ``execute_tool`` call in the loop.
+    The tenant's active module keys are read once per run and gate the
+    engines the message is routed among, the tools the model is offered,
+    and every ``execute_tool`` call in the loop.
+    ``timezone`` is the client's IANA name, resolved with a UTC fallback.
     Raises :class:`LLMError` when the model backend fails.
     """
     active_modules = await active_module_keys(session, user.tenant_id)
-    run = AgentRun(session, user, message, history, deps, active_modules=active_modules)
+    run = AgentRun(
+        session,
+        user,
+        message,
+        history,
+        deps,
+        active_modules=active_modules,
+        user_time=resolve_user_time(timezone),
+    )
     async for _event in run.events():
         pass
     return run.response()

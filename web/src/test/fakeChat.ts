@@ -83,6 +83,8 @@ export type ChatReply = string | ControlledStream | FakeReply;
 export interface RecordedChatRequest {
   message: string;
   history: ChatHistoryMessage[];
+  /** The browser's IANA time zone; absent when `streamChat` could not resolve one. */
+  timezone?: string;
   signal: AbortSignal | null | undefined;
 }
 

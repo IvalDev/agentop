@@ -169,16 +169,34 @@ export function parseChatEvent({ type, data }: ServerSentEvent): ChatStreamEvent
   }
 }
 
-/** Send one message with its history and yield the run's events until the stream ends. */
+/**
+ * The browser's IANA time zone (e.g. `Europe/Madrid`), or `undefined` when it cannot be
+ * resolved. The agent uses it for the user's local date and time; without it the server
+ * falls back to UTC.
+ */
+export function browserTimeZone(): string | undefined {
+  try {
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return typeof timeZone === 'string' && timeZone !== '' ? timeZone : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Send one message with its history (and the browser's time zone, when known) and yield
+ * the run's events until the stream ends.
+ */
 export async function* streamChat(
   api: ApiClient,
   message: string,
   history: ChatHistoryMessage[],
   signal: AbortSignal,
 ): AsyncGenerator<ChatStreamEvent> {
+  const timezone = browserTimeZone();
   const response = await api.send('/api/v1/chat/stream', {
     method: 'POST',
-    body: { message, history },
+    body: timezone === undefined ? { message, history } : { message, history, timezone },
     headers: { Accept: 'text/event-stream' },
     signal,
   });

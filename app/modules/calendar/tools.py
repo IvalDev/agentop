@@ -1,10 +1,10 @@
 """Calendar chat tools (D5/D6, T3): list, create, and cancel the user's events.
 
-Three ToolSpecs on module ``calendar``, registered only through
-:func:`register_calendar_tools` — the T1 human decision still holds: nothing
-in the production import graph registers calendar tools (or the calendar
-manifest) into a process-wide default; tests call this entry point against a
-LOCAL :class:`~app.modules.tools.registry.ToolRegistry`.
+Three ToolSpecs on module ``calendar``, registered through
+:func:`register_calendar_tools`: ``app/main.py`` calls it once at import time
+on the process-wide ``default_registry`` (human-approved allowlist entry,
+locked by ``tests/test_tools_executor.py``); tests call it against a LOCAL
+:class:`~app.modules.tools.registry.ToolRegistry`.
 
 Tool shapes (D5 — all ``ALLOW_WITHOUT_APPROVAL``: this is the user's own
 calendar and the action is self-service, so the model never waits for a human
@@ -14,8 +14,14 @@ approval round-trip):
   ``primary``) inside a required ``from``/``to`` range, bounded
   ``max_results`` (1–50, default 10);
 - ``create_event`` — ``ACTION`` / operator: insert one event
-  (``dateTime`` ISO 8601 with offset; all-day events are out of the MVP);
+  (``dateTime`` ISO 8601; all-day events are out of the MVP);
 - ``cancel_event`` — ``ACTION`` / operator: delete one event by id.
+
+Times follow the user's timezone (agent-engine-routing D7): a datetime input
+may be naive — the user's wall-clock time — or carry an offset, never both
+in one input. Handlers localize naive values with ``ToolContext.timezone``
+(UTC when it is ``None`` or unusable) and pass that zone name to the provider
+as ``time_zone``, so Google stores and returns times in the user's zone.
 
 ``operator`` (not ``viewer``) gates the two ACTIONs because viewer is the
 read-only role in this repo's rank map — an operator is the lowest role that
@@ -39,8 +45,9 @@ only the handlers do, so a refused call can never touch the external API.
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any, Self
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -89,13 +96,28 @@ MAX_SUMMARY_LENGTH = 1024
 MAX_DESCRIPTION_LENGTH = 4096
 
 
-def _aware(value: datetime, field_name: str) -> datetime:
-    """Reject naive datetimes: Google needs an offset in every dateTime."""
-    if value.tzinfo is None:
+#: Sentence appended to the time-taking tool descriptions (sent to the model on every call).
+TIMES_NOTE = (
+    "Times without an offset are read in the user's timezone (stated in the system "
+    "message); an offset is optional."
+)
+
+
+def _is_naive(value: datetime) -> bool:
+    """True for a wall-clock datetime without a UTC offset."""
+    return value.utcoffset() is None
+
+
+def _same_form(first: datetime, second: datetime, fields: str) -> None:
+    """Reject one input that mixes a naive datetime with an offset-bearing one.
+
+    Called before any ordering check, so ``<`` never compares naive with aware.
+    """
+    if _is_naive(first) != _is_naive(second):
         raise ValueError(
-            f"{field_name} must include a timezone offset (e.g. 2026-10-20T09:00:00+02:00)"
+            f"{fields} must both include a UTC offset or both omit it "
+            "(times without an offset are read in the user's timezone)"
         )
-    return value
 
 
 class ListEventsInput(BaseModel):
@@ -103,18 +125,16 @@ class ListEventsInput(BaseModel):
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    from_: datetime = Field(alias="from", description="Start of the range, ISO 8601 with offset.")
-    to: datetime = Field(description="End of the range, ISO 8601 with offset.")
+    from_: datetime = Field(
+        alias="from", description="Start of the range, ISO 8601 (offset optional)."
+    )
+    to: datetime = Field(description="End of the range, ISO 8601 (offset optional).")
     max_results: int = Field(default=MAX_RESULTS_DEFAULT, ge=1, le=MAX_RESULTS_LIMIT)
     calendar_id: str = Field(default="primary", min_length=1)
 
-    @field_validator("from_", "to")
-    @classmethod
-    def _must_be_aware(cls, value: datetime) -> datetime:
-        return _aware(value, "field")
-
     @model_validator(mode="after")
     def _range_is_ordered(self) -> Self:
+        _same_form(self.from_, self.to, "from and to")
         if self.from_ >= self.to:
             raise ValueError("from must be before to")
         return self
@@ -148,11 +168,6 @@ class CreateEventInput(BaseModel):
     description: str | None = Field(default=None, max_length=MAX_DESCRIPTION_LENGTH)
     attendees: list[str] = Field(default_factory=list, max_length=MAX_ATTENDEES)
 
-    @field_validator("start", "end")
-    @classmethod
-    def _must_be_aware(cls, value: datetime) -> datetime:
-        return _aware(value, "field")
-
     @field_validator("attendees")
     @classmethod
     def _attendees_are_present(cls, value: list[str]) -> list[str]:
@@ -163,6 +178,7 @@ class CreateEventInput(BaseModel):
 
     @model_validator(mode="after")
     def _end_after_start(self) -> Self:
+        _same_form(self.start, self.end, "start and end")
         if self.end <= self.start:
             raise ValueError("end must be after start")
         return self
@@ -351,6 +367,39 @@ async def calendar_precheck(context: ToolContext, validated_input: BaseModel) ->
     await _live_connection(context)
 
 
+def _user_zone(name: str | None) -> ZoneInfo | None:
+    """The requesting user's tz database zone, or ``None`` when absent or unusable.
+
+    The agent run already resolved ``ToolContext.timezone`` (``"UTC"`` on
+    fallback); it is ``None`` outside chat runs. An unusable name is only a
+    defensive path here and never fails the call.
+    """
+    if not name:
+        return None
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        return None
+
+
+def _localize(value: datetime, zone: ZoneInfo | None) -> datetime:
+    """Read a naive ``value`` as wall-clock time in ``zone`` (UTC when ``None``).
+
+    Offset-bearing values are returned untouched. DST edges use ``fold=0``
+    on purpose, so they are deterministic and never an error: a repeated
+    time (clocks going back) is its first occurrence, and a skipped time
+    (clocks going forward) keeps the offset in effect before the change.
+    """
+    if not _is_naive(value):
+        return value
+    return value.replace(tzinfo=zone or UTC, fold=0)
+
+
+def _time_zone_argument(zone: ZoneInfo | None) -> dict[str, str]:
+    """The provider's ``time_zone`` keyword, omitted when there is no usable zone."""
+    return {"time_zone": zone.key} if zone is not None else {}
+
+
 def _map_event(item: dict[str, Any]) -> CalendarEvent:
     """Flatten one Google ``items`` entry into a :class:`CalendarEvent`."""
     start = item.get("start") if isinstance(item.get("start"), dict) else {}
@@ -381,11 +430,13 @@ async def list_events_handler(
     """Return the events of one calendar inside the requested range."""
     row, access_token = await _live_connection(context)
     provider = _provider_for(row, access_token)
+    zone = _user_zone(context.timezone)
     items = await provider.list_events(
         calendar_id=validated_input.calendar_id,
         max_results=validated_input.max_results,
-        time_min=validated_input.from_.isoformat(),
-        time_max=validated_input.to.isoformat(),
+        time_min=_localize(validated_input.from_, zone).isoformat(),
+        time_max=_localize(validated_input.to, zone).isoformat(),
+        **_time_zone_argument(zone),
     )
     return ListEventsOutput(events=[_map_event(item) for item in items if isinstance(item, dict)])
 
@@ -396,12 +447,14 @@ async def create_event_handler(
     """Insert one event on the user's primary calendar."""
     row, access_token = await _live_connection(context)
     provider = _provider_for(row, access_token)
+    zone = _user_zone(context.timezone)
     payload = await provider.create_event(
         summary=validated_input.summary,
-        start=validated_input.start.isoformat(),
-        end=validated_input.end.isoformat(),
+        start=_localize(validated_input.start, zone).isoformat(),
+        end=_localize(validated_input.end, zone).isoformat(),
         description=validated_input.description,
         attendees=validated_input.attendees or None,
+        **_time_zone_argument(zone),
     )
     return CreateEventOutput.model_validate(payload)
 
@@ -422,7 +475,7 @@ LIST_EVENTS = ToolSpec(
     name="list_events",
     description=(
         "List the user's calendar events inside a time range, each with id, "
-        "summary, start, end, attendees, and status."
+        f"summary, start, end, attendees, and status. {TIMES_NOTE}"
     ),
     kind=ToolKind.EXTRACT,
     approval_policy=ApprovalPolicy.ALLOW_WITHOUT_APPROVAL,
@@ -438,7 +491,7 @@ CREATE_EVENT = ToolSpec(
     name="create_event",
     description=(
         "Create one event on the user's primary calendar (summary, start, "
-        "end with timezone offset; optional description and attendee emails)."
+        f"end; optional description and attendee emails). {TIMES_NOTE}"
     ),
     kind=ToolKind.ACTION,
     approval_policy=ApprovalPolicy.ALLOW_WITHOUT_APPROVAL,
@@ -465,12 +518,13 @@ CANCEL_EVENT = ToolSpec(
 
 
 def register_calendar_tools(registry: ToolRegistry) -> None:
-    """Register the three calendar tools on ``registry`` (never at import).
+    """Register the three calendar tools on ``registry``.
 
-    Explicit entry point, same contract as every other registration in this
-    module (T1 human decision): the production import graph registers
-    nothing, and ``tests/test_tools_executor.py``'s allowlist test keeps
-    locking ``default_registry``. Tests call this against a LOCAL registry.
+    Explicit entry point: importing this module registers nothing.
+    ``app/main.py`` calls it once at import time on ``default_registry``
+    (the human-approved allowlist entry that
+    ``tests/test_tools_executor.py``'s allowlist test locks); tests call it
+    against a LOCAL registry.
     """
     for spec in (LIST_EVENTS, CREATE_EVENT, CANCEL_EVENT):
         registry.register(spec)

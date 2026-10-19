@@ -9,7 +9,11 @@ Contract under test:
   ``execute_tool`` call: a full agent run over a local registry with a real
   (fake-provider) connection decrypts the stored token and succeeds, while
   the same run without the key hits the precheck and the model receives the
-  actionable reason.
+  actionable reason;
+- runs use a local catalog holding the calendar manifest, so with the module
+  active the first scripted reply is the engine router's (``calendar``) and
+  the agent's calls follow; with it inactive there is no calendar engine,
+  no router call, and the calendar tools are never offered.
 
 Calendar tools are ``ALLOW_WITHOUT_APPROVAL`` (D5), so they never flow
 through the approvals service — that path keeps its default
@@ -27,8 +31,10 @@ from app.core.db import Database
 from app.modules.agent.llm import AssistantMessage, FakeLLMProvider, ToolCall
 from app.modules.agent.service import AgentDeps, run_agent, tool_schemas
 from app.modules.calendar.provider import provider_registry, register_provider
+from app.modules.calendar.registry import register_calendar
 from app.modules.calendar.tools import EXPIRED, NOT_CONFIGURED, register_calendar_tools
 from app.modules.catalog.models import ModuleActivation
+from app.modules.catalog.registry import ModuleCatalog
 from app.modules.connections.models import ConnectionStatus, UserConnection
 from app.modules.identity.deps import CurrentUser
 from app.modules.retrieval.embeddings import FakeEmbeddingProvider
@@ -69,6 +75,10 @@ def call(name: str, arguments: dict | None = None) -> AssistantMessage:
 
 def answer(text: str) -> AssistantMessage:
     return AssistantMessage(content=text)
+
+
+#: The engine router's reply when the calendar module is active (first model call).
+ROUTE_TO_CALENDAR = answer("calendar")
 
 
 async def activate_calendar(db: Database, tenant_id: int, user_id: int) -> None:
@@ -142,12 +152,15 @@ async def run(db: Database, user: CurrentUser, agent_deps: AgentDeps, message: s
 
 
 def deps(registry: ToolRegistry, llm, *, credentials_key: str | None = None) -> AgentDeps:
+    catalog = ModuleCatalog()
+    register_calendar(catalog)
     return AgentDeps(
         registry=registry,
         llm=llm,
         embeddings=FakeEmbeddingProvider(dimension=DIM),
         settings=Settings(jwt_secret=JWT_SECRET, approval_ttl_seconds=3600),
         credentials_key=credentials_key,
+        catalog=catalog,
     )
 
 
@@ -193,13 +206,17 @@ async def test_agent_run_decrypts_the_stored_token_and_lists_events(
     await seed_connection(seeded_db, owner, key=oauth_key)
     factory = ListFactory()
     register_provider("google", factory)
-    llm = FakeLLMProvider([call("list_events", LIST_INPUT), answer("You have one event.")])
+    llm = FakeLLMProvider(
+        [ROUTE_TO_CALENDAR, call("list_events", LIST_INPUT), answer("You have one event.")]
+    )
 
     response = await run(seeded_db, owner, deps(calendar_registry, llm, credentials_key=oauth_key))
 
     assert response.answer == "You have one event."
     assert [(i.tool_name, i.status) for i in response.tool_calls] == [("list_events", "ok")]
     assert factory.access_tokens == ["ya29.chat-wired"]
+    assert llm.calls[0].tools == []  # the router call
+    assert {tool["function"]["name"] for tool in llm.calls[1].tools} == CALENDAR_TOOLS
 
 
 async def test_agent_run_without_credentials_key_reaches_the_model_as_precheck(
@@ -209,13 +226,13 @@ async def test_agent_run_without_credentials_key_reaches_the_model_as_precheck(
     owner = seeded_users[OWNER]
     await activate_calendar(seeded_db, owner.tenant_id, owner.id)
     await seed_connection(seeded_db, owner, key=oauth_key)
-    llm = FakeLLMProvider([call("list_events", LIST_INPUT), answer("Please connect.")])
+    llm = FakeLLMProvider([ROUTE_TO_CALENDAR, call("list_events", LIST_INPUT), answer("Connect.")])
 
     response = await run(seeded_db, owner, deps(calendar_registry, llm))
 
     assert response.tool_calls[0].error == "precheck_failed"
     # The model sees the detailed reason (executor message reaches the loop).
-    tool_msg = llm.calls[1].messages[-1]
+    tool_msg = llm.calls[2].messages[-1]
     assert tool_msg.role == "tool"
     assert NOT_CONFIGURED in tool_msg.content
 
@@ -227,22 +244,26 @@ async def test_agent_run_surfaces_the_expired_reason_when_refresh_is_impossible(
     owner = seeded_users[OWNER]
     await activate_calendar(seeded_db, owner.tenant_id, owner.id)
     await seed_connection(seeded_db, owner, key=oauth_key, expires_in=-120)
-    llm = FakeLLMProvider([call("list_events", LIST_INPUT), answer("Please reconnect.")])
+    llm = FakeLLMProvider(
+        [ROUTE_TO_CALENDAR, call("list_events", LIST_INPUT), answer("Please reconnect.")]
+    )
 
     response = await run(seeded_db, owner, deps(calendar_registry, llm, credentials_key=oauth_key))
 
     assert response.tool_calls[0].error == "precheck_failed"
-    tool_msg = llm.calls[1].messages[-1]
+    tool_msg = llm.calls[2].messages[-1]
     assert EXPIRED in tool_msg.content
 
 
 async def test_inactive_calendar_module_never_reaches_the_precheck_in_chat(
     seeded_db: Database, seeded_users, calendar_registry: ToolRegistry, oauth_key
 ) -> None:
-    """Without a ModuleActivation row the loop refuses as inactive_module."""
+    """Without a ModuleActivation row the tools are never offered; a call is refused."""
     owner = seeded_users[OWNER]
     llm = FakeLLMProvider([call("list_events", LIST_INPUT), answer("Not available.")])
 
     response = await run(seeded_db, owner, deps(calendar_registry, llm, credentials_key=oauth_key))
 
-    assert response.tool_calls[0].error == "inactive_module"
+    assert response.tool_calls[0].error == "unknown_tool"
+    assert llm.calls[0].tools == []  # knowledge only (no core tool here), no router call
+    assert len(llm.calls) == 2
