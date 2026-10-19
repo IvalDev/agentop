@@ -1,10 +1,11 @@
 import { vi } from 'vitest';
 import type { Role } from '../session/roles';
 
-/** A canned answer: a status plus an optional JSON body. */
+/** A canned answer: a status, an optional JSON body, and optional extra headers. */
 export interface FakeReply {
   status: number;
   body?: unknown;
+  headers?: Record<string, string>;
 }
 
 /**
@@ -13,10 +14,10 @@ export interface FakeReply {
  */
 export type FakeRoutes = Record<string, FakeReply | ((init: RequestInit) => FakeReply | Promise<FakeReply>)>;
 
-export function jsonResponse({ status, body }: FakeReply): Response {
+export function jsonResponse({ status, body, headers }: FakeReply): Response {
   return new Response(body === undefined ? null : JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...headers },
   });
 }
 
