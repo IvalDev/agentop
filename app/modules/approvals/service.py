@@ -22,7 +22,11 @@ Product policy:
   caught like a tampered payload), and runs exactly the stored payload.
 - Execution runs the tool's precheck again right before its handler (inside
   ``execute_tool``); a refusal is a failed run like a handler error: the
-  request ends ``failed`` with ``precheck_failed: <reason>``.
+  request ends ``failed`` with ``precheck_failed: <reason>``. The tool's
+  module must still be active for the tenant at execution time (the set is
+  re-read with ``active_module_keys``): a module deactivated between
+  approval and execution ends the request ``failed`` with
+  ``inactive_module``.
 - Requests expire ``Settings.approval_ttl_seconds`` after creation. Expiry
   is enforced on approve, reject, and execute: the first such call at or
   after ``expires_at`` marks a pending/approved request ``expired``. Listing
@@ -77,6 +81,7 @@ from app.modules.approvals.grants import mint_grant
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event, stage_event
+from app.modules.catalog.service import active_module_keys
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.deps import TenantContext
 from app.modules.identity.models import UserRole
@@ -472,11 +477,14 @@ async def execute_approved_action(
     Then an atomic ``approved → executing`` claim is committed (a loser of a
     race gets :class:`ApprovalStateError`), ``execute_tool`` runs the stored
     payload with a freshly minted single-use grant (and ``llm``/``storage``
-    in the tool context), and the request ends ``executed`` (with the
+    in the tool context) gated by the tenant's *current* module activations
+    (re-read with ``active_module_keys`` once per execution: a tool of a
+    module deactivated since the approval is refused there as
+    ``inactive_module``), and the request ends ``executed`` (with the
     JSON-encoded output) or ``failed`` (with the error — a precheck refusal
-    included; the handler's uncommitted writes are rolled back first). A
-    crash after the claim leaves ``executing``: never re-runnable, visible
-    for operators.
+    or an inactive module included; the handler's uncommitted writes are
+    rolled back first). A crash after the claim leaves ``executing``: never
+    re-runnable, visible for operators.
     """
     now = _utc(now)
     request = await _load(session, user, request_id)
@@ -503,6 +511,9 @@ async def execute_approved_action(
     if not role_satisfies(user, spec.required_role):
         await _deny(session, user, "execute", spec.name, request_id)
 
+    # Module activation may change between approval and execution: re-read it.
+    active_modules = await active_module_keys(session, user.tenant_id)
+
     payload, action_key = dict(request.input_payload), request.action_key
     claim = {"status": ApprovalStatus.EXECUTING, "executed_by": user.id, "executed_at": now}
     if not await _transition(session, request_id, ApprovalStatus.APPROVED, claim, alive_at=now):
@@ -520,6 +531,7 @@ async def execute_approved_action(
         correlation_id=str(request_id),
         llm=llm,
         storage=storage,
+        active_modules=active_modules,
     )
     if result.status == "ok":
         outcome = {

@@ -2,9 +2,11 @@
 
 Covers the T6 registration contract: valid specs register and round-trip;
 duplicate names, invalid names, missing input models, the
-ACTION-must-require-approval invariant, and the T11 hook invariants
-(``approval_role`` only on ``REQUIRE_APPROVAL`` tools, callable hooks) all
-raise ``ToolRegistrationError``; unknown lookups raise ``ToolNotFoundError``.
+ACTION-must-require-approval invariant, the T11 hook invariants
+(``approval_role`` only on ``REQUIRE_APPROVAL`` tools, callable hooks), and
+the T2 module invariant (``module`` defaults to ``None`` for core tools; a
+declared key must be a lowercase identifier) all raise
+``ToolRegistrationError``; unknown lookups raise ``ToolNotFoundError``.
 """
 
 import pytest
@@ -50,6 +52,20 @@ def build_spec(
         input_model=input_model,
         approval_role=approval_role,
         precheck=precheck,
+    )
+
+
+def build_moduled_spec(module) -> ToolSpec:
+    """A spec declaring ``module`` — only the module-invariant tests use it."""
+    return ToolSpec(
+        name="demo_tool",
+        description="registry test tool",
+        kind=ToolKind.EXTRACT,
+        approval_policy=ApprovalPolicy.AUTO,
+        required_role=UserRole.OPERATOR,
+        handler=stub_handler,
+        input_model=DemoInput,
+        module=module,
     )
 
 
@@ -130,6 +146,33 @@ def test_invalid_name_raises(bad_name: str) -> None:
 
     with pytest.raises(ToolRegistrationError, match="name"):
         registry.register(build_spec(name=bad_name))
+
+
+def test_module_defaults_to_none_for_core_tools() -> None:
+    """A spec that declares no module is a core tool: always available."""
+    registry = ToolRegistry()
+
+    registry.register(build_spec())
+
+    assert registry.get("demo_tool").module is None
+
+
+def test_valid_module_key_registers_and_round_trips() -> None:
+    """A module tool keeps its catalog key through registration."""
+    registry = ToolRegistry()
+
+    registry.register(build_moduled_spec("calendar"))
+
+    assert registry.get("demo_tool").module == "calendar"
+
+
+@pytest.mark.parametrize("bad_module", [*INVALID_NAMES, 42])
+def test_invalid_module_raises(bad_module) -> None:
+    """Module keys follow the same lowercase-identifier pattern as tool names."""
+    registry = ToolRegistry()
+
+    with pytest.raises(ToolRegistrationError, match="module"):
+        registry.register(build_moduled_spec(bad_module))
 
 
 def test_missing_input_model_raises() -> None:

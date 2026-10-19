@@ -20,6 +20,7 @@ STATIC_DIR = Path(__file__).resolve().parents[1] / "app" / "ui" / "static"
 async def _get(monkeypatch: pytest.MonkeyPatch, environment: str, path: str):
     monkeypatch.setenv("AA_ENVIRONMENT", environment)
     monkeypatch.setenv("AA_JWT_SECRET", "test-secret-0123456789-abcdefghijklmnop")
+    monkeypatch.setenv("AA_CREDENTIALS_KEY", "cqsp933navSzGBmyUEnO6EKloifkQMdohIhgjgTQ3iE=")
     transport = ASGITransport(app=create_app())
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         return await client.get(path)

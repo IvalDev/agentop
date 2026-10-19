@@ -57,6 +57,7 @@ export const esES = {
     knowledge: 'Base de conocimiento',
     settings: 'Configuración',
     team: 'Equipo',
+    tools: 'Herramientas',
   },
   sections: {
     comingSoon: 'Esta sección estará disponible próximamente.',
@@ -72,6 +73,10 @@ export const esES = {
     team: {
       title: 'Equipo',
       description: 'Da de alta a las personas de tu empresa y gestiona sus roles.',
+    },
+    tools: {
+      title: 'Herramientas',
+      description: 'Activa o desactiva los módulos del catálogo. El cambio se aplica a toda tu empresa.',
     },
   },
   chat: {
@@ -264,6 +269,49 @@ export const esES = {
       lastOwner: 'La empresa debe tener al menos un propietario activo.',
       conflict: 'No se ha podido aplicar el cambio porque incumple las reglas del equipo.',
       invalid: 'Los datos no son válidos. Revisa los campos e inténtalo de nuevo.',
+      network: 'No se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
+      unexpected: 'Se ha producido un error inesperado. Inténtalo de nuevo.',
+    },
+  },
+  tools: {
+    list: {
+      title: 'Módulos',
+      caption: 'Módulos disponibles para tu empresa',
+      loading: 'Cargando los módulos…',
+      loadError: 'No se han podido cargar los módulos. Comprueba la conexión e inténtalo de nuevo.',
+      retry: 'Reintentar',
+      empty: 'Todavía no hay módulos disponibles.',
+      columns: {
+        module: 'Módulo',
+        description: 'Descripción',
+        version: 'Versión',
+        state: 'Estado',
+        actions: 'Acciones',
+      },
+      active: 'Activo',
+      inactive: 'Inactivo',
+      activate: 'Activar',
+      deactivate: 'Desactivar',
+      actionTarget: '«{name}»',
+      toolsNote: 'Herramientas: {list}',
+      permissionsNote: 'Permisos: {list}',
+    },
+    activation: {
+      title: 'Activar {name}',
+      description: 'El módulo pasará a estar disponible para todas las personas de tu empresa.',
+      confirm: 'Activar',
+      done: 'Has activado el módulo {name}.',
+    },
+    deactivation: {
+      title: 'Desactivar {name}',
+      description: 'El módulo dejará de estar disponible para tu empresa. Su configuración y sus datos se conservan.',
+      confirm: 'Desactivar',
+      done: 'Has desactivado el módulo {name}.',
+    },
+    cancel: 'Cancelar',
+    errors: {
+      forbidden: 'No tienes permiso para cambiar los módulos de tu empresa.',
+      notFound: 'Ese módulo ya no está en el catálogo.',
       network: 'No se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
       unexpected: 'Se ha producido un error inesperado. Inténtalo de nuevo.',
     },

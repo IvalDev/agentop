@@ -684,6 +684,91 @@ async def test_unexpected_precheck_exception_is_masked_as_tool_failed(
     assert await audit_log(identity_db, action="tool.precheck_failed") == []
 
 
+# --- Module gating (T2) -------------------------------------------------------
+
+
+async def test_inactive_module_tool_is_refused_before_validation_approval_and_handler(
+    identity_db: Database, audit_log
+) -> None:
+    """An inactive module answers first — even invalid input never gets validated."""
+    handler = SpyHandler({"sent": True})
+    precheck = PrecheckSpy()
+    registry = gated_registry(module="calendar", handler=handler, precheck=precheck)
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry,
+            session,
+            make_user(UserRole.OPERATOR),
+            "gated_action",
+            {"value": 0},  # invalid (ge=1): the module gate must answer before validation
+            active_modules=set(),
+        )
+
+    assert (result.status, result.error_kind, result.error) == (
+        "error",
+        "inactive_module",
+        "inactive_module",
+    )
+    assert (result.approval_request, result.output) == (None, None)
+    assert handler.calls == []
+    assert precheck.contexts == []
+    [event] = await audit_log(identity_db, action="tool.inactive_module")
+    assert (event.actor_user_id, event.tool_name) == (7, "gated_action")
+    assert event.payload == {"input_fields": ["value"]}
+    assert event.result == {"error": "inactive_module", "module": "calendar"}
+    assert await audit_log(identity_db, action="tool.invalid_input") == []
+    assert await audit_log(identity_db, action="tool.approval_required") == []
+
+
+async def test_module_tool_passes_the_gate_when_the_module_is_active(
+    identity_db: Database,
+) -> None:
+    """Membership in ``active_modules`` lets the call continue to the approval gate."""
+    registry = gated_registry(module="calendar")
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry,
+            session,
+            make_user(UserRole.OPERATOR),
+            "gated_action",
+            {"value": 3},
+            active_modules={"calendar"},
+        )
+
+    assert result.status == "approval_required"
+
+
+async def test_core_tool_runs_whatever_the_active_module_set(
+    tools: ToolBundle, identity_db: Database
+) -> None:
+    """``module=None`` is core: even an empty active set never gates it."""
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            tools.registry,
+            session,
+            make_user(),
+            "spy_extract",
+            {"value": 2},
+            active_modules=set(),
+        )
+
+    assert result.status == "ok"
+
+
+async def test_without_active_modules_there_is_no_module_gate(
+    identity_db: Database, audit_log
+) -> None:
+    """``active_modules=None`` (the default) keeps the pre-T2 behavior: no gating."""
+    registry = gated_registry(module="calendar")
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry, session, make_user(UserRole.OPERATOR), "gated_action", {"value": 3}
+        )
+
+    assert result.status == "approval_required"
+    assert await audit_log(identity_db, action="tool.inactive_module") == []
+
+
 # --- Builtin tools wired on the default registry -----------------------------
 
 #: Acceptance criterion 5: every production tool is listed here on purpose, so

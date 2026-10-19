@@ -8,6 +8,8 @@ audit events as an upload through the API.
 import os
 import re
 import sqlite3
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -86,6 +88,29 @@ def test_fixture_set_covers_the_demo_business_documents() -> None:
     assert len([name for name in names if name.startswith("empleado_")]) >= 6
     assert len([name for name in names if name.startswith("rrhh_")]) >= 2
     assert all(path.suffix in {".md", ".txt"} for path in fixture_paths())
+
+
+def test_seed_registers_every_app_model_table() -> None:
+    """``python -m app.demo.seed`` must see the same tables as the full app.
+
+    The seed's ``create_all`` only creates tables whose model modules it
+    imports. A module missing there means a fresh ``dev.db`` breaks every
+    endpoint touching that table while the suite stays green (tests import
+    ``app.main``, which registers everything). Runs in a clean interpreter
+    so earlier imports in this process cannot mask the gap.
+    """
+    code = (
+        "import app.demo.seed\n"
+        "from app.core.db import Base\n"
+        "seed_tables = set(Base.metadata.tables)\n"
+        "import app.main  # noqa: F401\n"
+        "full_tables = set(Base.metadata.tables)\n"
+        "print(sorted(full_tables - seed_tables))\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=True
+    )
+    assert result.stdout.strip() == "[]", result.stdout.strip()
 
 
 async def test_seed_creates_tenant_team_and_ingested_documents(
@@ -235,6 +260,7 @@ def _cli_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, environment: str =
     monkeypatch.setenv("AA_STORAGE_BASE_DIR", str(tmp_path / "storage"))
     monkeypatch.setenv("AA_ENVIRONMENT", environment)
     monkeypatch.setenv("AA_JWT_SECRET", JWT_SECRET)
+    monkeypatch.setenv("AA_CREDENTIALS_KEY", "cqsp933navSzGBmyUEnO6EKloifkQMdohIhgjgTQ3iE=")
     monkeypatch.delenv("AA_DEMO_PASSWORD", raising=False)
     return db_file
 

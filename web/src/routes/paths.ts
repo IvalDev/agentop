@@ -5,4 +5,5 @@ export const paths = {
   knowledge: '/conocimiento',
   settings: '/configuracion',
   team: '/configuracion/equipo',
+  tools: '/configuracion/herramientas',
 } as const;

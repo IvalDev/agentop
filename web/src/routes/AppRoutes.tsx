@@ -5,7 +5,8 @@ import { KnowledgePage } from '../pages/KnowledgePage';
 import { LoginPage } from '../pages/LoginPage';
 import { NotFoundPage } from '../pages/NotFoundPage';
 import { TeamPage } from '../pages/TeamPage';
-import { TEAM_MANAGER_ROLES } from '../session/roles';
+import { ToolsPage } from '../pages/ToolsPage';
+import { SETTINGS_ADMIN_ROLES } from '../session/roles';
 import { paths } from './paths';
 import { RequireAuth } from './RequireAuth';
 import { RequireRole } from './RequireRole';
@@ -27,13 +28,14 @@ export function AppRoutes() {
         <Route
           path={paths.settings}
           element={
-            <RequireRole allowed={TEAM_MANAGER_ROLES}>
+            <RequireRole allowed={SETTINGS_ADMIN_ROLES}>
               <Outlet />
             </RequireRole>
           }
         >
           <Route index element={<Navigate to={paths.team} replace />} />
           <Route path={paths.team} element={<TeamPage />} />
+          <Route path={paths.tools} element={<ToolsPage />} />
         </Route>
         <Route path="*" element={<NotFoundPage />} />
       </Route>

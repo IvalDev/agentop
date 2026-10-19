@@ -34,6 +34,7 @@ from app.modules.approvals.service import (
     list_approval_requests,
     reject_request,
 )
+from app.modules.catalog.models import ModuleActivation
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import UserRole
@@ -577,6 +578,53 @@ async def test_precheck_refusal_at_execution_fails_the_request_once(
     assert refused.correlation_id == str(request_id)
     [failed] = await audit_log(seeded_db, action="approval.failed")
     assert failed.result == {"error": "precheck_failed: note already routed"}
+
+
+async def test_execution_refuses_a_tool_whose_module_is_inactive_for_the_tenant(
+    seeded_db: Database, seeded_users, approval_tools, audit_log
+) -> None:
+    """An approved call whose module is off ends failed; activation unblocks the next one."""
+    spec = approval_tools.registry.get("send_note")
+    approval_tools.registry.register(replace(spec, name="moduled_note", module="messaging"))
+    owner = seeded_users[OWNER]
+    request_id = await _create(seeded_db, approval_tools, owner, tool="moduled_note")
+    await _approve(seeded_db, owner, request_id)
+
+    outcome = await _execute(seeded_db, approval_tools, owner, request_id)
+
+    assert (outcome.result.status, outcome.result.error_kind, outcome.result.error) == (
+        "error",
+        "inactive_module",
+        "inactive_module",
+    )
+    assert outcome.request.status is ApprovalStatus.FAILED
+    assert outcome.request.execution_error == "inactive_module"
+    assert approval_tools.spy.calls == []
+    [refused] = await audit_log(seeded_db, action="tool.inactive_module")
+    assert (refused.correlation_id, refused.tool_name) == (str(request_id), "moduled_note")
+    assert refused.payload == {"input_fields": ["body", "priority", "to"]}
+    [failed] = await audit_log(seeded_db, action="approval.failed")
+    assert failed.result == {"error": "inactive_module"}
+
+    # Triangulate: the same flow succeeds once the tenant's admin activates the module.
+    async with seeded_db.sessionmaker() as session:
+        session.add(
+            ModuleActivation(
+                tenant_id=owner.tenant_id,
+                module_key="messaging",
+                active=True,
+                activated_by_user_id=owner.id,
+            )
+        )
+        await session.commit()
+    second_id = await _create(seeded_db, approval_tools, owner, tool="moduled_note")
+    await _approve(seeded_db, owner, second_id)
+
+    allowed = await _execute(seeded_db, approval_tools, owner, second_id)
+
+    assert allowed.result.status == "ok"
+    assert allowed.request.status is ApprovalStatus.EXECUTED
+    assert len(approval_tools.spy.calls) == 1
 
 
 async def test_approved_execution_gives_the_tool_the_llm_and_storage(

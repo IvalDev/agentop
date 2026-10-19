@@ -6,7 +6,8 @@ the audit correlation id of everything the run does):
 1. The conversation is the system policy, the client's capped user/assistant
    history, and the new message (:func:`~app.modules.agent.prompt.build_messages`).
    The model is offered only the tools whose required role the user
-   satisfies, with JSON schemas from their input models.
+   satisfies and whose module (when the tool declares one) the tenant has
+   active, with JSON schemas from their input models.
 2. A reply without tool calls is the final answer. Otherwise each call (at
    most :data:`MAX_TOOL_CALLS_PER_STEP` per reply) runs through
    :func:`~app.modules.tools.executor.execute_tool` as actor ``agent`` with
@@ -74,6 +75,7 @@ from app.modules.approvals.exceptions import ApprovalError
 from app.modules.approvals.service import create_approval_request
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
+from app.modules.catalog.service import active_module_keys
 from app.modules.documents.storage import DocumentStorage
 from app.modules.retrieval.embeddings import EmbeddingProvider
 from app.modules.tools.builtin import SearchDocumentsOutput
@@ -100,6 +102,7 @@ _NAME_MAX_CHARS = 64
 _ERROR_CODES = {
     "not_found": "unknown_tool",
     "forbidden": "forbidden",
+    "inactive_module": "inactive_module",
     "validation": "invalid_input",
     "precheck": "precheck_failed",
     "execution": "tool_failed",
@@ -137,11 +140,22 @@ def new_run_id() -> str:
     return str(uuid4())
 
 
-def tool_schemas(registry: ToolRegistry, user: ToolUser) -> list[dict[str, Any]]:
-    """Function schemas of the tools ``user``'s role satisfies (what the model sees)."""
+def tool_schemas(
+    registry: ToolRegistry, user: ToolUser, active_modules: set[str]
+) -> list[dict[str, Any]]:
+    """Function schemas of the tools ``user`` may use (what the model sees).
+
+    A tool is offered when the user's role satisfies its ``required_role``
+    and its module is available: core tools (``spec.module is None``)
+    always, module tools only when ``spec.module`` is one of the tenant's
+    ``active_modules`` (from
+    :func:`~app.modules.catalog.service.active_module_keys`).
+    """
     schemas = []
     for spec in registry.list_specs():
         if not role_satisfies(user, spec.required_role):
+            continue
+        if spec.module is not None and spec.module not in active_modules:
             continue
         assert spec.input_model is not None  # registration invariant
         schemas.append(
@@ -174,6 +188,8 @@ class AgentRun:
         message: str,
         history: Sequence[HistoryTurn],
         deps: AgentDeps,
+        *,
+        active_modules: set[str],
     ) -> None:
         self.run_id = new_run_id()
         self._session = session
@@ -182,7 +198,8 @@ class AgentRun:
         self._message = message
         self._history_count = len(history)
         self._messages = build_messages(message, history)
-        self._tools = tool_schemas(deps.registry, user)
+        self._active_modules = active_modules
+        self._tools = tool_schemas(deps.registry, user, active_modules)
         self._citations = CitationIndex()
         self._approvals: dict[str, PendingApproval] = {}
         self._summaries: list[ToolCallSummary] = []
@@ -301,6 +318,7 @@ class AgentRun:
                 embeddings=self._deps.embeddings,
                 llm=self._deps.llm,
                 storage=self._deps.storage,
+                active_modules=self._active_modules,
             )
             summary, content, new_approval = await self._handle(call_id, name, result)
         self._summaries.append(summary)
@@ -424,9 +442,12 @@ async def run_agent(
 ) -> ChatResponse:
     """Run the agent to completion and return its response (no streaming).
 
+    The tenant's active module keys are read once per run and gate both the
+    tools the model is offered and every ``execute_tool`` call in the loop.
     Raises :class:`LLMError` when the model backend fails.
     """
-    run = AgentRun(session, user, message, history, deps)
+    active_modules = await active_module_keys(session, user.tenant_id)
+    run = AgentRun(session, user, message, history, deps, active_modules=active_modules)
     async for _event in run.events():
         pass
     return run.response()

@@ -46,7 +46,7 @@ describe('auth guard', () => {
 });
 
 describe('role-based navigation', () => {
-  it.each<Role>(['viewer', 'operator'])('hides Team from a %s', async (role) => {
+  it.each<Role>(['viewer', 'operator'])('hides Settings from a %s', async (role) => {
     signedIn(role, '/chat');
     await screen.findByRole('heading', { level: 1, name: 'Chat' });
 
@@ -54,11 +54,19 @@ describe('role-based navigation', () => {
     expect(within(nav).getByRole('link', { name: 'Chat' })).toHaveAttribute('aria-current', 'page');
     expect(within(nav).getByRole('link', { name: 'Base de conocimiento' })).toBeInTheDocument();
     expect(within(nav).queryByRole('link', { name: 'Equipo' })).not.toBeInTheDocument();
+    expect(within(nav).queryByRole('link', { name: 'Herramientas' })).not.toBeInTheDocument();
     expect(within(nav).queryByText('Configuración')).not.toBeInTheDocument();
   });
 
   it.each<Role>(['viewer', 'operator'])('redirects a %s away from the Team route', async (role) => {
     signedIn(role, '/configuracion/equipo');
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Chat' })).toBeInTheDocument();
+    expect(screen.getByTestId('location')).toHaveTextContent('/chat');
+  });
+
+  it.each<Role>(['viewer', 'operator'])('redirects a %s away from the Tools route', async (role) => {
+    signedIn(role, '/configuracion/herramientas');
 
     expect(await screen.findByRole('heading', { level: 1, name: 'Chat' })).toBeInTheDocument();
     expect(screen.getByTestId('location')).toHaveTextContent('/chat');
@@ -75,6 +83,19 @@ describe('role-based navigation', () => {
     expect(await screen.findByRole('heading', { level: 1, name: 'Equipo' })).toBeInTheDocument();
     expect(screen.getByTestId('location')).toHaveTextContent('/configuracion/equipo');
     expect(document.title).toBe('Equipo · Asistente de trabajo');
+  });
+
+  it.each<Role>(['owner', 'admin'])('lets a %s reach Settings → Tools', async (role) => {
+    const { user } = signedIn(role, '/chat');
+    await screen.findByRole('heading', { level: 1, name: 'Chat' });
+
+    const nav = mainNav();
+    expect(within(nav).getByText('Configuración')).toBeInTheDocument();
+    await user.click(within(nav).getByRole('link', { name: 'Herramientas' }));
+
+    expect(await screen.findByRole('heading', { level: 1, name: 'Herramientas' })).toBeInTheDocument();
+    expect(screen.getByTestId('location')).toHaveTextContent('/configuracion/herramientas');
+    expect(document.title).toBe('Herramientas · Asistente de trabajo');
   });
 
   it('collapses the navigation behind a toggle that reports its state', async () => {

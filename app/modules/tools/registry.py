@@ -10,6 +10,11 @@ authenticated user. Every tool declares:
   human first and is mandatory for every ``ACTION`` (feature decision A7:
   the model never authorizes);
 - the minimum :class:`~app.modules.identity.models.role` that may invoke it;
+- the catalog ``module`` key it belongs to: ``None`` marks a core tool every
+  tenant always has, while a non-``None`` key (a lowercase identifier like a
+  tool name) is offered and executed only while the tenant has that module
+  active (see :func:`app.modules.agent.service.tool_schemas` and
+  :func:`app.modules.tools.executor.execute_tool`);
 - a Pydantic ``input_model`` describing its typed input, and optionally an
   ``output_model`` the handler's return value is validated against.
 
@@ -127,6 +132,9 @@ class ToolSpec:
     ``ToolRegistrationError`` (not a wrapped ``ValidationError``).
     ``input_model`` may be ``None`` on a bare construction but is required
     at registration time. ``required_role`` is who may *invoke* the tool;
+    ``module`` is which catalog module owns it — ``None`` marks a core tool
+    that is never gated by tenant activation, a non-``None`` key must match
+    the tool-name identifier pattern (checked at registration);
     ``approval_role`` and ``precheck`` are the optional hooks described in
     the module docstring.
     """
@@ -141,6 +149,7 @@ class ToolSpec:
     output_model: type[BaseModel] | None = None
     approval_role: ApprovalRoleResolver | None = None
     precheck: ToolPrecheck | None = None
+    module: str | None = None
 
 
 class ToolRegistry:
@@ -155,8 +164,9 @@ class ToolRegistry:
         Raises:
             ToolRegistrationError: duplicate or invalid name, missing or
                 non-Pydantic ``input_model``, non-callable handler or hook,
-                an ``ACTION`` tool that is not ``REQUIRE_APPROVAL``, or an
-                ``approval_role`` on a tool that is not ``REQUIRE_APPROVAL``.
+                an ``ACTION`` tool that is not ``REQUIRE_APPROVAL``, an
+                ``approval_role`` on a tool that is not ``REQUIRE_APPROVAL``,
+                or an invalid ``module`` key.
         """
         if not isinstance(spec.name, str) or not _NAME_PATTERN.fullmatch(spec.name):
             raise ToolRegistrationError(
@@ -165,6 +175,13 @@ class ToolRegistry:
             )
         if spec.name in self._specs:
             raise ToolRegistrationError(f"duplicate tool name: {spec.name!r}")
+        if spec.module is not None and (
+            not isinstance(spec.module, str) or not _NAME_PATTERN.fullmatch(spec.module)
+        ):
+            raise ToolRegistrationError(
+                f"tool {spec.name!r}: invalid module {spec.module!r}: expected lowercase "
+                "identifier like 'calendar'"
+            )
         if spec.input_model is None or not (
             isinstance(spec.input_model, type) and issubclass(spec.input_model, BaseModel)
         ):

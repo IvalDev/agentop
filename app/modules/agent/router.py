@@ -1,9 +1,9 @@
 """Chat API: ``POST /api/v1/chat`` (JSON) and ``POST /api/v1/chat/stream`` (SSE).
 
 Any authenticated role may chat; the tenant always comes from the user, and
-the tools offered to the model are filtered by that user's role. The model
-backend failing maps to 502 (JSON) or a typed ``error`` event (SSE) with a
-generic message.
+the tools offered to the model are filtered by that user's role and by the
+tenant's active catalog modules. The model backend failing maps to 502
+(JSON) or a typed ``error`` event (SSE) with a generic message.
 
 SSE wire format: ``event: <type>\\ndata: <json>\\n\\n`` with the types
 ``run_started``, ``tool_call``, ``approval_required``, ``tool_result``,
@@ -27,6 +27,7 @@ from app.core.db import Database, get_session
 from app.core.deps import get_settings
 from app.modules.agent.llm import LLMError
 from app.modules.agent.service import AgentDeps, AgentRun, run_agent
+from app.modules.catalog.service import active_module_keys
 from app.modules.documents.router import StorageDep
 from app.modules.identity.deps import CurrentUser, get_current_user
 from app.modules.retrieval.router import EmbeddingsDep
@@ -89,7 +90,10 @@ async def _event_stream(
 ) -> AsyncIterator[str]:
     """SSE frames of one run; its own session lives exactly as long as the stream."""
     async with db.sessionmaker() as session:
-        run = AgentRun(session, user, body.message, body.history, deps)
+        active_modules = await active_module_keys(session, user.tenant_id)
+        run = AgentRun(
+            session, user, body.message, body.history, deps, active_modules=active_modules
+        )
         try:
             async for event in run.events(stream=True):
                 yield _frame(event.type, event.data)

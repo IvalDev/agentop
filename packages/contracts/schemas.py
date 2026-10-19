@@ -262,6 +262,36 @@ class AuditEventListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ModuleResponse(BaseModel):
+    """One catalog module with the caller tenant's activation flag.
+
+    The manifest's public identity only: onboarding steps stay server-side
+    until the onboarding API (T4) exposes them per user, and ``tenant_id``
+    never leaves the server.
+    """
+
+    key: str
+    name: str
+    description: str
+    version: str
+    permissions: list[str]
+    tools: list[str]
+    active: bool
+
+
+class ModuleListResponse(BaseModel):
+    """The catalog in registration order with this tenant's activation flags."""
+
+    modules: list[ModuleResponse]
+
+
+class ModuleActivationResponse(BaseModel):
+    """Resulting state of ``POST``/``DELETE`` ``/api/v1/modules/{key}/activate``."""
+
+    key: str
+    active: bool
+
+
 #: Longest chat message (and history turn) the API accepts, in characters.
 CHAT_MESSAGE_MAX_CHARS = 4000
 #: Most prior turns a client may replay as ``history``.
@@ -345,3 +375,133 @@ class ChatResponse(BaseModel):
     sources: list[ChatCitation]
     pending_approvals: list[PendingApproval]
     tool_calls: list[ToolCallSummary]
+
+
+#: Lowercase provider identifier inside a module (``caldav``, ``google`` …).
+_PROVIDER = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
+
+
+class ConnectionResponse(BaseModel):
+    """Public view of one per-user connection.
+
+    Deliberately carries neither ``tenant_id`` nor any credential: ``metadata``
+    is the NON-secret display data only (labels, scopes, endpoint), and the
+    Fernet token has no field here at all — a secret cannot leak through
+    serialization when it has nowhere to serialize to.
+    """
+
+    id: int
+    user_id: int
+    module_key: str
+    provider: str
+    status: Literal["pending", "connected", "expired", "revoked", "failed"]
+    metadata: dict[str, Any]
+    last_health_at: datetime | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class ConnectionListResponse(BaseModel):
+    """One scope of connections: the caller's own, or the whole tenant (admin)."""
+
+    connections: list[ConnectionResponse]
+
+
+class ConnectionCreateRequest(BaseModel):
+    """Body of ``POST /api/v1/connections`` (create-or-update by natural key).
+
+    Tenant and user always come from the authenticated caller. ``credentials``
+    is write-only: encrypted at rest, never echoed, rejected when blank.
+    ``metadata`` is non-secret display data; omitted keeps the stored dict.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    module_key: str = Field(min_length=1, max_length=64)
+    provider: str = Field(min_length=1, max_length=64)
+    credentials: str | dict[str, str] | None = None
+    metadata: dict[str, Any] | None = None
+
+    @field_validator("provider")
+    @classmethod
+    def _require_lowercase_identifier(cls, value: str) -> str:
+        if not _PROVIDER.fullmatch(value):
+            raise ValueError("provider must be a lowercase identifier like 'caldav'")
+        return value
+
+    @field_validator("credentials")
+    @classmethod
+    def _reject_blank_credentials(
+        cls, value: str | dict[str, str] | None
+    ) -> str | dict[str, str] | None:
+        if value is None:
+            return None
+        if isinstance(value, str) and not value.strip():
+            raise ValueError("credentials must not be empty")
+        if not isinstance(value, str) and not value:
+            raise ValueError("credentials must not be empty")
+        return value
+
+
+class OnboardingFieldResponse(BaseModel):
+    """One input of the current onboarding step, for the generic renderer.
+
+    ``secret`` marks a field whose value is encrypted toward the connection
+    and never appears in onboarding state, responses, or audit payloads;
+    ``options`` is the fixed choice list of a ``select`` widget (empty when
+    unconstrained).
+    """
+
+    key: str
+    label: str
+    type: Literal["text", "email", "password", "url", "number", "select"]
+    required: bool
+    secret: bool
+    help_text: str = ""
+    options: list[str] = Field(default_factory=list)
+
+
+class OnboardingStepResponse(BaseModel):
+    """Declarative definition of the step the user is parked on."""
+
+    key: str
+    type: Literal["form", "redirect", "scope_select", "test_connection"]
+    title: str
+    description: str
+    fields: list[OnboardingFieldResponse]
+
+
+class OnboardingStateResponse(BaseModel):
+    """The caller's own onboarding state plus the current step definition.
+
+    State is derived from the authenticated principal — there is no user id
+    in the path or body, so a response can only ever describe the caller's
+    own flow. ``data`` carries the NON-secret answers only; the contract has
+    no field for secrets of any kind, so they cannot leak through
+    serialization. ``step`` is ``None`` once the flow is completed (and for
+    modules that declare no steps — those answer ``completed``).
+    ``created_at``/``updated_at`` are ``None`` while the state is still
+    virtual (no row before the first successful submit).
+    """
+
+    module_key: str
+    status: Literal["not_started", "in_progress", "completed"]
+    current_step: str | None
+    step: OnboardingStepResponse | None
+    data: dict[str, Any]
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+class OnboardingStepSubmitRequest(BaseModel):
+    """Body of ``POST /api/v1/onboarding/{module_key}/steps/{step_key}``.
+
+    The step's answers keyed by field key; the engine validates them strictly
+    against the step's manifest declaration (unknown keys are rejected).
+    ``test_connection`` steps take an empty object; ``redirect`` steps are
+    refused by the engine before any answer is read.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    answers: dict[str, Any] = Field(default_factory=dict)

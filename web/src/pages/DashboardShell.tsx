@@ -4,7 +4,7 @@ import { ChatProvider } from '../chat/ChatProvider';
 import { AppHeader } from '../components/organisms/AppHeader';
 import { MainNav } from '../components/organisms/MainNav';
 import { DashboardLayout } from '../components/templates/DashboardLayout';
-import { canManageTeam } from '../session/roles';
+import { canManageSettings } from '../session/roles';
 import { useCurrentUser, useSession } from '../session/SessionProvider';
 
 /**
@@ -34,7 +34,7 @@ export function DashboardShell() {
           userName={user.fullName}
           role={user.role}
           onLogout={logout}
-          navigation={<MainNav showTeam={canManageTeam(user.role)} />}
+          navigation={<MainNav showSettings={canManageSettings(user.role)} />}
         />
       }
     >
