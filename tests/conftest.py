@@ -1,16 +1,50 @@
 """Shared pytest fixtures for the admin-agent test suite."""
 
+from dataclasses import dataclass, field
+
 import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 
+from app.core.config import Settings
+from app.core.db import Base, Database
 from app.main import create_app
+from app.modules.audit.models import AuditEvent
+from app.modules.identity.deps import CurrentUser
+from app.modules.identity.models import Tenant, User, UserRole
+from app.modules.identity.security import hash_password
+from app.modules.tools.exceptions import ToolPrecheckError
+from app.modules.tools.registry import (
+    ApprovalPolicy,
+    ToolContext,
+    ToolKind,
+    ToolRegistry,
+    ToolSpec,
+)
+
+
+@pytest.fixture(autouse=True)
+def default_embedding_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never call a live Ollama: default every app to the fake providers.
+
+    ``create_app`` builds the embedding and chat adapters from ``Settings``;
+    fixtures that build an app after this runs pick up the offline fakes.
+    Tests that need a specific provider override ``app.state.embeddings`` /
+    ``app.state.llm`` explicitly (constructor arguments still beat environment
+    variables in pydantic).
+    """
+    monkeypatch.setenv("AA_EMBEDDING_PROVIDER", "fake")
+    monkeypatch.setenv("AA_LLM_PROVIDER", "fake")
 
 
 @pytest.fixture
 def app() -> FastAPI:
-    """Build a fresh application instance."""
-    return create_app()
+    """Build a fresh application instance without a database attached."""
+    application = create_app()
+    application.state.db = None
+    return application
 
 
 @pytest.fixture
@@ -19,3 +53,245 @@ async def client(app: FastAPI) -> AsyncClient:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
+
+
+@pytest.fixture
+def identity_settings() -> Settings:
+    """Settings with a fixed JWT secret so tokens are decodable in tests."""
+    return Settings(
+        jwt_secret="test-secret-0123456789-abcdefghijklmnop",
+        access_token_expire_minutes=30,
+    )
+
+
+@pytest.fixture
+async def identity_db() -> Database:
+    """In-memory SQLite database with the full ORM schema created."""
+    db = Database("sqlite+aiosqlite:///:memory:")
+    async with db.engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    try:
+        yield db
+    finally:
+        await db.dispose()
+
+
+@pytest.fixture
+def identity_app(seeded_db: Database, identity_settings: Settings) -> FastAPI:
+    """Application wired with the seeded test database and settings."""
+    application = create_app()
+    application.state.db = seeded_db
+    application.state.settings = identity_settings
+    return application
+
+
+@pytest.fixture
+async def identity_client(identity_app: FastAPI) -> AsyncClient:
+    """HTTP client bound to the identity-enabled application."""
+    transport = ASGITransport(app=identity_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as async_client:
+        yield async_client
+
+
+@pytest.fixture
+async def seeded_db(identity_db: Database) -> Database:
+    """Database with two tenants and users of several roles seeded."""
+    async with identity_db.sessionmaker() as session:
+        acme = Tenant(name="Acme", slug="acme", is_active=True)
+        globex = Tenant(name="Globex", slug="globex", is_active=True)
+        session.add_all([acme, globex])
+        await session.flush()
+        session.add_all(
+            [
+                User(
+                    tenant_id=acme.id,
+                    email="owner@acme.test",
+                    full_name="Acme Owner",
+                    hashed_password=hash_password("owner-pass"),
+                    role=UserRole.OWNER,
+                ),
+                User(
+                    tenant_id=acme.id,
+                    email="admin@acme.test",
+                    full_name="Acme Admin",
+                    hashed_password=hash_password("admin-pass"),
+                    role=UserRole.ADMIN,
+                ),
+                User(
+                    tenant_id=acme.id,
+                    email="viewer@acme.test",
+                    full_name="Acme Viewer",
+                    hashed_password=hash_password("viewer-pass"),
+                    role=UserRole.VIEWER,
+                ),
+                User(
+                    tenant_id=globex.id,
+                    email="owner@globex.test",
+                    full_name="Globex Owner",
+                    hashed_password=hash_password("other-pass"),
+                    role=UserRole.OWNER,
+                ),
+            ]
+        )
+        await session.commit()
+    return identity_db
+
+
+@pytest.fixture
+async def seeded_users(seeded_db: Database) -> dict[str, CurrentUser]:
+    """Request-scoped principals for every seeded user, keyed by email."""
+    async with seeded_db.sessionmaker() as session:
+        users = (await session.execute(select(User))).scalars().all()
+    return {
+        user.email: CurrentUser(
+            id=user.id,
+            tenant_id=user.tenant_id,
+            email=user.email,
+            full_name=user.full_name,
+            role=user.role,
+            is_superadmin=user.is_superadmin,
+        )
+        for user in users
+    }
+
+
+class SendNoteInput(BaseModel):
+    """Input of the test-only ``send_note`` ACTION tool (``priority`` has a default)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    to: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    priority: int = Field(default=1, ge=1, le=5)
+
+
+@dataclass
+class ActionSpy:
+    """Async handler double: records every call, then returns or raises."""
+
+    error: Exception | None = None
+    calls: list[tuple[int, CurrentUser, BaseModel]] = field(default_factory=list)
+    contexts: list[ToolContext] = field(default_factory=list)
+
+    async def __call__(self, context: ToolContext, validated_input: BaseModel) -> dict:
+        self.calls.append((context.tenant_id, context.user, validated_input))
+        self.contexts.append(context)
+        if self.error is not None:
+            raise self.error
+        return {"delivered": True, "to": validated_input.to}
+
+
+@dataclass
+class PrecheckSpy:
+    """Async precheck double: records every context, then passes, refuses, or raises."""
+
+    refusal: str | None = None
+    error: Exception | None = None
+    contexts: list[ToolContext] = field(default_factory=list)
+
+    async def __call__(self, context: ToolContext, validated_input: BaseModel) -> None:
+        self.contexts.append(context)
+        if self.error is not None:
+            raise self.error
+        if self.refusal is not None:
+            raise ToolPrecheckError(self.refusal)
+
+
+def note_approver(note: SendNoteInput) -> UserRole:
+    """Test-only approver tiers by priority: 1-2 operator, 3-4 admin, 5 owner."""
+    if note.priority >= 5:
+        return UserRole.OWNER
+    if note.priority >= 3:
+        return UserRole.ADMIN
+    return UserRole.OPERATOR
+
+
+@dataclass
+class ApprovalTools:
+    """Local registry holding test-only tools (never the production registry)."""
+
+    registry: ToolRegistry
+    spy: ActionSpy
+    precheck: PrecheckSpy = field(default_factory=PrecheckSpy)
+
+
+@pytest.fixture
+def approval_tools() -> ApprovalTools:
+    """Registry with admin- and operator-gated ACTION tools and an AUTO extract tool."""
+    registry = ToolRegistry()
+    spy = ActionSpy()
+    registry.register(
+        ToolSpec(
+            name="send_note",
+            description="test-only action that needs human approval",
+            kind=ToolKind.ACTION,
+            approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+            required_role=UserRole.ADMIN,
+            handler=spy,
+            input_model=SendNoteInput,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="queue_note",
+            description="test-only operator action that needs human approval",
+            kind=ToolKind.ACTION,
+            approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+            required_role=UserRole.OPERATOR,
+            handler=spy,
+            input_model=SendNoteInput,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="peek_note",
+            description="test-only extract that never needs approval",
+            kind=ToolKind.EXTRACT,
+            approval_policy=ApprovalPolicy.AUTO,
+            required_role=UserRole.VIEWER,
+            handler=spy,
+            input_model=SendNoteInput,
+        )
+    )
+    return ApprovalTools(registry=registry, spy=spy)
+
+
+@pytest.fixture
+def tiered_tools(approval_tools: ApprovalTools) -> ApprovalTools:
+    """``approval_tools`` plus ``route_note``: an operator ACTION approved by priority tier.
+
+    Its approver role comes from :func:`note_approver` and its precheck is
+    ``approval_tools.precheck`` (passes unless a test sets a refusal or error).
+    """
+    approval_tools.registry.register(
+        ToolSpec(
+            name="route_note",
+            description="test-only operator action whose approver depends on priority",
+            kind=ToolKind.ACTION,
+            approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+            required_role=UserRole.OPERATOR,
+            handler=approval_tools.spy,
+            input_model=SendNoteInput,
+            approval_role=note_approver,
+            precheck=approval_tools.precheck,
+        )
+    )
+    return approval_tools
+
+
+@pytest.fixture
+def audit_log():
+    """Async reader of stored audit events (oldest first), optionally filtered.
+
+    ``await audit_log(db, action="tool.executed")`` compares each keyword
+    against the ``AuditEvent`` column of the same name.
+    """
+
+    async def read(db: Database, **filters) -> list[AuditEvent]:
+        query = select(AuditEvent).order_by(AuditEvent.created_at, AuditEvent.id)
+        for name, value in filters.items():
+            query = query.where(getattr(AuditEvent, name) == value)
+        async with db.sessionmaker() as session:
+            return list((await session.execute(query)).scalars())
+
+    return read

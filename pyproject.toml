@@ -13,14 +13,32 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic>=2",
     "pydantic-settings>=2",
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pyjwt>=2.8",
+    # passlib 1.7.4 mis-parses the bcrypt package version metadata on
+    # bcrypt>=4.1 (noisy warning); pin below 4.1 until passlib ships a fix.
+    "passlib[bcrypt]>=1.7.4",
+    "bcrypt>=4.0,<4.1",
+    "pypdf>=4",
+    "python-docx>=1.1",
+    # FastAPI multipart parsing for the document upload endpoint.
+    "python-multipart>=0.0.9",
+    # Vector column type for the retrieval layer (pgvector on PostgreSQL).
+    "pgvector>=0.3",
+    # Async HTTP client used by the Ollama embedding adapter at runtime.
+    "httpx>=0.27",
+    # Dotenv parsing for the dev-only demo seed (--env-file).
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
     "pytest-asyncio>=0.24",
-    "httpx>=0.27",
     "ruff>=0.8",
+    "aiosqlite>=0.20",
 ]
 
 [tool.setuptools.packages.find]
@@ -31,6 +49,11 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.isort]
+# The local `alembic/` directory holds migration scripts, not an importable
+# package; imports of `alembic` resolve to the installed library.
+known-third-party = ["alembic"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

@@ -28,6 +28,34 @@ make lint      # ruff check . && ruff format --check .
 make format    # ruff format . && ruff check --fix .
 make test      # pytest
 make run       # uvicorn app.main:app --reload
+make demo      # seed the fictional demo company (dev only; creates the schema)
+make dev       # like `make run`, reading settings from .env when present
+make chat      # console chat client; `make chat user=viewer` for another role
+```
+
+**Light setup without a VPS** (SQLite, Grok as the chat model, no local inference):
+see [docs/dev-setup.md](docs/dev-setup.md). Profiles live in `deployment/dev/`.
+
+### Chat model settings
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `AA_LLM_PROVIDER` | `ollama` | `ollama` (local), `fake` (offline tests), or `openai_compatible` (external API) |
+| `AA_LLM_MODEL` | `qwen2.5:7b-instruct` | Model name for the selected provider |
+| `AA_LLM_BASE_URL` | empty | `openai_compatible` only, e.g. `https://api.x.ai/v1` |
+| `AA_LLM_API_KEY` | empty | `openai_compatible` only; never logged or audited |
+| `AA_ALLOW_EXTERNAL_LLM` | `false` | Must be `true` for `openai_compatible`, which sends prompts and document passages off the machine — synthetic data only, never in client installations |
+| `AA_LLM_TIMEOUT_SECONDS` | `120` | Per-request model timeout |
+| `AA_AGENT_MAX_STEPS` | `6` | Model calls per chat run (1–50) |
+
+## Database migrations
+
+Schema changes are managed with Alembic; migrations read `AA_DATABASE_URL` from the
+environment (see `.env.example`):
+
+```bash
+make migrate                        # alembic upgrade head
+make migrate-revision m="add users" # alembic revision --autogenerate -m "add users"
 ```
 
 ## Docker Compose

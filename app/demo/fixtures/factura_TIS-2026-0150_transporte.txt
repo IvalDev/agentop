@@ -1,0 +1,32 @@
+FACTURA TIS-2026-0150
+
+Documento ficticio de demostración. Todas las empresas, identificadores y datos bancarios son inventados.
+
+PROVEEDOR (EMISOR)
+Razón social: Transportes Imaginarios del Sur, S.L.
+CIF: B00000044
+Domicilio: Carretera Inventada km 3, 00000 Puerto Ficticio
+Correo de logística: logistica@transportes-imaginarios.test
+
+CLIENTE (DESTINATARIO)
+Razón social: Suministros Ficticios Demo, S.L.
+CIF: B00000010
+
+DATOS DE LA FACTURA
+Número de factura: TIS-2026-0150
+Fecha de emisión: 02/10/2026
+Fecha de vencimiento: 01/11/2026
+Forma de pago: transferencia bancaria a 30 días
+IBAN del proveedor: ES00 0000 0000 0000 0000 0000
+Referencia de pedido: PED-2026-118
+
+CONCEPTOS
+- Portes de reparto regional (septiembre de 2026): 12 envíos x 100,00 € = 1.200,00 €
+
+TOTALES
+Base imponible: 1.200,00 €
+IVA (21 %): 252,00 €
+Total factura: 1.452,00 €
+
+ESTADO INTERNO
+Pendiente de pago. Importe superior a 1.000 €: requiere la aprobación del administrador según el procedimiento PRC-FIN-02.

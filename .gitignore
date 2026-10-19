@@ -10,8 +10,11 @@ dist/
 venv/
 env/
 
-# Environment files
+# Environment files (may hold API keys; examples stay tracked)
 .env
+.env.*
+*.env
+!.env.example
 
 # Tool caches
 .ruff_cache/
@@ -19,3 +22,6 @@ env/
 
 # Local data
 models/
+var/
+dev.db
+*.db-journal

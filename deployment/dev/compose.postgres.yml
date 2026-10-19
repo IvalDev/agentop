@@ -1,0 +1,11 @@
+# Development override: publish the Postgres of deployment/docker-compose.yml on
+# localhost so an API and seed running on the host can reach it. Start only Postgres:
+#
+#   docker compose -f deployment/docker-compose.yml -f deployment/dev/compose.postgres.yml up -d postgres
+#
+# Then AA_DATABASE_URL=postgresql+asyncpg://admin:admin@localhost:5432/admin_agent
+# (the development credentials of the base compose file). Bound to 127.0.0.1 only.
+services:
+  postgres:
+    ports:
+      - "127.0.0.1:5432:5432"
