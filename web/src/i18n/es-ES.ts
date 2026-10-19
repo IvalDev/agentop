@@ -59,6 +59,7 @@ export const esES = {
     myTools: 'Mis herramientas',
     team: 'Equipo',
     tools: 'Herramientas',
+    installWidget: 'Instalar widget',
   },
   sections: {
     comingSoon: 'Esta sección estará disponible próximamente.',
@@ -85,6 +86,11 @@ export const esES = {
     },
     onboarding: {
       title: 'Configurar la herramienta',
+    },
+    installWidget: {
+      title: 'Instalar el widget',
+      description:
+        'Habla con el asistente sin abrir el navegador. El widget es una ventana ligera que vive en la bandeja del sistema y carga este mismo chat.',
     },
   },
   chat: {
@@ -440,6 +446,39 @@ export const esES = {
     title: 'Página no encontrada',
     description: 'La dirección que has abierto no existe.',
     backToChat: 'Ir al chat',
+  },
+  installWidget: {
+    loading: 'Cargando los instaladores…',
+    listTitle: 'Instaladores disponibles',
+    listCaption: 'Instaladores disponibles para descargar',
+    columns: {
+      package: 'Paquete',
+      version: 'Versión',
+      arch: 'Arquitectura',
+      size: 'Tamaño',
+      actions: 'Acciones',
+    },
+    download: 'Descargar',
+    downloadTarget: 'Descargar {name}',
+    downloading: 'Descargando…',
+    downloadDone: 'Descarga iniciada: {name}.',
+    downloadError: 'No se ha podido descargar el instalador. Inténtalo de nuevo.',
+    empty: 'Todavía no hay instaladores publicados.',
+    loadError: 'No se ha podido cargar la lista de instaladores.',
+    retry: 'Reintentar',
+    linux: {
+      title: 'Linux',
+      intro:
+        'Descarga el paquete que prefieras. El .deb se instala con el gestor de paquetes de tu distribución; el AppImage se ejecuta sin instalar nada.',
+      debHint: 'Ubuntu, Debian y derivados. Instálalo con doble clic o con: sudo apt install ./{filename}',
+      appimageHint: 'Cualquier distribución. Dale permiso de ejecución y ábrelo:',
+    },
+    other: {
+      title: 'Tu sistema todavía no tiene instalador',
+      intro:
+        'Por ahora el widget está disponible solo para Linux. Windows y macOS llegarán más adelante; mientras tanto puedes usar el chat desde el navegador.',
+      backToChat: 'Ir al chat',
+    },
   },
 };
 

@@ -1,6 +1,7 @@
 import { Navigate, Outlet, Route, Routes } from 'react-router';
 import { ChatPage } from '../pages/ChatPage';
 import { DashboardShell } from '../pages/DashboardShell';
+import { InstallWidgetPage } from '../pages/InstallWidgetPage';
 import { KnowledgePage } from '../pages/KnowledgePage';
 import { LoginPage } from '../pages/LoginPage';
 import { MyToolsPage } from '../pages/MyToolsPage';
@@ -40,6 +41,8 @@ export function AppRoutes() {
         {/* Every user configures their own tools: these two are NOT admin-gated,
             or the OAuth callback would bounce a connected non-admin. */}
         <Route path={paths.myTools} element={<MyToolsPage />} />
+        {/* Installing the widget is for every role: the widget is another chat client. */}
+        <Route path={paths.installWidget} element={<InstallWidgetPage />} />
         <Route path={paths.onboardingRoute} element={<OnboardingPage />} />
         <Route
           path={paths.settings}
