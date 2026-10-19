@@ -2007,7 +2007,7 @@ async def test_send_email_never_posts_messages_send_when_the_profile_read_fails(
     assert result.error == expected_error
     assert seen, "the profile must be read before any send"
     assert all(url == GOOGLE_GMAIL_PROFILE_URL for _, url in seen)
-    assert ("POST", GOOGLE_GMAIL_MESSAGES_URL) not in seen
+    assert ("POST", f"{GOOGLE_GMAIL_MESSAGES_URL}/send") not in seen
 
 
 async def test_send_email_posts_mime_from_the_profile_address_over_the_wire(
@@ -2017,11 +2017,12 @@ async def test_send_email_posts_mime_from_the_profile_address_over_the_wire(
     await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
     raw_input = {**SEND_INPUT, "thread_id": "t-9"}
     posted: list[dict[str, Any]] = []
+    send_url = f"{GOOGLE_GMAIL_MESSAGES_URL}/send"
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.method == "GET" and str(request.url) == GOOGLE_GMAIL_PROFILE_URL:
             return httpx.Response(200, json={"emailAddress": SENDER, "messagesTotal": 3})
-        if request.method == "POST" and str(request.url) == GOOGLE_GMAIL_MESSAGES_URL:
+        if request.method == "POST" and str(request.url) == send_url:
             posted.append(json.loads(request.content))
             return httpx.Response(
                 200, json={"id": "sent-1", "threadId": "t-9", "labelIds": ["SENT"]}
