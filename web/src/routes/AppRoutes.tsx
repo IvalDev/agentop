@@ -8,6 +8,7 @@ import { NotFoundPage } from '../pages/NotFoundPage';
 import { OnboardingPage } from '../pages/OnboardingPage';
 import { TeamPage } from '../pages/TeamPage';
 import { ToolsPage } from '../pages/ToolsPage';
+import { WidgetPage } from '../pages/WidgetPage';
 import { SETTINGS_ADMIN_ROLES } from '../session/roles';
 import { paths } from './paths';
 import { RequireAuth } from './RequireAuth';
@@ -17,6 +18,15 @@ export function AppRoutes() {
   return (
     <Routes>
       <Route path={paths.login} element={<LoginPage />} />
+      {/* The desktop widget loads this route: chat only, no dashboard layout. */}
+      <Route
+        path={paths.widget}
+        element={
+          <RequireAuth>
+            <WidgetPage />
+          </RequireAuth>
+        }
+      />
       <Route
         element={
           <RequireAuth>

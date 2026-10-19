@@ -6,8 +6,10 @@
  *   token can never reach another origin or a non-API page.
  * - Adds `Authorization: Bearer <token>` with the session token (or an explicit one).
  * - Turns every non-2xx reply into an `ApiError` carrying FastAPI's `detail`.
- * - A 401 on the session token means the session is over: `onUnauthorized` runs
- *   (the session provider clears it and the app returns to the login page).
+ * - A 401 on the session token attempts ONE refresh (shared by concurrent 401s)
+ *   and retries the original request with the new token. If the refresh fails or
+ *   the retry is rejected again, `onUnauthorized` runs: the session provider
+ *   clears it and the app returns to the login page.
  */
 
 /** An HTTP error from the API, or a network failure (`status` 0). */
@@ -46,6 +48,12 @@ export interface ApiClient {
 export interface ApiClientConfig {
   getToken: () => string | null;
   onUnauthorized: () => void;
+  /**
+   * Renew the session after a 401 on the session token: resolves with a new
+   * access token, or `null`/a rejection when the refresh itself failed.
+   * Concurrent 401s share one in-flight call (single flight).
+   */
+  refresh?: () => Promise<string | null>;
 }
 
 async function readDetail(response: Response): Promise<unknown> {
@@ -66,8 +74,26 @@ function assertApiPath(path: string): void {
   }
 }
 
-export function createApiClient({ getToken, onUnauthorized }: ApiClientConfig): ApiClient {
-  async function send(path: string, options: RequestOptions = {}): Promise<Response> {
+export function createApiClient({ getToken, onUnauthorized, refresh }: ApiClientConfig): ApiClient {
+  let refreshInFlight: Promise<string | null> | null = null;
+
+  /** Single flight: every 401 while a refresh is running awaits the same one. */
+  function refreshOnce(): Promise<string | null> {
+    if (refresh === undefined) {
+      return Promise.resolve(null);
+    }
+    refreshInFlight ??= refresh().finally(() => {
+      refreshInFlight = null;
+    });
+    return refreshInFlight;
+  }
+
+  /** One fetch attempt. `overrideToken` carries the renewed token after a 401. */
+  async function sendOnce(
+    path: string,
+    options: RequestOptions,
+    overrideToken?: string,
+  ): Promise<Response> {
     assertApiPath(path);
     const { body, auth = true, token, headers, ...init } = options;
     const finalHeaders = new Headers(headers);
@@ -78,28 +104,44 @@ export function createApiClient({ getToken, onUnauthorized }: ApiClientConfig): 
       payload = JSON.stringify(body);
       finalHeaders.set('Content-Type', 'application/json');
     }
-    const usesSessionToken = auth && token === undefined;
-    const bearer = auth ? (token ?? getToken()) : null;
+    const bearer = auth ? (overrideToken ?? token ?? getToken()) : null;
     if (bearer) {
       finalHeaders.set('Authorization', `Bearer ${bearer}`);
     }
 
-    let response: Response;
     try {
-      response = await fetch(path, { ...init, headers: finalHeaders, body: payload });
+      return await fetch(path, { ...init, headers: finalHeaders, body: payload });
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
         throw error;
       }
       throw new ApiError(0, null);
     }
+  }
+
+  async function send(path: string, options: RequestOptions = {}): Promise<Response> {
+    const { auth = true, token } = options;
+    const usesSessionToken = auth && token === undefined;
+
+    let response = await sendOnce(path, options);
+    if (response.status === 401 && usesSessionToken) {
+      let renewed: string | null = null;
+      try {
+        renewed = await refreshOnce();
+      } catch {
+        renewed = null;
+      }
+      if (renewed !== null) {
+        response = await sendOnce(path, options, renewed);
+      }
+      if (response.status === 401) {
+        onUnauthorized();
+      }
+    }
     if (response.ok) {
       return response;
     }
     const detail = await readDetail(response);
-    if (response.status === 401 && usesSessionToken) {
-      onUnauthorized();
-    }
     throw new ApiError(response.status, detail);
   }
 

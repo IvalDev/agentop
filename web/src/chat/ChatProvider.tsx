@@ -2,6 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useReducer,
 import { streamChat } from '../api/chat';
 import { useSession } from '../session/SessionProvider';
 import { buildHistory, conversationReducer, requestErrorKind, type ChatExchange } from './conversation';
+import { announceAssistantResponseDone } from './responseNotifications';
 
 export interface ChatValue {
   exchanges: ChatExchange[];
@@ -59,7 +60,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               break;
             }
             dispatch({ type: 'event', id, event });
-            if (event.type === 'done' || event.type === 'error') {
+            if (event.type === 'done') {
+              // A window that is not in front may want to notify; in a browser nobody listens.
+              announceAssistantResponseDone(event.answer);
+              break; // the turn is settled: free the composer at once
+            }
+            if (event.type === 'error') {
               break; // the turn is settled: free the composer at once
             }
           }

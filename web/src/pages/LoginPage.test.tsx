@@ -19,11 +19,12 @@ function loginOk() {
 }
 
 describe('LoginPage', () => {
-  it('starts with the demo company and labelled fields', () => {
+  it('starts with the demo company and labelled fields', async () => {
     installFakeApi({});
     renderApp({ route: '/login' });
 
-    expect(screen.getByRole('heading', { level: 1, name: 'Iniciar sesión' })).toBeInTheDocument();
+    // The session is restored from the refresh cookie first, so the form appears asynchronously.
+    expect(await screen.findByRole('heading', { level: 1, name: 'Iniciar sesión' })).toBeInTheDocument();
     expect(screen.getByLabelText('Empresa')).toHaveValue('demo');
     expect(screen.getByLabelText('Correo electrónico')).toHaveValue('');
     expect(screen.getByLabelText('Contraseña')).toHaveAttribute('type', 'password');
@@ -33,6 +34,7 @@ describe('LoginPage', () => {
   it('flags empty fields, focuses the first one, and sends nothing', async () => {
     const fetchMock = installFakeApi({});
     const { user } = renderApp({ route: '/login' });
+    await screen.findByRole('heading', { level: 1, name: 'Iniciar sesión' });
 
     await user.clear(screen.getByLabelText('Empresa'));
     await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }));
@@ -51,6 +53,7 @@ describe('LoginPage', () => {
   it('rejects a malformed email', async () => {
     const fetchMock = installFakeApi({});
     const { user } = renderApp({ route: '/login' });
+    await screen.findByRole('heading', { level: 1, name: 'Iniciar sesión' });
 
     await user.type(screen.getByLabelText('Correo electrónico'), 'not-an-email');
     await user.type(screen.getByLabelText('Contraseña'), 'secret');
@@ -66,6 +69,7 @@ describe('LoginPage', () => {
   it('trims and lowercases the email, then opens the chat', async () => {
     const fetchMock = installFakeApi({ [LOGIN]: loginOk(), [ME]: { status: 200, body: meBody('admin') } });
     const { user } = renderApp({ route: '/login' });
+    await screen.findByRole('heading', { level: 1, name: 'Iniciar sesión' });
 
     await user.type(screen.getByLabelText('Correo electrónico'), '  Admin@Demo.TEST ');
     await user.type(screen.getByLabelText('Contraseña'), ' demo-admin-pass');
@@ -79,12 +83,14 @@ describe('LoginPage', () => {
       tenant_slug: 'demo',
     });
     expect(screen.getByTestId('location')).toHaveTextContent('/chat');
-    expect(window.sessionStorage.length).toBe(1);
+    // The access token lives in memory only; the refresh cookie is httpOnly.
+    expect(window.sessionStorage.length).toBe(0);
   });
 
   async function logInFrom(from: unknown) {
     installFakeApi({ [LOGIN]: loginOk(), [ME]: { status: 200, body: meBody('admin') } });
     const { user } = renderApp({ route: '/login', state: { from } });
+    await screen.findByRole('heading', { level: 1, name: 'Iniciar sesión' });
     await user.type(screen.getByLabelText('Correo electrónico'), 'admin@demo.test');
     await user.type(screen.getByLabelText('Contraseña'), 'demo-admin-pass');
     await user.click(screen.getByRole('button', { name: 'Iniciar sesión' }));
@@ -110,6 +116,7 @@ describe('LoginPage', () => {
   it('announces invalid credentials and stays on the login page', async () => {
     installFakeApi({ [LOGIN]: { status: 401, body: { detail: 'invalid credentials' } } });
     const { user } = renderApp({ route: '/login' });
+    await screen.findByRole('heading', { level: 1, name: 'Iniciar sesión' });
 
     await user.type(screen.getByLabelText('Correo electrónico'), 'admin@demo.test');
     await user.type(screen.getByLabelText('Contraseña'), 'wrong');
@@ -124,8 +131,10 @@ describe('LoginPage', () => {
   });
 
   it('announces when the server cannot be reached', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
     const { user } = renderApp({ route: '/login' });
+    // With no refresh cookie the restore probe answers 401, so the form appears; then the network dies.
+    await screen.findByRole('heading', { level: 1, name: 'Iniciar sesión' });
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')));
 
     await user.type(screen.getByLabelText('Correo electrónico'), 'admin@demo.test');
     await user.type(screen.getByLabelText('Contraseña'), 'demo-admin-pass');

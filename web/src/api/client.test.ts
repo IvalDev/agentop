@@ -2,9 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { headersOf, installFakeApi } from '../test/fakeApi';
 import { ApiError, createApiClient } from './client';
 
-function clientWith(token: string | null) {
+function clientWith(token: string | null, refresh?: () => Promise<string | null>) {
   const onUnauthorized = vi.fn();
-  const api = createApiClient({ getToken: () => token, onUnauthorized });
+  const api = createApiClient({ getToken: () => token, onUnauthorized, refresh });
   return { api, onUnauthorized };
 }
 
@@ -60,6 +60,63 @@ describe('createApiClient', () => {
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
   });
 
+  it('refreshes once on a session 401 and retries with the new token', async () => {
+    let thingsCalls = 0;
+    const fetchMock = installFakeApi({
+      'GET /api/v1/things': () =>
+        (thingsCalls += 1) === 1
+          ? { status: 401, body: { detail: 'invalid token' } }
+          : { status: 200, body: { ok: true } },
+    });
+    const refresh = vi.fn(async () => 'fresh-token');
+    const { api, onUnauthorized } = clientWith('stale-token', refresh);
+
+    await expect(api.get('/api/v1/things')).resolves.toEqual({ ok: true });
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(headersOf(fetchMock.mock.calls[0]?.[1]).get('Authorization')).toBe('Bearer stale-token');
+    expect(headersOf(fetchMock.mock.calls[1]?.[1]).get('Authorization')).toBe('Bearer fresh-token');
+  });
+
+  it('does not loop: a retried 401 ends the session after the one refresh', async () => {
+    const fetchMock = installFakeApi({
+      'GET /api/v1/things': { status: 401, body: { detail: 'invalid token' } },
+    });
+    const refresh = vi.fn(async () => 'fresh-token');
+    const { api, onUnauthorized } = clientWith('stale-token', refresh);
+
+    await expect(api.get('/api/v1/things')).rejects.toMatchObject({ status: 401 });
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(headersOf(fetchMock.mock.calls[1]?.[1]).get('Authorization')).toBe('Bearer fresh-token');
+  });
+
+  it('falls through to onUnauthorized when the refresh fails', async () => {
+    installFakeApi({ 'GET /api/v1/things': { status: 401, body: { detail: 'invalid token' } } });
+    const refresh = vi.fn(async () => null);
+    const { api, onUnauthorized } = clientWith('stale-token', refresh);
+
+    await expect(api.get('/api/v1/things')).rejects.toMatchObject({ status: 401 });
+
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats a rejected refresh as an expired session, not a network error', async () => {
+    installFakeApi({ 'GET /api/v1/things': { status: 401, body: { detail: 'invalid token' } } });
+    const refresh = vi.fn(async () => {
+      throw new Error('refresh exploded');
+    });
+    const { api, onUnauthorized } = clientWith('stale-token', refresh);
+
+    await expect(api.get('/api/v1/things')).rejects.toMatchObject({ status: 401 });
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
   it('sends no token and ignores 401 for anonymous calls such as login', async () => {
     const fetchMock = installFakeApi({
       'POST /api/v1/auth/login': { status: 401, body: { detail: 'invalid credentials' } },
@@ -78,13 +135,15 @@ describe('createApiClient', () => {
 
   it('uses an explicit token without treating its 401 as the session expiring', async () => {
     const fetchMock = installFakeApi({ 'GET /api/v1/auth/me': { status: 401, body: { detail: 'invalid token' } } });
-    const { api, onUnauthorized } = clientWith(null);
+    const refresh = vi.fn(async () => 'fresh-token');
+    const { api, onUnauthorized } = clientWith(null, refresh);
 
     await expect(api.get('/api/v1/auth/me', { token: 'candidate' })).rejects.toMatchObject({ status: 401 });
 
     const [, init] = fetchMock.mock.calls[0]!;
     expect(headersOf(init).get('Authorization')).toBe('Bearer candidate');
     expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(refresh).not.toHaveBeenCalled();
   });
 
   it('reports a network failure as an ApiError with status 0', async () => {

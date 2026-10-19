@@ -280,6 +280,36 @@ describe('ChatPage', () => {
     expect(await within(chatLog()).findByText('Sigo aquí.')).toBeInTheDocument();
   });
 
+  it('announces a completed response with a capped preview, and stays silent on errors and cuts', async () => {
+    const long = `${'a'.repeat(150)} final`;
+    const { user, input } = await openChat([
+      doneFrame(`  ${long}  `),
+      sseFrame('run_started', { run_id: 'r' }) + sseFrame('error', { message: 'internal error' }),
+      sseFrame('token', { text: 'Cortada' }),
+    ]);
+
+    const details: unknown[] = [];
+    const listener = (event: Event) => {
+      details.push((event as CustomEvent).detail);
+    };
+    window.addEventListener('aa:assistant-response-done', listener);
+    try {
+      await user.type(input, 'Uno{Enter}');
+      await waitFor(() => expect(details).toHaveLength(1));
+      expect(details[0]).toStrictEqual({ preview: 'a'.repeat(140) });
+
+      await user.type(input, 'Dos{Enter}');
+      await within(chatLog()).findByText('Se ha producido un error inesperado. Inténtalo de nuevo.');
+      expect(details).toHaveLength(1);
+
+      await user.type(input, 'Tres{Enter}');
+      await within(chatLog()).findByText('La respuesta se ha interrumpido. Inténtalo de nuevo.');
+      expect(details).toHaveLength(1);
+    } finally {
+      window.removeEventListener('aa:assistant-response-done', listener);
+    }
+  });
+
   it('has no axe violations, empty and with citations, an approval, and an error', async () => {
     const { user, input } = await openChat([
       sseFrame('approval_required', APPROVAL) +
