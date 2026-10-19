@@ -519,3 +519,27 @@ class OnboardingStepSubmitRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     answers: dict[str, Any] = Field(default_factory=dict)
+
+
+class WidgetInstallerResponse(BaseModel):
+    """One published desktop-widget bundle (T7).
+
+    ``filename`` is the bundle's file name as built by Tauri, and doubles as
+    its identity: the download route takes it back verbatim. ``package_type``
+    is ``deb`` or ``appimage``, and ``download_url`` is the same-origin API
+    path the console links to — never an absolute URL, so the client cannot be
+    pointed at another host.
+    """
+
+    filename: str
+    package_type: Literal["deb", "appimage"]
+    version: str
+    arch: str
+    size_bytes: int
+    download_url: str
+
+
+class WidgetInstallerListResponse(BaseModel):
+    """The published bundles; an empty list when nothing has been published."""
+
+    installers: list[WidgetInstallerResponse]

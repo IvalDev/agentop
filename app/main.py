@@ -45,6 +45,7 @@ from app.modules.retrieval.embeddings import build_embedding_provider
 from app.modules.retrieval.router import router as search_router
 from app.modules.tools import builtin  # noqa: F401  (registers the production tools)
 from app.modules.tools.registry import default_registry
+from app.modules.widget.router import router as widget_router
 
 # Calendar module wiring (reviewed allowlist entries, human-approved
 # 2026-10-15): register the manifest on the process-wide catalog, plus the
@@ -240,6 +241,7 @@ def create_app() -> FastAPI:
     application.include_router(onboarding_router)
     application.include_router(oauth_router)
     application.include_router(chat_router)
+    application.include_router(widget_router)
     if settings.is_development:
         # Static dev console over the public API; any other environment answers 404.
         application.mount("/ui", StaticFiles(directory=UI_STATIC_DIR, html=True), name="ui")
