@@ -63,6 +63,17 @@ class ConnectionTestError(OnboardingError):
     """The registered tester raised while checking the connection (router: 502)."""
 
 
+class ScopeOptionsUnavailableError(OnboardingError):
+    """Dynamic ``scope_select`` options could not be loaded (router: 409).
+
+    Raised on submit when the module's registered options provider failed
+    (no stored connection, dead tokens, provider outage): no options, no
+    choice — fail closed with the same fixed actionable message the
+    rendered step carries. The client's 409 → reload loop then shows the
+    step's error state. The message never carries provider internals.
+    """
+
+
 class OnboardingEncryptionError(OnboardingError):
     """Secret answers cannot be encrypted or decrypted (router: 500).
 

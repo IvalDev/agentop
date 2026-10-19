@@ -1,7 +1,7 @@
 import { vi } from 'vitest';
 import type { ChatHistoryMessage } from '../api/chat';
 import type { Role } from '../session/roles';
-import { jsonResponse, meBody, type FakeReply } from './fakeApi';
+import { jsonResponse, meBody, type FakeReply, type FakeRoutes } from './fakeApi';
 
 /** One SSE frame as `app/modules/agent/router.py` writes it. */
 export function sseFrame(type: string, data: unknown): string {
@@ -90,14 +90,19 @@ export interface RecordedChatRequest {
 
 /**
  * Fake API for a signed-in `role` whose `POST /api/v1/chat/stream` answers `replies` in
- * order. Returns the recorded request bodies (and their abort signals).
+ * order, and whose other `routes` (e.g. the approvals API) answer like `installFakeApi`.
+ * Returns the recorded request bodies (and their abort signals).
  */
-export function installChatApi(role: Role, replies: ChatReply[]) {
+export function installChatApi(role: Role, replies: ChatReply[], routes: FakeRoutes = {}) {
   const requests: RecordedChatRequest[] = [];
   const fetchMock = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
     const route = `${(init.method ?? 'GET').toUpperCase()} ${String(input)}`;
     if (route === 'GET /api/v1/auth/me') {
       return jsonResponse({ status: 200, body: meBody(role) });
+    }
+    const handler = routes[route];
+    if (handler !== undefined) {
+      return jsonResponse(typeof handler === 'function' ? await handler(init) : handler);
     }
     if (route !== 'POST /api/v1/chat/stream') {
       return jsonResponse({ status: 404, body: { detail: 'Not Found' } });
@@ -114,4 +119,27 @@ export function installChatApi(role: Role, replies: ChatReply[]) {
   });
   vi.stubGlobal('fetch', fetchMock);
   return { fetchMock, requests };
+}
+
+/** An `ApprovalResponse` (`GET /api/v1/approvals/{id}`) for `approvalId`, pending by default. */
+export function approvalBody(approvalId: string, overrides: Record<string, unknown> = {}) {
+  return {
+    id: approvalId,
+    tool_name: 'send_email',
+    input: { to: ['ana@example.com'], subject: 'Factura 42', body: 'Adjunto la factura.', cc: [], bcc: [], thread_id: null },
+    action_key: 'send_email:0f1e',
+    required_role: 'operator',
+    status: 'pending',
+    requested_by: 1,
+    created_at: '2026-10-15T09:00:00Z',
+    expires_at: '2026-10-15T10:00:00Z',
+    decided_by: null,
+    decided_at: null,
+    decision_reason: null,
+    executed_by: null,
+    executed_at: null,
+    execution_result: null,
+    execution_error: null,
+    ...overrides,
+  };
 }

@@ -5,9 +5,10 @@ the audit correlation id of everything the run does):
 
 1. The run first picks its engine (:mod:`~app.modules.agent.engines`): the
    engine router (:func:`~app.modules.agent.routing.route_message`) asks the
-   model once to classify the message among the engines the user may get,
-   and skips that call when there is only one (``knowledge``, e.g. a tenant
-   without active modules); a run given an engine skips routing. The
+   model once (once more if that call fails) to classify the message among
+   the engines the user may get, and skips that call when there is only one
+   (``knowledge``, e.g. a tenant without active modules); a run given an
+   engine skips routing. The
    conversation is then the engine's system policy followed by the user's
    current date, time, and timezone (:mod:`~app.modules.agent.user_time`;
    UTC when the client sent no usable timezone), the client's capped
@@ -56,8 +57,9 @@ resolved ``timezone``, ``local_time`` with its UTC offset, and whether the
 run fell back to UTC as ``timezone_fallback`` in its payload; the offered
 ``tools``, the ``engine`` key, whether the router was asked (``routed``),
 whether it fell back to ``knowledge`` (``router_fallback``), and then why
-(``router_reason``) in its result): the message, history, and answer text are
-never written to the audit log.
+(``router_reason``), and ``router_retried`` when the router's first model call
+failed and it asked once more, in its result): the message, history, and
+answer text are never written to the audit log.
 
 Transactions: the loop commits only the approval requests it creates
 (``EXTRACT`` tools are read-only); audit events use their own transactions.
@@ -268,8 +270,9 @@ class AgentRun:
     async def events(self, *, stream: bool = False) -> AsyncIterator[AgentEvent]:
         """Run the loop, yielding typed events; ``stream`` adds ``token`` deltas.
 
-        The engine is chosen first (a router failure falls back to
-        ``knowledge`` and never fails the run). Model failures of the loop are
+        The engine is chosen first (a router model failure is retried once;
+        a router failure falls back to ``knowledge`` and never fails the
+        run). Model failures of the loop are
         audited as ``agent.run_failed`` and re-raised (:class:`LLMError` for
         backend problems).
         """
@@ -282,6 +285,8 @@ class AgentRun:
         }
         if decision.fallback:
             started["router_reason"] = decision.reason
+        if decision.retried:
+            started["router_retried"] = True
         await self._audit(
             "agent.run_started",
             payload={

@@ -459,7 +459,10 @@ class OnboardingFieldResponse(BaseModel):
     ``secret`` marks a field whose value is encrypted toward the connection
     and never appears in onboarding state, responses, or audit payloads;
     ``options`` is the fixed choice list of a ``select`` widget (empty when
-    unconstrained).
+    unconstrained) — the values answers are validated against and submitted
+    as. ``option_labels`` maps some of those values to a human-readable
+    display label (e.g. a Gmail label id to the label's name); it is display
+    only, and a value without an entry is displayed as itself.
     """
 
     key: str
@@ -469,6 +472,7 @@ class OnboardingFieldResponse(BaseModel):
     secret: bool
     help_text: str = ""
     options: list[str] = Field(default_factory=list)
+    option_labels: dict[str, str] = Field(default_factory=dict)
 
 
 class OnboardingStepResponse(BaseModel):

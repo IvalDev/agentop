@@ -17,7 +17,10 @@ export interface OnboardingField {
   required: boolean;
   secret: boolean;
   helpText: string;
+  /** The values answers are validated against and submitted as. */
   options: string[];
+  /** Display labels for some option values (display only); see {@link optionLabel}. */
+  optionLabels: Record<string, string>;
 }
 
 /** Declarative definition of the step the user is parked on (`OnboardingStepResponse`). */
@@ -49,6 +52,7 @@ interface OnboardingFieldBody {
   secret: boolean;
   help_text: string;
   options: string[];
+  option_labels: Record<string, string>;
 }
 
 interface OnboardingStepBody {
@@ -76,7 +80,13 @@ function toField(body: OnboardingFieldBody): OnboardingField {
     secret: body.secret,
     helpText: body.help_text,
     options: [...body.options],
+    optionLabels: { ...body.option_labels },
   };
+}
+
+/** What to show for one option `value` of `field`: its display label, else the value itself. */
+export function optionLabel(field: OnboardingField, value: string): string {
+  return Object.hasOwn(field.optionLabels, value) ? field.optionLabels[value]! : value;
 }
 
 function toStep(body: OnboardingStepBody): OnboardingStep {

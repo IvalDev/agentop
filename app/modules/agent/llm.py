@@ -14,14 +14,19 @@ The agent loop only talks to :class:`LLMProvider`. Shipped adapters:
 
 Every backend failure surfaces as :class:`LLMError`, whose message names only
 the failure class (HTTP status, timeout, unusable payload) — never request
-headers, credentials, or response bodies. Misconfiguration surfaces as
-:class:`LLMConfigurationError` when the provider is built (app startup).
+headers, credentials, or response text. An HTTP error also names the
+provider's ``error.type`` and ``error.code`` when its JSON body holds them as
+short identifiers (``type=invalid_request_error, code=tool_use_failed``);
+``error.message`` and every other field can echo user content and are never
+read. Misconfiguration surfaces as :class:`LLMConfigurationError` when the
+provider is built (app startup).
 
 ``ToolCall.arguments`` is the parsed JSON object, ``{}`` when the model sent
 none, or ``None`` when it sent something that is not a JSON object; the agent
 loop reports ``None`` back to the model instead of executing anything.
 """
 
+import contextlib
 import json
 import logging
 import re
@@ -50,6 +55,9 @@ _STATUS_HINTS = {
     404: "endpoint or model not found",
     429: "rate limited",
 }
+#: Fields of a JSON error body an ``LLMError`` may name, and the only values it keeps.
+_ERROR_FIELDS = ("type", "code")
+_ERROR_FIELD_VALUE = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 
 
 class LLMError(Exception):
@@ -172,16 +180,54 @@ def _assistant_message(raw: Any) -> AssistantMessage:
 
 
 def _failure(operation: str, exc: Exception) -> LLMError:
-    """Typed error naming only the failure class (no headers, keys, or bodies)."""
+    """Typed error naming only the failure class (no headers, keys, or body text).
+
+    An HTTP error adds the provider's error type and code (:func:`_error_detail`).
+    """
     if isinstance(exc, httpx.TimeoutException):
         return LLMError(f"{operation} timed out")
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
         hint = _STATUS_HINTS.get(status, "request failed")
-        return LLMError(f"{operation} failed: {hint} (HTTP {status})")
+        detail = _error_detail(exc.response)
+        return LLMError(f"{operation} failed: {hint} (HTTP {status}{detail})")
     if isinstance(exc, httpx.HTTPError):
         return LLMError(f"{operation} failed: {type(exc).__name__}")
     return LLMError(f"{operation} returned an unusable response ({type(exc).__name__})")
+
+
+def _error_detail(response: httpx.Response) -> str:
+    """``", type=…, code=…"`` from a read JSON error body, or ``""``.
+
+    Only ``error.type`` and ``error.code`` are read, and only when each is a
+    short identifier-like string; ``error.message`` and every other field can
+    echo user content and never reach the error text.
+    """
+    try:
+        body = json.loads(response.content)
+    except (httpx.ResponseNotRead, ValueError, RecursionError):
+        return ""
+    error = body.get("error") if isinstance(body, dict) else None
+    if not isinstance(error, dict):
+        return ""
+    detail = ""
+    for name in _ERROR_FIELDS:
+        value = error.get(name)
+        if isinstance(value, str) and _ERROR_FIELD_VALUE.fullmatch(value):
+            detail += f", {name}={value}"
+    return detail
+
+
+async def _raise_for_status(response: httpx.Response) -> None:
+    """``raise_for_status`` for a streamed response, reading an error body first.
+
+    The read body lets :func:`_error_detail` name the provider's error type
+    and code; a failure while reading it still reports the HTTP status.
+    """
+    if not response.is_success:
+        with contextlib.suppress(httpx.HTTPError):
+            await response.aread()
+    response.raise_for_status()
 
 
 # --- Ollama -----------------------------------------------------------------------
@@ -260,7 +306,7 @@ class OllamaChatProvider:
                 self._client() as client,
                 client.stream("POST", "/api/chat", json=payload) as response,
             ):
-                response.raise_for_status()
+                await _raise_for_status(response)
                 async for line in response.aiter_lines():
                     if not line.strip():
                         continue
@@ -408,7 +454,7 @@ class OpenAICompatibleChatProvider:
                 self._client() as client,
                 client.stream("POST", "/chat/completions", json=payload) as response,
             ):
-                response.raise_for_status()
+                await _raise_for_status(response)
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
                         continue  # blank separators, comments, other SSE fields

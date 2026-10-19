@@ -31,6 +31,11 @@ from app.modules.catalog.router import router as modules_router
 from app.modules.connections.router import router as connections_router
 from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
+from app.modules.google_mail.registry import (
+    register_default_google_mail,
+    register_google_mail_provider,
+    register_google_mail_tester,
+)
 from app.modules.identity.router import router as auth_router
 from app.modules.identity.users_router import router as users_router
 from app.modules.oauth.router import router as oauth_router
@@ -49,6 +54,16 @@ register_default_calendar()
 register_google_provider()
 register_calendar_tester()
 register_calendar_tools(default_registry)
+
+# Google Mail module wiring (reviewed allowlist entries, google-mail G1–G3,
+# 2026-10-18): register the manifest on the process-wide catalog, plus the
+# Gmail provider factory and the connection tester. The six chat tools are
+# folded into register_default_google_mail (G3), which registers them on the
+# process-wide tool registry. Runs once at import time, like the calendar
+# wiring above.
+register_default_google_mail()
+register_google_mail_provider()
+register_google_mail_tester()
 
 logger = logging.getLogger(__name__)
 
@@ -207,9 +222,9 @@ def create_app() -> FastAPI:
     application.state.llm = build_llm_provider(settings)
     application.state.tool_registry = default_registry
     application.state.module_catalog = default_catalog
-    # default_catalog already holds the calendar manifest: the calendar wiring
-    # at the top of this module registers it once at import time (reviewed
-    # allowlist change).
+    # default_catalog already holds the calendar and google_mail manifests:
+    # the wiring blocks at the top of this module register them once at
+    # import time (reviewed allowlist changes).
     # Per-module connection testers for onboarding's test_connection steps
     # (empty in production; module packages register theirs at import time).
     application.state.connection_testers = connection_testers

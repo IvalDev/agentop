@@ -14,7 +14,11 @@ class ApprovalNotFoundError(ApprovalError):
 
 
 class ApprovalForbiddenError(ApprovalError):
-    """The caller's role does not satisfy the tool's required role."""
+    """The caller may not act on the request.
+
+    Either their role does not satisfy the request's stored required role, or
+    the tool is requester-only and the caller is not its requester.
+    """
 
 
 class ApprovalStateError(ApprovalError):

@@ -24,6 +24,7 @@ from sqlalchemy import select
 
 from app.core.config import Settings
 from app.core.db import Database
+from app.modules.agent import routing
 from app.modules.agent.engines import KNOWLEDGE, module_engine
 from app.modules.agent.llm import (
     AssistantMessage,
@@ -372,7 +373,8 @@ async def test_router_sends_a_calendar_message_to_the_calendar_engine_only(
     ]
     router_call, *agent_calls = llm.calls
     assert router_call.tools == []
-    assert router_call.messages[-1].content == "What's on the 20th?"
+    assert [message.role for message in router_call.messages] == ["system", "user"]
+    assert "\n<<<LATEST MESSAGE>>>\nWhat's on the 20th?\n" in router_call.messages[-1].content
     calendar_policy = module_engine(CALENDAR_MANIFEST).system_prompt
     for agent_call in agent_calls:
         assert tool_names(agent_call) == {"check_calendar"}
@@ -425,31 +427,72 @@ def _router_down(messages: list[ChatMessage], tools: list[dict]) -> AssistantMes
     raise LLMError("ollama chat timed out")
 
 
+@pytest.fixture
+def no_router_pause(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The router's retry does not wait in tests."""
+    monkeypatch.setattr(routing, "ROUTER_RETRY_DELAY_SECONDS", 0)
+
+
 @pytest.mark.parametrize(
-    ("router_reply", "reason"),
-    [(_router_down, "llm_error"), (answer("the weather"), "unrecognized_reply")],
-    ids=["model-down", "unrecognized"],
+    ("router_replies", "audited"),
+    [
+        ([_router_down, _router_down], {"router_reason": "llm_error", "router_retried": True}),
+        ([answer("the weather")], {"router_reason": "unrecognized_reply"}),
+    ],
+    ids=["model-down-twice", "unrecognized"],
 )
 async def test_router_failure_falls_back_to_knowledge_and_is_audited(
-    seeded_db: Database, seeded_users, registry, approval_tools, audit_log, router_reply, reason
+    seeded_db: Database,
+    seeded_users,
+    registry,
+    approval_tools,
+    audit_log,
+    no_router_pause,
+    router_replies,
+    audited,
 ) -> None:
     """A dead or confused router never fails the run: knowledge answers, the audit says why."""
     viewer = seeded_users[VIEWER]
     register_calendar_tool(registry, approval_tools.spy)
     await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
-    llm = FakeLLMProvider([router_reply, answer("Hello.")])
+    llm = FakeLLMProvider([*router_replies, answer("Hello.")])
 
     response = await run(seeded_db, viewer, routed_deps(registry, llm))
 
     assert (response.answer, response.stop_reason) == ("Hello.", "completed")
-    assert tool_names(llm.calls[1]) == {"peek_note", "search_documents"}
+    assert tool_names(llm.calls[len(router_replies)]) == {"peek_note", "search_documents"}
     [started] = await audit_log(seeded_db, action="agent.run_started")
     assert started.result == {
         "tools": ["peek_note", "search_documents"],
         "engine": "knowledge",
         "routed": True,
         "router_fallback": True,
-        "router_reason": reason,
+        **audited,
+    }
+    assert await audit_log(seeded_db, action="agent.run_failed") == []
+
+
+async def test_a_router_retry_that_succeeds_routes_normally_and_is_audited(
+    seeded_db: Database, seeded_users, registry, approval_tools, audit_log, no_router_pause
+) -> None:
+    """One router ``LLMError`` keeps the engine: the retry routes, the audit marks it."""
+    viewer = seeded_users[VIEWER]
+    register_calendar_tool(registry, approval_tools.spy)
+    await activate_module(seeded_db, viewer.tenant_id, viewer.id, "calendar")
+    llm = FakeLLMProvider([_router_down, answer("calendar"), answer("Your day is free.")])
+
+    response = await run(seeded_db, viewer, routed_deps(registry, llm), "What's on the 20th?")
+
+    assert response.answer == "Your day is free."
+    _failed, _retry, agent_call = llm.calls
+    assert tool_names(agent_call) == {"check_calendar"}
+    [started] = await audit_log(seeded_db, action="agent.run_started")
+    assert started.result == {
+        "tools": ["check_calendar"],
+        "engine": "calendar",
+        "routed": True,
+        "router_fallback": False,
+        "router_retried": True,
     }
     assert await audit_log(seeded_db, action="agent.run_failed") == []
 

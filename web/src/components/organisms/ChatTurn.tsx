@@ -1,6 +1,7 @@
 import type { ChatExchange } from '../../chat/conversation';
-import { activityMessage, approvalMessage, statusMessage } from '../../chat/messages';
+import { activityMessage, statusMessage } from '../../chat/messages';
 import { t } from '../../i18n';
+import { ApprovalNotice } from '../molecules/ApprovalNotice';
 import { CitationList } from '../molecules/CitationList';
 import { CitedText } from '../molecules/CitedText';
 
@@ -8,7 +9,10 @@ export interface ChatTurnProps {
   exchange: ChatExchange;
 }
 
-/** One question and its reply: activity, answer text, notices, and cited sources. */
+/**
+ * One question and its reply: activity, answer text, notices, the confirmation of each action
+ * the agent asked for, and cited sources.
+ */
 export function ChatTurn({ exchange }: ChatTurnProps) {
   const prefix = `chat-${exchange.id}`;
   const citationId = (number: number) => `${prefix}-source-${number}`;
@@ -43,9 +47,7 @@ export function ChatTurn({ exchange }: ChatTurnProps) {
         )}
         {status && <p className={`chat-notice chat-notice--${status.tone}`}>{status.text}</p>}
         {exchange.approvals.map((approval) => (
-          <p key={approval.approvalId} className="chat-notice chat-notice--info">
-            {approvalMessage(approval)}
-          </p>
+          <ApprovalNotice key={approval.approvalId} approval={approval} />
         ))}
         {exchange.citations.length > 0 && (
           <CitationList headingId={`${prefix}-sources`} citations={exchange.citations} citationId={citationId} />

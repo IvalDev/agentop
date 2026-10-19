@@ -4,6 +4,7 @@ import { ApiError } from '../api/client';
 import {
   getOnboardingState,
   invalidAnswerKeys,
+  optionLabel,
   restartOnboarding,
   startAuthorization,
   submitStep,
@@ -374,7 +375,7 @@ export function OnboardingPage() {
                         )
                       }
                     />{' '}
-                    {option}
+                    {optionLabel(field, option)}
                   </label>
                 ))}
                 {fieldErrors[field.key] && (
@@ -409,7 +410,7 @@ export function OnboardingPage() {
                   error={fieldErrors[field.key] ?? null}
                   options={[
                     { value: '', label: '—' },
-                    ...field.options.map((option) => ({ value: option, label: option })),
+                    ...field.options.map((option) => ({ value: option, label: optionLabel(field, option) })),
                   ]}
                   value={values[field.key] ?? ''}
                   onChange={(event) =>

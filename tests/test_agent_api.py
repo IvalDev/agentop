@@ -372,7 +372,9 @@ async def test_both_endpoints_route_the_message_to_one_engine(
     assert response.status_code == 200, response.text
     router_call, agent_call = llm.calls
     assert router_call.tools == []
-    assert router_call.messages[-1].content == "What do I have on the 20th?"
+    assert (
+        "\n<<<LATEST MESSAGE>>>\nWhat do I have on the 20th?\n" in router_call.messages[-1].content
+    )
     assert {tool["function"]["name"] for tool in agent_call.tools} == {
         "list_events",
         "create_event",
@@ -477,4 +479,7 @@ def test_importing_the_app_alone_populates_the_registry() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "search_documents,list_events,create_event,cancel_event"
+    assert result.stdout.strip() == (
+        "search_documents,list_events,create_event,cancel_event,"
+        "search_emails,get_email,list_labels,send_email,archive_message,add_label"
+    )

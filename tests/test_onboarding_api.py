@@ -918,6 +918,7 @@ async def test_scope_select_step_definition_exposes_the_allowlist(
             "secret": False,
             "help_text": "",
             "options": list(SCOPES),
+            "option_labels": {},
         }
     ]
 

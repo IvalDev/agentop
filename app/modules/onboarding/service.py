@@ -41,6 +41,26 @@ at rest. (Strict per-request in-memory accumulation was rejected because it
 cannot survive the resume-across-requests flows this engine is built for and
 would be process-local mutable state.)
 
+Dynamic ``scope_select`` options
+--------------------------------
+By default a ``scope_select`` step is static: its options are the
+manifest's declared ``permissions``. A module whose scope choice lives in
+provider data (e.g. the user's Gmail labels) registers a *scope options
+provider* (:mod:`app.modules.onboarding.options`, same explicit-registry
+style as the tester registry). When one is registered for the module, the
+engine invokes it — with the caller's principal, the request session, the
+credentials key, and the settings — every time it renders or validates the
+step, and the returned options replace the static allowlist (``exclusive``
+additionally enforces exactly one choice). The provider may also name its
+values (``labels``, e.g. a Gmail label id → the label's name): the view
+carries those display labels beside the step (``option_labels``) while
+answers keep being validated and persisted as the values. A provider
+failure fails closed on both paths, never as a 500: the rendered step keeps
+answering 200 with an empty option list plus one fixed actionable
+``help_text``, and a submit
+is refused with :class:`ScopeOptionsUnavailableError` (router: 409, the
+same fixed message). No provider registered = zero behavior change.
+
 Provider rule
 -------------
 The manifest does not declare providers yet, so at completion time the
@@ -99,15 +119,18 @@ exactly ``{module_key, step_key, status}`` — never answers, never secrets.
 """
 
 import json
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.core.crypto import (
     CredentialsKeyFormatError,
     DecryptionError,
@@ -129,11 +152,20 @@ from app.modules.onboarding.exceptions import (
     OnboardingCompletedError,
     OnboardingEncryptionError,
     RedirectStepError,
+    ScopeOptionsUnavailableError,
     TesterNotRegisteredError,
     WrongStepError,
 )
 from app.modules.onboarding.models import OnboardingState, OnboardingStatus
+from app.modules.onboarding.options import (
+    ScopeOptions,
+    ScopeOptionsContext,
+    ScopeOptionsError,
+    scope_options_providers,
+)
 from app.modules.onboarding.testers import ConnectionContext, ConnectionTester
+
+logger = logging.getLogger(__name__)
 
 _RESOURCE = "onboarding"
 
@@ -146,6 +178,13 @@ _EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+\Z")
 
 _FIXED_ENCRYPTION = "credentials encryption is not configured"
 _FIXED_DECRYPTION = "stored onboarding answers could not be decrypted"
+
+#: One fixed actionable message for a failed scope options provider — the
+#: rendered step's ``help_text`` and the submit refusal detail share it, so
+#: a module failure never surfaces provider internals (fail closed).
+_SCOPE_OPTIONS_UNAVAILABLE = (
+    "scope options could not be loaded; reconnect the account and try again"
+)
 
 #: One canonical serialized form for the credentials payload (write-only),
 #: mirroring the connections API's dict handling.
@@ -165,6 +204,9 @@ class OnboardingViewState:
     a generic renderer — ``scope_select`` carries its synthesized ``scopes``
     field), or ``None`` when the flow is completed. ``data`` holds the
     non-secret answers only; secrets have no place in this view at all.
+    ``option_labels`` maps a field key to the display labels of its option
+    values (only a dynamic ``scope_select`` carries any today); an option
+    without an entry is displayed as its value.
     """
 
     module_key: str
@@ -174,6 +216,7 @@ class OnboardingViewState:
     data: dict[str, Any]
     created_at: datetime | None
     updated_at: datetime | None
+    option_labels: Mapping[str, Mapping[str, str]] = dataclass_field(default_factory=dict)
 
 
 def _is_secret(field: FieldSpec) -> bool:
@@ -181,17 +224,34 @@ def _is_secret(field: FieldSpec) -> bool:
     return field.secret or field.type == "password"
 
 
-def _step_definition(manifest: ModuleManifest, step: StepSpec) -> StepSpec:
+def _step_definition(
+    manifest: ModuleManifest,
+    step: StepSpec,
+    *,
+    scope_options: ScopeOptions | None = None,
+    scope_options_error: str | None = None,
+) -> StepSpec:
     """Declarative view of ``step`` for the generic renderer.
 
     ``scope_select`` synthesizes its single ``scopes`` field from the
     manifest's declared ``permissions`` — the allowlist the engine validates
-    against — so the future UI needs no per-module code. Form fields whose
-    *effective* secrecy differs from the declared flag (``password`` widgets
-    are secret by type) are re-flagged, so the renderer always sees the rule
-    the engine enforces.
+    against — so the future UI needs no per-module code. When the module
+    registered a scope options provider, the fetched ``scope_options``
+    replace that static allowlist, and a provider failure
+    (``scope_options_error``) becomes one fixed actionable ``help_text`` over
+    an *empty* option list (the step renders, but nothing can be chosen —
+    never the stale static allowlist). Form fields whose *effective* secrecy
+    differs from the declared flag (``password`` widgets are secret by
+    type) are re-flagged, so the renderer always sees the rule the engine
+    enforces.
     """
     if step.type == "scope_select":
+        if scope_options_error is not None:
+            options: tuple[str, ...] = ()
+        elif scope_options is not None:
+            options = scope_options.options
+        else:
+            options = manifest.permissions
         return StepSpec(
             key=step.key,
             type=step.type,
@@ -203,7 +263,8 @@ def _step_definition(manifest: ModuleManifest, step: StepSpec) -> StepSpec:
                     label="Scopes",
                     type="select",
                     required=True,
-                    options=manifest.permissions,
+                    options=options,
+                    help_text=scope_options_error or "",
                 ),
             ),
         )
@@ -215,6 +276,29 @@ def _step_definition(manifest: ModuleManifest, step: StepSpec) -> StepSpec:
         if fields != step.fields:
             return replace(step, fields=fields)
     return step
+
+
+def _option_labels(
+    step: StepSpec,
+    *,
+    scope_options: ScopeOptions | None = None,
+    scope_options_error: str | None = None,
+) -> dict[str, dict[str, str]]:
+    """Display labels of ``step``'s option values, keyed by field key.
+
+    Only a dynamic ``scope_select`` has them: the provider's ``labels``
+    restricted to the values it actually offers, non-empty strings only
+    (a stale or blank label never reaches the renderer). Static options and
+    a failed provider carry none — the renderer then shows the values.
+    """
+    if step.type != "scope_select" or scope_options is None or scope_options_error is not None:
+        return {}
+    labels: dict[str, str] = {}
+    for value in scope_options.options:
+        label = scope_options.labels.get(value)
+        if isinstance(label, str) and label:
+            labels[value] = label
+    return {"scopes": labels} if labels else {}
 
 
 def _find_step(manifest: ModuleManifest, step_key: str) -> StepSpec:
@@ -277,9 +361,14 @@ def _validate_form(
 
 
 def _validate_scopes(
-    manifest: ModuleManifest, answers: Mapping[str, Any]
+    manifest: ModuleManifest, answers: Mapping[str, Any], scope_options: ScopeOptions | None
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Validate ``scope_select`` answers: one non-empty allowlisted list."""
+    """Validate ``scope_select`` answers: one non-empty allowlisted list.
+
+    The allowlist is the module's registered dynamic ``scope_options`` when
+    one exists (the provider's values, plus its ``exclusive`` single-choice
+    rule), otherwise the manifest's declared ``permissions``.
+    """
     unknown = sorted(set(answers) - {"scopes"})
     if unknown:
         raise OnboardingAnswersError(f"unknown answer field(s): {', '.join(unknown)}")
@@ -288,20 +377,29 @@ def _validate_scopes(
         raise OnboardingAnswersError("answer 'scopes' must be a non-empty list")
     if any(not isinstance(item, str) for item in scopes):
         raise OnboardingAnswersError("answer 'scopes' must list strings")
+    if scope_options is None:
+        allowed = set(manifest.permissions)
+    else:
+        if scope_options.exclusive and len(scopes) != 1:
+            raise OnboardingAnswersError("answer 'scopes' accepts exactly one choice")
+        allowed = set(scope_options.options)
     for scope in scopes:
-        if scope not in manifest.permissions:
+        if scope not in allowed:
             raise OnboardingAnswersError(f"scope {scope!r} is not declared by the module")
     return {"scopes": list(scopes)}, {}
 
 
 def _validate_answers(
-    manifest: ModuleManifest, step: StepSpec, answers: Mapping[str, Any]
+    manifest: ModuleManifest,
+    step: StepSpec,
+    answers: Mapping[str, Any],
+    scope_options: ScopeOptions | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """Strictly validate one step's answers; returns ``(non_secret, secrets)``."""
     if step.type == "form":
         return _validate_form(step, answers)
     if step.type == "scope_select":
-        return _validate_scopes(manifest, answers)
+        return _validate_scopes(manifest, answers, scope_options)
     if step.type == "test_connection":
         if answers:
             raise OnboardingAnswersError("test_connection step takes no answers")
@@ -409,7 +507,102 @@ async def _load(
     return result.scalar_one_or_none()
 
 
-def _view(manifest: ModuleManifest, state: OnboardingState | None) -> OnboardingViewState:
+async def _scope_options_for(
+    session: AsyncSession,
+    *,
+    caller: CurrentUser,
+    module_key: str,
+    credentials_key: str | None,
+    settings: Settings | None,
+) -> tuple[ScopeOptions | None, str | None]:
+    """Fetch the module's dynamic scope options; ``(None, None)`` = static.
+
+    Returns ``(options, None)`` on success, ``(None, message)`` when a
+    registered provider failed (:class:`ScopeOptionsError` *or* any
+    unexpected raise — both fail closed with the same fixed actionable
+    message, never provider internals and never a 500), and
+    ``(None, None)`` when the module registered no provider, keeping the
+    static ``manifest.permissions`` contract untouched.
+    """
+    provider = scope_options_providers.get(module_key)
+    if provider is None:
+        return None, None
+    context = ScopeOptionsContext(
+        caller=caller,
+        session=session,
+        module_key=module_key,
+        credentials_key=credentials_key,
+        settings=settings,
+    )
+    try:
+        return await provider(context), None
+    except ScopeOptionsError:
+        logger.warning(
+            "scope options provider refused for module %s",
+            module_key,
+            extra={"module_key": module_key},
+        )
+        return None, _SCOPE_OPTIONS_UNAVAILABLE
+    except Exception:
+        logger.warning(
+            "scope options provider failed for module %s",
+            module_key,
+            exc_info=True,
+            extra={"module_key": module_key},
+        )
+        return None, _SCOPE_OPTIONS_UNAVAILABLE
+
+
+def _pending_step(manifest: ModuleManifest, state: OnboardingState | None) -> StepSpec | None:
+    """The step :func:`_view` would render, or ``None`` when nothing renders."""
+    if not manifest.onboarding:
+        return None
+    if state is None:
+        return manifest.onboarding[0]
+    if state.status is OnboardingStatus.COMPLETED or state.current_step is None:
+        return None
+    return _find_step(manifest, state.current_step)
+
+
+async def _render(
+    session: AsyncSession,
+    *,
+    manifest: ModuleManifest,
+    state: OnboardingState | None,
+    caller: CurrentUser,
+    credentials_key: str | None,
+    settings: Settings | None,
+) -> OnboardingViewState:
+    """:func:`_view` plus the module's dynamic scope options, when needed.
+
+    The options are fetched only when the step about to render is a
+    ``scope_select`` of a module that registered a provider — every other
+    step, and every module without a provider, keeps the synchronous static
+    path with zero extra work.
+    """
+    scope_options: ScopeOptions | None = None
+    scope_options_error: str | None = None
+    step = _pending_step(manifest, state)
+    if step is not None and step.type == "scope_select":
+        scope_options, scope_options_error = await _scope_options_for(
+            session,
+            caller=caller,
+            module_key=manifest.key,
+            credentials_key=credentials_key,
+            settings=settings,
+        )
+    return _view(
+        manifest, state, scope_options=scope_options, scope_options_error=scope_options_error
+    )
+
+
+def _view(
+    manifest: ModuleManifest,
+    state: OnboardingState | None,
+    *,
+    scope_options: ScopeOptions | None = None,
+    scope_options_error: str | None = None,
+) -> OnboardingViewState:
     """Build the public snapshot from a manifest and (maybe) a stored row."""
     if not manifest.onboarding:
         # Nothing declared → nothing to configure → vacuously completed.
@@ -428,10 +621,18 @@ def _view(manifest: ModuleManifest, state: OnboardingState | None) -> Onboarding
             module_key=manifest.key,
             status=OnboardingStatus.NOT_STARTED,
             current_step=first.key,
-            step=_step_definition(manifest, first),
+            step=_step_definition(
+                manifest,
+                first,
+                scope_options=scope_options,
+                scope_options_error=scope_options_error,
+            ),
             data={},
             created_at=None,
             updated_at=None,
+            option_labels=_option_labels(
+                first, scope_options=scope_options, scope_options_error=scope_options_error
+            ),
         )
     if state.status is OnboardingStatus.COMPLETED or state.current_step is None:
         return OnboardingViewState(
@@ -448,10 +649,15 @@ def _view(manifest: ModuleManifest, state: OnboardingState | None) -> Onboarding
         module_key=manifest.key,
         status=state.status,
         current_step=state.current_step,
-        step=_step_definition(manifest, step),
+        step=_step_definition(
+            manifest, step, scope_options=scope_options, scope_options_error=scope_options_error
+        ),
         data=dict(state.data or {}),
         created_at=state.created_at,
         updated_at=state.updated_at,
+        option_labels=_option_labels(
+            step, scope_options=scope_options, scope_options_error=scope_options_error
+        ),
     )
 
 
@@ -503,20 +709,31 @@ async def get_state(
     catalog: ModuleCatalog,
     caller: CurrentUser,
     module_key: str,
+    credentials_key: str | None = None,
+    settings: Settings | None = None,
 ) -> OnboardingViewState:
     """Return the caller's own onboarding state plus the current step definition.
 
-    A read never writes: an untouched flow answers a virtual ``not_started``
-    (row created only on the first successful submit), and a module with no
-    declared steps answers a virtual ``completed``. Unknown modules raise
-    ``UnknownModuleError`` (catalog, router: 404); modules the tenant has not
-    active raise :class:`ModuleInactiveError` (router: 409).
+    A read never writes state: an untouched flow answers a virtual
+    ``not_started`` (row created only on the first successful submit), and a
+    module with no declared steps answers a virtual ``completed``. Unknown
+    modules raise ``UnknownModuleError`` (catalog, router: 404); modules the
+    tenant has not active raise :class:`ModuleInactiveError` (router: 409).
+    ``credentials_key``/``settings`` are forwarded to the module's scope
+    options provider when the rendered step is a dynamic ``scope_select``.
     """
     manifest = await _require_active(session, catalog, caller, module_key)
     state = await _load(
         session, tenant_id=caller.tenant_id, user_id=caller.id, module_key=module_key
     )
-    return _view(manifest, state)
+    return await _render(
+        session,
+        manifest=manifest,
+        state=state,
+        caller=caller,
+        credentials_key=credentials_key,
+        settings=settings,
+    )
 
 
 async def submit_step(
@@ -529,15 +746,19 @@ async def submit_step(
     module_key: str,
     step_key: str,
     answers: Mapping[str, Any],
+    settings: Settings | None = None,
 ) -> OnboardingViewState:
     """Validate and apply one step of the caller's own onboarding flow.
 
     ``step_key`` must be the flow's current step (router: 409 otherwise), and
     ``answers`` are validated strictly against that step's declaration
-    (router: 422 on violation). Refusals — wrong step, invalid answers, a
+    (router: 422 on violation). A dynamic ``scope_select`` step re-fetches
+    the module's scope options for the validation; when that fetch fails the
+    submit is refused with :class:`ScopeOptionsUnavailableError` (router:
+    409) — no options, no choice. Refusals — wrong step, invalid answers, a
     redirect placeholder, a missing/failing tester — leave the stored state
-    completely untouched. On the last step the accumulated secrets become the
-    connection's encrypted credentials and the state turns ``completed``.
+    completely untouched. On the last step the accumulated secrets become
+    the connection's encrypted credentials and the state turns ``completed``.
     """
     manifest = await _require_active(session, catalog, caller, module_key)
     state = await _load(
@@ -558,7 +779,18 @@ async def submit_step(
             "redirect steps complete at the provider OAuth callback "
             "(/api/v1/onboarding/{module_key}/callback); not supported in this release"
         )
-    non_secret, secrets = _validate_answers(manifest, step, answers)
+    scope_options: ScopeOptions | None = None
+    if step.type == "scope_select":
+        scope_options, scope_options_error = await _scope_options_for(
+            session,
+            caller=caller,
+            module_key=module_key,
+            credentials_key=credentials_key,
+            settings=settings,
+        )
+        if scope_options_error is not None:
+            raise ScopeOptionsUnavailableError(scope_options_error)
+    non_secret, secrets = _validate_answers(manifest, step, answers, scope_options)
     return await _advance(
         session,
         manifest=manifest,
@@ -571,6 +803,7 @@ async def submit_step(
         non_secret=non_secret,
         secrets=secrets,
         state=state,
+        settings=settings,
     )
 
 
@@ -587,6 +820,7 @@ async def _advance(
     non_secret: Mapping[str, Any],
     secrets: Mapping[str, str],
     state: OnboardingState | None,
+    settings: Settings | None = None,
 ) -> OnboardingViewState:
     """Apply one already-validated step: advance, audit, commit, return the view.
 
@@ -703,7 +937,14 @@ async def _advance(
             status=next_status,
         )
     await session.commit()
-    return _view(manifest, state)
+    return await _render(
+        session,
+        manifest=manifest,
+        state=state,
+        caller=caller,
+        credentials_key=credentials_key,
+        settings=settings,
+    )
 
 
 async def complete_redirect_step(
@@ -713,6 +954,7 @@ async def complete_redirect_step(
     credentials_key: str | None,
     caller: CurrentUser,
     module_key: str,
+    settings: Settings | None = None,
 ) -> OnboardingViewState:
     """Complete the module's current ``redirect`` step — the OAuth callback path.
 
@@ -759,6 +1001,7 @@ async def complete_redirect_step(
         non_secret={},
         secrets={},
         state=state,
+        settings=settings,
     )
 
 
@@ -815,6 +1058,8 @@ async def restart(
     catalog: ModuleCatalog,
     caller: CurrentUser,
     module_key: str,
+    credentials_key: str | None = None,
+    settings: Settings | None = None,
 ) -> OnboardingViewState:
     """Reset the caller's completed onboarding so they can reconfigure (D7).
 
@@ -825,17 +1070,32 @@ async def restart(
     well (:func:`_revoke_connections`): restart means reconnecting from
     scratch, never reusing tokens the user just discarded. A flow that is
     not completed (or a module with no steps) is returned unchanged —
-    nothing to restart, nothing revoked.
+    nothing to restart, nothing revoked. ``credentials_key``/``settings``
+    forward to a dynamic ``scope_select`` provider, as in :func:`get_state`.
     """
     manifest = await _require_active(session, catalog, caller, module_key)
     state = await _load(
         session, tenant_id=caller.tenant_id, user_id=caller.id, module_key=module_key
     )
     if state is None or state.status is not OnboardingStatus.COMPLETED:
-        return _view(manifest, state)
+        return await _render(
+            session,
+            manifest=manifest,
+            state=state,
+            caller=caller,
+            credentials_key=credentials_key,
+            settings=settings,
+        )
     if not manifest.onboarding:
         # Degenerate: the row outlived a flow that no longer declares steps.
-        return _view(manifest, state)
+        return await _render(
+            session,
+            manifest=manifest,
+            state=state,
+            caller=caller,
+            credentials_key=credentials_key,
+            settings=settings,
+        )
     first = manifest.onboarding[0]
     state.status = OnboardingStatus.IN_PROGRESS
     state.current_step = first.key
@@ -855,7 +1115,14 @@ async def restart(
     if any(step.type == "redirect" for step in manifest.onboarding):
         # After the state commit: revoke() commits its own unit of work.
         await _revoke_connections(session, caller=caller, module_key=module_key)
-    return _view(manifest, state)
+    return await _render(
+        session,
+        manifest=manifest,
+        state=state,
+        caller=caller,
+        credentials_key=credentials_key,
+        settings=settings,
+    )
 
 
 __all__ = [
