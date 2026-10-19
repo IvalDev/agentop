@@ -379,7 +379,7 @@ No borres la rama del padre hasta haber cambiado la base del hijo.
 | Núcleo: identidad, documentos y RAG, chat, herramientas, aprobaciones, auditoría | Disponible |
 | Consola web y módulos Google Calendar y Gmail | Disponible |
 | Widget de escritorio | Linux (`.deb` y AppImage); Windows y macOS pendientes |
-| Espacio de trabajo del agente: carpeta del servidor con una subcarpeta por usuario y base de conocimiento personal | Diseñado, sin implementar |
+| Espacio de trabajo del agente: carpeta del servidor con la documentación de la empresa (`RAG/`) separada de una carpeta por empleado, que es el alcance de su agente | Diseñado, sin implementar |
 | Almacenamiento en MinIO y cola Redis + RQ | Previstos; hoy los archivos van a disco y la ingesta es síncrona |
 | Migraciones de Alembic | Configuradas, sin revisiones; `make demo` crea el esquema en desarrollo |
 
