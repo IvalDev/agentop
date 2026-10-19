@@ -107,9 +107,56 @@ export const esES = {
     sources: 'Fuentes',
     sourceSummary: '[{number}] {document}',
     sourceLink: '[{number}] Fuente: {document}',
-    approval:
-      'Esta acción necesita aprobación y no se ejecutará hasta que una persona autorizada la apruebe. ' +
-      'Identificador de la aprobación: {id}. Caduca el {expiresAt}.',
+    approval: 'El asistente necesita tu confirmación para: {action}. Caduca el {expiresAt}.',
+    approvalNotice: {
+      actions: {
+        send_email: 'Enviar un correo',
+        archive_message: 'Archivar un correo',
+        add_label: 'Añadir una etiqueta a un correo',
+        other: 'Confirmar una acción',
+      },
+      intro: 'No se hará nada hasta que lo confirmes. La solicitud caduca el {expiresAt}.',
+      fields: {
+        to: 'Para',
+        cc: 'CC',
+        bcc: 'CCO',
+        subject: 'Asunto',
+        body: 'Mensaje',
+        message: 'Correo (identificador)',
+        label: 'Etiqueta',
+      },
+      reference: 'Identificador de la aprobación: {id}',
+      confirm: 'Aprobar y ejecutar',
+      reject: 'Rechazar',
+      retry: 'Volver a cargar',
+      announcement: '{action}: {status}',
+      progress: {
+        loading: 'Cargando los detalles de la acción…',
+        approving: 'Aprobando la acción…',
+        executing: 'Ejecutando la acción…',
+        rejecting: 'Rechazando la acción…',
+      },
+      done: {
+        send_email: 'Correo enviado.',
+        archive_message: 'Correo archivado.',
+        add_label: 'Etiqueta añadida.',
+        other: 'Acción ejecutada.',
+      },
+      status: {
+        executing: 'La acción se está ejecutando.',
+        rejected: 'Acción rechazada. No se ha hecho nada.',
+        expired: 'La solicitud ha caducado sin ejecutarse. Pide al asistente que la prepare de nuevo.',
+        failed: 'No se ha podido ejecutar la acción.',
+        failedWithReason: 'No se ha podido ejecutar la acción. Motivo: {reason}',
+      },
+      errors: {
+        forbidden: 'No tienes permiso para confirmar ni rechazar esta acción.',
+        notFound: 'Esta solicitud ya no existe.',
+        conflict: 'Esta solicitud ya se había decidido.',
+        network: 'No se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
+        unexpected: 'Se ha producido un error inesperado. Inténtalo de nuevo.',
+      },
+    },
     answerAnnouncement: 'Respuesta del asistente: {answer}',
     notices: {
       stepLimit:

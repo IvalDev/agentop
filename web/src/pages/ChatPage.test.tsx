@@ -1,7 +1,16 @@
 import { screen, waitFor, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
+import type { Role } from '../session/roles';
 import { expectNoAxeViolations } from '../test/axe';
-import { ControlledStream, doneFrame, installChatApi, sseFrame, type ChatReply } from '../test/fakeChat';
+import { createGate, routesCalled, type FakeReply, type FakeRoutes } from '../test/fakeApi';
+import {
+  approvalBody,
+  ControlledStream,
+  doneFrame,
+  installChatApi,
+  sseFrame,
+  type ChatReply,
+} from '../test/fakeChat';
 import { renderApp } from '../test/renderApp';
 
 const CITATION = {
@@ -21,8 +30,22 @@ const APPROVAL = {
   expires_at: '2026-10-15T10:00:00Z',
 };
 
-async function openChat(replies: ChatReply[]) {
-  const api = installChatApi('viewer', replies);
+const SEND_APPROVAL = { ...APPROVAL, tool_name: 'send_email' };
+const SEND_PATH = `/api/v1/approvals/${SEND_APPROVAL.approval_id}`;
+
+/** The SSE frames of a run that asked to send an email and stopped for the user's confirmation. */
+const SEND_RUN =
+  sseFrame('tool_call', { call_id: 'c1', tool_name: 'send_email' }) +
+  sseFrame('approval_required', SEND_APPROVAL) +
+  sseFrame('tool_result', { call_id: 'c1', tool_name: 'send_email', status: 'approval_required' }) +
+  doneFrame('Te dejo el correo listo para confirmar.', { pending_approvals: [SEND_APPROVAL] });
+
+function sendReply(overrides: Record<string, unknown> = {}): FakeReply {
+  return { status: 200, body: approvalBody(SEND_APPROVAL.approval_id, overrides) };
+}
+
+async function openChat(replies: ChatReply[], routes: FakeRoutes = {}, role: Role = 'viewer') {
+  const api = installChatApi(role, replies, routes);
   const view = renderApp({ route: '/chat', storedToken: 'viewer-token' });
   await screen.findByRole('heading', { level: 1, name: 'Chat' });
   const input = screen.getByLabelText('Mensaje');
@@ -33,8 +56,23 @@ function chatLog() {
   return screen.getByRole('log', { name: 'Conversación' });
 }
 
+/** The page's polite live region (each approval notice has its own inside the log). */
 function announcer() {
-  return screen.getByRole('status');
+  const [page] = screen.getAllByRole('status').filter((region) => !chatLog().contains(region));
+  return page!;
+}
+
+/** Open the chat, ask for an email, and wait for its confirmation notice. */
+async function askToSend(routes: FakeRoutes) {
+  const chat = await openChat([SEND_RUN], { [`GET ${SEND_PATH}`]: sendReply(), ...routes }, 'operator');
+  await chat.user.type(chat.input, 'Envía la factura a Ana{Enter}');
+  const notice = await within(chatLog()).findByRole('group', { name: 'Enviar un correo' });
+  await within(notice).findByText('ana@example.com');
+  return { ...chat, notice };
+}
+
+function approvalRoutes(fetchMock: Parameters<typeof routesCalled>[0]): string[] {
+  return routesCalled(fetchMock).filter((route) => route.includes('/approvals/'));
 }
 
 describe('ChatPage', () => {
@@ -120,19 +158,182 @@ describe('ChatPage', () => {
   });
 
   it('shows an approval request once, with its id', async () => {
-    const { user, input } = await openChat([
-      sseFrame('tool_call', { call_id: 'c1', tool_name: 'register_invoice' }) +
-        sseFrame('approval_required', APPROVAL) +
-        sseFrame('tool_result', { call_id: 'c1', tool_name: 'register_invoice', status: 'approval_required' }) +
-        doneFrame('He solicitado la aprobación.', { pending_approvals: [APPROVAL] }),
-    ]);
+    const { user, input, fetchMock } = await openChat(
+      [
+        sseFrame('tool_call', { call_id: 'c1', tool_name: 'register_invoice' }) +
+          sseFrame('approval_required', APPROVAL) +
+          sseFrame('tool_result', { call_id: 'c1', tool_name: 'register_invoice', status: 'approval_required' }) +
+          doneFrame('He solicitado la aprobación.', { pending_approvals: [APPROVAL] }),
+      ],
+      {
+        [`GET /api/v1/approvals/${APPROVAL.approval_id}`]: {
+          status: 200,
+          body: approvalBody(APPROVAL.approval_id, { tool_name: 'register_invoice', input: { amount: 10 } }),
+        },
+      },
+    );
 
     await user.type(input, 'Registra la factura{Enter}');
 
-    const notices = await within(chatLog()).findAllByText(/necesita aprobación/);
+    const notices = await within(chatLog()).findAllByRole('group', { name: 'Confirmar una acción' });
     expect(notices).toHaveLength(1);
     expect(notices[0]).toHaveTextContent(`Identificador de la aprobación: ${APPROVAL.approval_id}`);
+    await within(notices[0]!).findByRole('button', { name: 'Aprobar y ejecutar' });
     expect(screen.queryByText(/register_invoice/)).not.toBeInTheDocument();
+    expect(announcer()).toHaveTextContent('El asistente necesita tu confirmación para: Confirmar una acción.');
+    expect(approvalRoutes(fetchMock)).toEqual([`GET /api/v1/approvals/${APPROVAL.approval_id}`]);
+  });
+
+  it('approves and executes an email from the chat, then shows and announces the result', async () => {
+    const { user, notice, fetchMock } = await askToSend({
+      [`POST ${SEND_PATH}/approve`]: sendReply({ status: 'approved' }),
+      [`POST ${SEND_PATH}/execute`]: sendReply({ status: 'executed', execution_result: { id: 'g-1' } }),
+    });
+    expect(notice).toHaveTextContent('Factura 42');
+    expect(notice).toHaveTextContent('Adjunto la factura.');
+
+    await user.click(within(notice).getByRole('button', { name: 'Aprobar y ejecutar' }));
+
+    expect(await within(notice).findByText('Correo enviado.')).toBeInTheDocument();
+    expect(within(notice).getByRole('status')).toHaveTextContent('Correo enviado.');
+    for (const name of ['Aprobar y ejecutar', 'Rechazar']) {
+      expect(within(notice).getByRole('button', { name })).toHaveAttribute('aria-disabled', 'true');
+    }
+    expect(approvalRoutes(fetchMock)).toEqual([`GET ${SEND_PATH}`, `POST ${SEND_PATH}/approve`, `POST ${SEND_PATH}/execute`]);
+  });
+
+  it('rejects an email from the chat without executing it', async () => {
+    const { user, notice, fetchMock } = await askToSend({
+      [`POST ${SEND_PATH}/reject`]: sendReply({ status: 'rejected' }),
+    });
+
+    await user.click(within(notice).getByRole('button', { name: 'Rechazar' }));
+
+    expect(await within(notice).findByText('Acción rechazada. No se ha hecho nada.')).toBeInTheDocument();
+    expect(within(notice).getByRole('status')).toHaveTextContent('Acción rechazada.');
+    expect(approvalRoutes(fetchMock)).toEqual([`GET ${SEND_PATH}`, `POST ${SEND_PATH}/reject`]);
+  });
+
+  it('shows progress and ignores more clicks while a call is in flight', async () => {
+    const gate = createGate();
+    const { user, notice, fetchMock } = await askToSend({
+      [`POST ${SEND_PATH}/approve`]: () => gate.hold(() => sendReply({ status: 'approved' })),
+      [`POST ${SEND_PATH}/execute`]: () => gate.hold(() => sendReply({ status: 'executed' })),
+    });
+    const confirm = within(notice).getByRole('button', { name: 'Aprobar y ejecutar' });
+
+    await user.click(confirm);
+    expect(await within(notice).findByText('Aprobando la acción…')).toBeInTheDocument();
+    expect(confirm).toHaveAttribute('aria-disabled', 'true');
+    expect(confirm).toHaveFocus();
+    await user.click(confirm);
+    await user.click(within(notice).getByRole('button', { name: 'Rechazar' }));
+    gate.release();
+
+    expect(await within(notice).findByText('Ejecutando la acción…')).toBeInTheDocument();
+    await waitFor(() => expect(gate.pending).toBe(1));
+    gate.release();
+    expect(await within(notice).findByText('Correo enviado.')).toBeInTheDocument();
+    expect(approvalRoutes(fetchMock)).toEqual([`GET ${SEND_PATH}`, `POST ${SEND_PATH}/approve`, `POST ${SEND_PATH}/execute`]);
+  });
+
+  it('shows why an execution failed with the tool reason', async () => {
+    const { user, notice } = await askToSend({
+      [`POST ${SEND_PATH}/approve`]: sendReply({ status: 'approved' }),
+      [`POST ${SEND_PATH}/execute`]: sendReply({
+        status: 'failed',
+        execution_error: 'precheck_failed: google mail connection expired',
+      }),
+    });
+
+    await user.click(within(notice).getByRole('button', { name: 'Aprobar y ejecutar' }));
+
+    expect(
+      await within(notice).findByText('No se ha podido ejecutar la acción. Motivo: google mail connection expired'),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      { status: 410, body: { detail: 'approval request expired' } },
+      'La solicitud ha caducado sin ejecutarse. Pide al asistente que la prepare de nuevo.',
+    ],
+    [{ status: 403, body: { detail: 'forbidden' } }, 'No tienes permiso para confirmar ni rechazar esta acción.'],
+    [{ status: 404, body: { detail: 'approval request not found' } }, 'Esta solicitud ya no existe.'],
+  ])('ends with a clear message when approving answers %o', async (reply, message) => {
+    const { user, notice } = await askToSend({ [`POST ${SEND_PATH}/approve`]: reply });
+
+    await user.click(within(notice).getByRole('button', { name: 'Aprobar y ejecutar' }));
+
+    expect(await within(notice).findByText(message)).toBeInTheDocument();
+    expect(within(notice).getByRole('status')).toHaveTextContent(message);
+    expect(within(notice).getByRole('button', { name: 'Aprobar y ejecutar' })).toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('re-reads a request decided elsewhere and shows its real state', async () => {
+    let reads = 0;
+    const { user, notice } = await askToSend({
+      [`GET ${SEND_PATH}`]: () => {
+        reads += 1;
+        return sendReply(reads === 1 ? {} : { status: 'rejected' });
+      },
+      [`POST ${SEND_PATH}/approve`]: { status: 409, body: { detail: 'approval request is rejected' } },
+    });
+
+    await user.click(within(notice).getByRole('button', { name: 'Aprobar y ejecutar' }));
+
+    expect(await within(notice).findByText('Acción rechazada. No se ha hecho nada.')).toBeInTheDocument();
+    expect(reads).toBe(2);
+  });
+
+  it('retries only the execution after a network error, once approved', async () => {
+    let executions = 0;
+    const { user, notice, fetchMock } = await askToSend({
+      [`POST ${SEND_PATH}/approve`]: sendReply({ status: 'approved' }),
+      [`POST ${SEND_PATH}/execute`]: () => {
+        executions += 1;
+        return executions === 1 ? { status: 503, body: { detail: 'upstream' } } : sendReply({ status: 'executed' });
+      },
+    });
+    const confirm = within(notice).getByRole('button', { name: 'Aprobar y ejecutar' });
+
+    await user.click(confirm);
+    expect(
+      await within(notice).findByText(
+        'No se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
+      ),
+    ).toBeInTheDocument();
+    expect(confirm).not.toHaveAttribute('aria-disabled');
+    await user.click(confirm);
+
+    expect(await within(notice).findByText('Correo enviado.')).toBeInTheDocument();
+    expect(approvalRoutes(fetchMock)).toEqual([
+      `GET ${SEND_PATH}`,
+      `POST ${SEND_PATH}/approve`,
+      `POST ${SEND_PATH}/execute`,
+      `POST ${SEND_PATH}/execute`,
+    ]);
+  });
+
+  it('offers to load the details again when the first read fails', async () => {
+    let reads = 0;
+    const { user, input } = await openChat(
+      [SEND_RUN],
+      {
+        [`GET ${SEND_PATH}`]: () => {
+          reads += 1;
+          return reads === 1 ? { status: 502, body: { detail: 'bad gateway' } } : sendReply();
+        },
+      },
+      'operator',
+    );
+    await user.type(input, 'Envía la factura a Ana{Enter}');
+    const notice = await within(chatLog()).findByRole('group', { name: 'Enviar un correo' });
+
+    await user.click(await within(notice).findByRole('button', { name: 'Volver a cargar' }));
+
+    expect(await within(notice).findByText('ana@example.com')).toBeInTheDocument();
+    expect(within(notice).getByRole('button', { name: 'Aprobar y ejecutar' })).not.toHaveAttribute('aria-disabled');
   });
 
   it.each([
@@ -311,15 +512,19 @@ describe('ChatPage', () => {
   });
 
   it('has no axe violations, empty and with citations, an approval, and an error', async () => {
-    const { user, input } = await openChat([
-      sseFrame('approval_required', APPROVAL) +
-        doneFrame('Mira [1].', { citations: [CITATION], pending_approvals: [APPROVAL] }),
-      sseFrame('error', { message: 'language model unavailable' }),
-    ]);
+    const { user, input } = await openChat(
+      [
+        sseFrame('approval_required', SEND_APPROVAL) +
+          doneFrame('Mira [1].', { citations: [CITATION], pending_approvals: [SEND_APPROVAL] }),
+        sseFrame('error', { message: 'language model unavailable' }),
+      ],
+      { [`GET ${SEND_PATH}`]: sendReply() },
+    );
     await expectNoAxeViolations();
 
     await user.type(input, 'Uno{Enter}');
     await screen.findByRole('list', { name: 'Fuentes' });
+    await within(chatLog()).findByRole('button', { name: 'Aprobar y ejecutar' });
     await user.type(input, 'Dos{Enter}');
     await within(chatLog()).findByText(/no está disponible/);
     await user.click(within(chatLog()).getByRole('link', { name: /\[1\]/ }));
