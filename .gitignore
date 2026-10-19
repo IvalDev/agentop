@@ -25,3 +25,7 @@ models/
 var/
 dev.db
 *.db-journal
+
+# Web app (web/): dependencies and build output; package-lock.json stays tracked
+web/node_modules/
+web/dist/

@@ -1,11 +1,16 @@
 """Typed application settings loaded from environment variables."""
 
+from pathlib import Path
+
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 #: ``environment`` values that enable development-only features (the ``/ui``
 #: console). Matched exactly, like the demo seed: ``PRODUCTION`` is not ``dev``.
 DEVELOPMENT_ENVIRONMENTS = frozenset({"dev", "development", "local", "test"})
+
+#: Build output of the React web app (``npm --prefix web run build``).
+DEFAULT_WEB_DIST_DIR = Path(__file__).resolve().parents[2] / "web" / "dist"
 
 
 class Settings(BaseSettings):
@@ -65,6 +70,8 @@ class Settings(BaseSettings):
     # Audit (T8): cap on the compact JSON of each stored payload/result.
     audit_max_payload_bytes: int = 16 * 1024
     log_level: str = "INFO"
+    # Web app: served at ``/`` only when this directory holds an ``index.html``.
+    web_dist_dir: str = str(DEFAULT_WEB_DIST_DIR)
     bootstrap_email: str = ""
     bootstrap_password: str = ""
 

@@ -1,10 +1,11 @@
 """Shared request/response schemas; populated as feature tasks land."""
 
+import re
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class LoginRequest(BaseModel):
@@ -59,6 +60,78 @@ class AdminProbeResponse(BaseModel):
     """Response of the admin+ role-gate probe endpoint."""
 
     status: str
+
+
+#: Roles a team member can hold, from most to least privileged.
+TeamRole = Literal["owner", "admin", "operator", "viewer"]
+#: Shortest initial password the team API accepts, in characters.
+PASSWORD_MIN_CHARS = 8
+#: Longest password in UTF-8 bytes: bcrypt ignores everything past 72 bytes.
+PASSWORD_MAX_BYTES = 72
+_EMAIL = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
+
+
+class TeamUserResponse(BaseModel):
+    """Public view of one user of the caller's tenant (no tenant id, never a hash)."""
+
+    id: int
+    email: str
+    full_name: str
+    role: TeamRole
+    is_active: bool
+    created_at: datetime
+
+
+class TeamUserListResponse(BaseModel):
+    """Every user of the caller's tenant, oldest first."""
+
+    users: list[TeamUserResponse]
+
+
+class TeamUserCreateRequest(BaseModel):
+    """Body of ``POST /api/v1/users``.
+
+    The tenant always comes from the caller's token: a ``tenant_id`` (or any
+    other unknown field) is rejected. ``email`` is trimmed and lowercased.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(max_length=320)
+    full_name: str = Field(max_length=200)
+    role: TeamRole
+    password: str = Field(min_length=PASSWORD_MIN_CHARS)
+
+    @field_validator("email")
+    @classmethod
+    def _normalize_email(cls, value: str) -> str:
+        email = value.strip().lower()
+        if not _EMAIL.fullmatch(email):
+            raise ValueError("invalid email address")
+        return email
+
+    @field_validator("full_name")
+    @classmethod
+    def _require_full_name(cls, value: str) -> str:
+        name = value.strip()
+        if not name:
+            raise ValueError("full name must not be blank")
+        return name
+
+    @field_validator("password")
+    @classmethod
+    def _limit_password_bytes(cls, value: str) -> str:
+        if len(value.encode()) > PASSWORD_MAX_BYTES:
+            raise ValueError(f"password must be at most {PASSWORD_MAX_BYTES} bytes")
+        return value
+
+
+class TeamUserRoleRequest(BaseModel):
+    """Body of ``PUT /api/v1/users/{user_id}/role``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: TeamRole
 
 
 class DocumentResponse(BaseModel):
