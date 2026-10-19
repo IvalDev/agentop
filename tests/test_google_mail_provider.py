@@ -380,7 +380,7 @@ async def test_send_message_posts_raw_and_returns_the_payload() -> None:
 
     assert payload == {"id": "sent-1", "threadId": "t-9"}
     assert seen["method"] == "POST"
-    assert seen["url"] == GOOGLE_GMAIL_MESSAGES_URL
+    assert seen["url"] == f"{GOOGLE_GMAIL_MESSAGES_URL}/send"
     assert b'"raw":"cmF3"' in seen["body"]
     assert b'"threadId":"t-9"' in seen["body"]
 

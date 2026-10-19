@@ -47,7 +47,7 @@ GOOGLE_GMAIL_PROFILE_URL = "https://gmail.googleapis.com/gmail/v1/users/me/profi
 #: Gmail API ``users.labelsList`` endpoint for the mailbox's labels (G2).
 GOOGLE_GMAIL_LABELS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/labels"
 
-#: Gmail API ``users.messages`` collection endpoint (G3: list/send).
+#: Gmail API ``users.messages`` collection endpoint (G3: list; send appends ``/send``).
 GOOGLE_GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
 
 #: Headers a ``format=metadata`` read asks for (G3.1: what a search hit shows).
@@ -280,7 +280,9 @@ class GoogleGmailProvider:
         body: dict[str, Any] = {"raw": raw_mime_b64url}
         if thread_id is not None:
             body["threadId"] = thread_id
-        response = await self._request("POST", GOOGLE_GMAIL_MESSAGES_URL, json=body)
+        # ``users.messages.send`` is the ``/send`` sub-resource; the bare collection
+        # URL is ``users.messages.insert``, which stores a copy without sending it.
+        response = await self._request("POST", f"{GOOGLE_GMAIL_MESSAGES_URL}/send", json=body)
         self._raise_for_status(response)
         return self._require_id(self._json_object(response))
 
