@@ -21,6 +21,7 @@ from app.modules.agent.prompt import (
     module_prompt,
     neutralize,
     render_passages,
+    render_pending_approval,
     render_tool_output,
 )
 from packages.contracts.schemas import (
@@ -271,3 +272,22 @@ def test_cited_keeps_only_known_markers() -> None:
     assert (cited[0].start_offset, cited[0].end_offset) == (40, 47)
     assert cited[0].content == "tax 21%"
     assert index.cited("No markers at all.") == []
+
+
+def test_base_prompt_points_pending_actions_to_the_approval_notice() -> None:
+    """The approval notice is the confirmation: no chat confirmation, no request id."""
+    text = " ".join(BASE_PROMPT.lower().split())
+
+    assert "approval notice" in text
+    assert "do not ask the user to confirm in the chat" in text
+    assert "give its request id" not in text
+
+
+def test_pending_approval_message_sends_the_user_to_the_notice() -> None:
+    """The tool message keeps the human-approval contract and names the notice."""
+    text = render_pending_approval("send_email", uuid4())
+
+    assert "submitted for human approval" in text
+    assert "approval notice" in text
+    assert "do not call send_email again" in text.lower()
+    assert "do not repeat the request id" in text.lower()

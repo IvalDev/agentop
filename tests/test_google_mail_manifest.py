@@ -130,3 +130,20 @@ def test_production_registers_google_mail_once_at_import() -> None:
         register_default_google_mail()
     # The failed duplicate leaves the production entry untouched.
     assert default_catalog.get("google_mail") is production
+
+
+def test_agent_profile_calls_actions_without_asking_in_the_chat() -> None:
+    """The approval notice confirms an action, so the agent never asks first in the chat.
+
+    It asks only for missing details, shows a requested draft in the same
+    answer as the tool call, and never leaves bracket placeholders in mail.
+    """
+    profile = GOOGLE_MAIL_MANIFEST.agent
+    assert profile is not None
+    text = " ".join(profile.instructions.lower().split())
+
+    assert "approval notice" in text
+    assert "never ask the user to confirm in the chat" in text
+    assert "ask only for" in text
+    assert "same answer" in text
+    assert "placeholders" in text
