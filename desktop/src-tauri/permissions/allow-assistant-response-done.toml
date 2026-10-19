@@ -1,0 +1,17 @@
+# App-level permission for the response notification bridge (W5).
+#
+# The widget loads its page from an external http origin, so the injected
+# bridge script talks to the native side from a *remote* origin. Tauri's ACL
+# only forwards commands that a capability grants, and capabilities can only
+# reference permissions that exist; this file defines the app permission the
+# `widget-bridge` capability grants to that single command.
+
+[[permission]]
+identifier = "allow-assistant-response-done"
+description = "Enables the assistant_response_done command without any pre-configured scope."
+commands.allow = ["assistant_response_done"]
+
+[[permission]]
+identifier = "deny-assistant-response-done"
+description = "Denies the assistant_response_done command without any pre-configured scope."
+commands.deny = ["assistant_response_done"]

@@ -6,10 +6,21 @@ authenticated user. Every tool declares:
 - its :class:`ToolKind` — ``EXTRACT`` (read-only, produces structured data)
   or ``ACTION`` (mutates external state or sends something);
 - its :class:`ApprovalPolicy` — ``AUTO`` may run without human approval and
-  is only legal for ``EXTRACT``; ``REQUIRE_APPROVAL`` must be approved by a
-  human first and is mandatory for every ``ACTION`` (feature decision A7:
-  the model never authorizes);
+  is only legal for ``EXTRACT``; ``ALLOW_WITHOUT_APPROVAL`` also runs
+  without approval and is the explicit no-approval policy for deliberate
+  self-service ``ACTION`` tools (calendar-mvp D5: the user's own calendar —
+  the model acts on the caller's behalf with no third-party effect, so a
+  human approval round-trip would only add friction; the registration
+  invariant still forbids ``AUTO`` on ``ACTION``, so an action must declare
+  its no-approval policy explicitly); ``EXTRACT`` tools may use it as the
+  clearer spelling of ``AUTO``; ``REQUIRE_APPROVAL`` must be approved by a
+  human first (feature decision A7: the model never authorizes);
 - the minimum :class:`~app.modules.identity.models.role` that may invoke it;
+- the catalog ``module`` key it belongs to: ``None`` marks a core tool every
+  tenant always has, while a non-``None`` key (a lowercase identifier like a
+  tool name) is offered and executed only while the tenant has that module
+  active (see :func:`app.modules.agent.service.tool_schemas` and
+  :func:`app.modules.tools.executor.execute_tool`);
 - a Pydantic ``input_model`` describing its typed input, and optionally an
   ``output_model`` the handler's return value is validated against.
 
@@ -21,11 +32,12 @@ Handler contract (exact signature)::
 ``session``, the ``tenant_id`` and ``user`` of the authenticated principal,
 and the optional services a handler may need (the ``embeddings`` provider for
 semantic search, the chat model ``llm``, the document blob ``storage``, the
-run's ``correlation_id``). ``tenant_id`` is the isolation key (decision A8):
-handlers MUST scope every query with it. ``ToolUser`` is a structural
-protocol satisfied by both the ORM ``User`` and the request-scoped
-``CurrentUser`` value object, so handlers stay decoupled from either. New
-services are added as context fields, never as extra positional arguments.
+run's ``correlation_id``, the requesting user's ``timezone``). ``tenant_id``
+is the isolation key (decision A8): handlers MUST scope every query with it.
+``ToolUser`` is a structural protocol satisfied by both the ORM ``User`` and
+the request-scoped ``CurrentUser`` value object, so handlers stay decoupled
+from either. New services are added as context fields, never as extra
+positional arguments.
 
 Optional hooks (T11)::
 
@@ -44,6 +56,20 @@ Optional hooks (T11)::
   :class:`~app.modules.tools.exceptions.ToolPrecheckError` with a short,
   user-safe reason; it must not change state.
 
+Requester-only approval (google-mail G7)::
+
+    requester_only_approval: bool = False
+
+- ``requester_only_approval`` (``REQUIRE_APPROVAL`` tools only) marks a tool
+  that acts on the *requester's own* account — a per-user provider
+  connection such as their Gmail mailbox. The handler always runs with the
+  identity of whoever executes the approved call, so for such a tool another
+  user of the tenant would act on *their* account instead. With the flag set
+  only the request's ``requested_by`` may approve, reject, or execute it (and
+  still needs the stored approver role); reads and listing are unchanged
+  (see :mod:`app.modules.approvals.service`). Declarative on purpose: the
+  approvals service reads it from the registry, never from the request.
+
 Registration invariants are enforced by :meth:`ToolRegistry.register` and
 raise :class:`ToolRegistrationError`; lookups raise
 :class:`ToolNotFoundError`. Single-process MVP: no thread-safety guarantees.
@@ -58,6 +84,7 @@ from typing import Any, Protocol
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.modules.agent.llm import LLMProvider
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.models import UserRole
@@ -76,6 +103,7 @@ class ApprovalPolicy(enum.StrEnum):
     """Whether a human must approve the tool before it executes."""
 
     AUTO = "auto"
+    ALLOW_WITHOUT_APPROVAL = "allow_without_approval"
     REQUIRE_APPROVAL = "require_approval"
 
 
@@ -96,6 +124,14 @@ class ToolContext:
     from the authenticated principal, never from tool input). ``embeddings``,
     ``llm``, and ``storage`` are ``None`` when the caller wired no such
     service; handlers must degrade or fail closed instead of assuming one.
+    ``credentials_key`` is the Fernet key for decrypting per-user provider
+    connections (calendar-mvp T3); ``settings`` carries the app configuration
+    a handler's precheck may need (the Google OAuth client credentials for
+    the under-demand token refresh, D3). Both default to ``None`` — tools
+    that need them must fail closed with a precheck error, never a 500.
+    ``timezone`` is the resolved IANA name of the requesting user in a chat
+    run (``"UTC"`` when the browser sent none or an unknown one); it is
+    ``None`` outside chat runs, e.g. when an approved request executes.
     """
 
     session: AsyncSession
@@ -105,6 +141,9 @@ class ToolContext:
     correlation_id: str | None = None
     llm: LLMProvider | None = None
     storage: DocumentStorage | None = None
+    credentials_key: str | None = None
+    settings: Settings | None = None
+    timezone: str | None = None
 
 
 ToolHandler = Callable[[ToolContext, BaseModel], Awaitable[Any]]
@@ -127,8 +166,12 @@ class ToolSpec:
     ``ToolRegistrationError`` (not a wrapped ``ValidationError``).
     ``input_model`` may be ``None`` on a bare construction but is required
     at registration time. ``required_role`` is who may *invoke* the tool;
+    ``module`` is which catalog module owns it — ``None`` marks a core tool
+    that is never gated by tenant activation, a non-``None`` key must match
+    the tool-name identifier pattern (checked at registration);
     ``approval_role`` and ``precheck`` are the optional hooks described in
-    the module docstring.
+    the module docstring, as is ``requester_only_approval`` (who may decide
+    and execute an approval of this tool).
     """
 
     name: str
@@ -141,6 +184,8 @@ class ToolSpec:
     output_model: type[BaseModel] | None = None
     approval_role: ApprovalRoleResolver | None = None
     precheck: ToolPrecheck | None = None
+    module: str | None = None
+    requester_only_approval: bool = False
 
 
 class ToolRegistry:
@@ -155,8 +200,9 @@ class ToolRegistry:
         Raises:
             ToolRegistrationError: duplicate or invalid name, missing or
                 non-Pydantic ``input_model``, non-callable handler or hook,
-                an ``ACTION`` tool that is not ``REQUIRE_APPROVAL``, or an
-                ``approval_role`` on a tool that is not ``REQUIRE_APPROVAL``.
+                an ``ACTION`` tool that is not ``REQUIRE_APPROVAL``, an
+                ``approval_role`` or ``requester_only_approval`` on a tool
+                that is not ``REQUIRE_APPROVAL``, or an invalid ``module`` key.
         """
         if not isinstance(spec.name, str) or not _NAME_PATTERN.fullmatch(spec.name):
             raise ToolRegistrationError(
@@ -165,6 +211,13 @@ class ToolRegistry:
             )
         if spec.name in self._specs:
             raise ToolRegistrationError(f"duplicate tool name: {spec.name!r}")
+        if spec.module is not None and (
+            not isinstance(spec.module, str) or not _NAME_PATTERN.fullmatch(spec.module)
+        ):
+            raise ToolRegistrationError(
+                f"tool {spec.name!r}: invalid module {spec.module!r}: expected lowercase "
+                "identifier like 'calendar'"
+            )
         if spec.input_model is None or not (
             isinstance(spec.input_model, type) and issubclass(spec.input_model, BaseModel)
         ):
@@ -173,12 +226,13 @@ class ToolRegistry:
             )
         if not callable(spec.handler):
             raise ToolRegistrationError(f"tool {spec.name!r} needs a callable handler")
-        if (
-            spec.kind is ToolKind.ACTION
-            and spec.approval_policy is not ApprovalPolicy.REQUIRE_APPROVAL
+        if spec.kind is ToolKind.ACTION and spec.approval_policy not in (
+            ApprovalPolicy.REQUIRE_APPROVAL,
+            ApprovalPolicy.ALLOW_WITHOUT_APPROVAL,
         ):
             raise ToolRegistrationError(
-                f"tool {spec.name!r}: ACTION tools must use approval_policy=REQUIRE_APPROVAL"
+                f"tool {spec.name!r}: ACTION tools must declare approval_policy="
+                "REQUIRE_APPROVAL or ALLOW_WITHOUT_APPROVAL (never AUTO)"
             )
         for hook in ("approval_role", "precheck"):
             if getattr(spec, hook) is not None and not callable(getattr(spec, hook)):
@@ -189,6 +243,14 @@ class ToolRegistry:
         ):
             raise ToolRegistrationError(
                 f"tool {spec.name!r}: approval_role needs approval_policy=REQUIRE_APPROVAL"
+            )
+        if (
+            spec.requester_only_approval
+            and spec.approval_policy is not ApprovalPolicy.REQUIRE_APPROVAL
+        ):
+            raise ToolRegistrationError(
+                f"tool {spec.name!r}: requester_only_approval needs "
+                "approval_policy=REQUIRE_APPROVAL"
             )
         self._specs[spec.name] = spec
 

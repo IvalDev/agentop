@@ -21,8 +21,9 @@ control plane; in this milestone it only bypasses in-tenant role checks.
 """
 
 import enum
+from datetime import datetime
 
-from sqlalchemy import Boolean, Enum, ForeignKey, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base, TimestampMixin
@@ -64,3 +65,26 @@ class User(TimestampMixin, Base):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_superadmin: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class RefreshSession(TimestampMixin, Base):
+    """One persistent session per device, keyed by an opaque refresh token.
+
+    The client holds the raw token in an httpOnly cookie; the database stores
+    only its SHA-256 digest (``token_hash``), so a database leak never exposes
+    a usable session. Each rotation keeps the same ``family_id`` and links the
+    replaced row through ``replaced_by_id``; replaying a revoked token is
+    treated as theft and revokes the whole family.
+    """
+
+    __tablename__ = "refresh_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    family_id: Mapped[str] = mapped_column(String(64), index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replaced_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("refresh_sessions.id"), nullable=True
+    )

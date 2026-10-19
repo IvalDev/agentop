@@ -7,6 +7,18 @@ Product policy:
   included. A superadmin passes the role check, but the tenant must still
   match. Listing omits requests the caller's role does not satisfy; a get of
   one raises :class:`ApprovalForbiddenError`.
+- Requester-only tools (``ToolSpec.requester_only_approval``, google-mail
+  G7): a tool acting on the requester's own account — a per-user provider
+  connection such as their Gmail mailbox — runs with the identity of whoever
+  executes it, so only ``requested_by`` may approve, reject, or execute its
+  requests; anyone else, a superadmin or a higher role included, gets
+  :class:`ApprovalForbiddenError` (audited ``approval.denied`` with reason
+  ``requester_only``), checked right after the role check, which the
+  requester must still pass. Reads and listing keep the role rule. The flag
+  is read from the registry (a tool missing from it fails closed:
+  requester only); a decision made without a ``registry`` cannot read it
+  and applies the role rule alone — the HTTP routes always pass one, and
+  execution always has one.
 - Requests of other tenants are indistinguishable from missing ones
   (:class:`ApprovalNotFoundError`), which is checked before the role.
 - Who may *create* a request is the tool's invocation role
@@ -22,7 +34,11 @@ Product policy:
   caught like a tampered payload), and runs exactly the stored payload.
 - Execution runs the tool's precheck again right before its handler (inside
   ``execute_tool``); a refusal is a failed run like a handler error: the
-  request ends ``failed`` with ``precheck_failed: <reason>``.
+  request ends ``failed`` with ``precheck_failed: <reason>``. The tool's
+  module must still be active for the tenant at execution time (the set is
+  re-read with ``active_module_keys``): a module deactivated between
+  approval and execution ends the request ``failed`` with
+  ``inactive_module``.
 - Requests expire ``Settings.approval_ttl_seconds`` after creation. Expiry
   is enforced on approve, reject, and execute: the first such call at or
   after ``expires_at`` marks a pending/approved request ``expired``. Listing
@@ -77,6 +93,7 @@ from app.modules.approvals.grants import mint_grant
 from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event, stage_event
+from app.modules.catalog.service import active_module_keys
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.deps import TenantContext
 from app.modules.identity.models import UserRole
@@ -171,9 +188,12 @@ async def _deny(
     operation: str,
     tool_name: str,
     request_id: UUID | None = None,
+    *,
+    reason: str | None = None,
 ) -> NoReturn:
-    """Persist ``approval.denied`` for ``operation``, then raise forbidden."""
+    """Persist ``approval.denied`` for ``operation`` (with ``reason``, if any), then raise."""
     reference = None if request_id is None else str(request_id)
+    result = {"error": "forbidden"} if reason is None else {"error": "forbidden", "reason": reason}
     await persist_event(
         session,
         tenant_id=user.tenant_id,
@@ -183,18 +203,41 @@ async def _deny(
         resource_id=reference,
         tool_name=tool_name,
         payload={"operation": operation},
-        result={"error": "forbidden"},
+        result=result,
         correlation_id=reference,
     )
     raise ApprovalForbiddenError("forbidden")
 
 
+def _requester_only(registry: ToolRegistry | None, tool_name: str) -> bool:
+    """Whether only the requester may decide or execute ``tool_name``'s requests.
+
+    ``None`` (no registry given) cannot tell and keeps the role rule alone; a
+    tool the registry no longer knows fails closed (requester only).
+    """
+    if registry is None:
+        return False
+    try:
+        return registry.get(tool_name).requester_only_approval
+    except ToolNotFoundError:
+        return True
+
+
 async def _authorize(
-    session: AsyncSession, user: ToolUser, request: ApprovalRequest, operation: str
+    session: AsyncSession,
+    user: ToolUser,
+    request: ApprovalRequest,
+    operation: str,
+    *,
+    registry: ToolRegistry | None,
 ) -> None:
-    """Audited :func:`_require_role` for state-changing operations."""
+    """Audited :func:`_require_role`, then the requester-only rule, for state changes."""
     if not role_satisfies(user, UserRole(request.required_role)):
         await _deny(session, user, operation, request.tool_name, request.id)
+    if _requester_only(registry, request.tool_name) and user.id != request.requested_by:
+        await _deny(
+            session, user, operation, request.tool_name, request.id, reason="requester_only"
+        )
 
 
 def _readable_roles(user: ToolUser) -> list[str]:
@@ -396,12 +439,13 @@ async def _decide(
     outcome: ApprovalStatus,
     reason: str | None,
     now: datetime | None,
+    registry: ToolRegistry | None,
 ) -> ApprovalRequest:
     """One-shot pending → ``outcome`` decision (see :func:`approve_request`)."""
     now = _utc(now)
     request = await _load(session, user, request_id)
     operation = "approve" if outcome is ApprovalStatus.APPROVED else "reject"
-    await _authorize(session, user, request, operation)
+    await _authorize(session, user, request, operation, registry=registry)
     await _expire_if_due(session, user, request, now)
     _require_status(request, ApprovalStatus.PENDING)
     decision = {
@@ -427,16 +471,22 @@ async def _decide(
 
 
 async def approve_request(
-    session: AsyncSession, user: ToolUser, request_id: UUID, *, now: datetime | None = None
+    session: AsyncSession,
+    user: ToolUser,
+    request_id: UUID,
+    *,
+    now: datetime | None = None,
+    registry: ToolRegistry | None = None,
 ) -> ApprovalRequest:
     """Approve a pending request (commits).
 
     Raises, in check order: :class:`ApprovalNotFoundError`,
-    :class:`ApprovalForbiddenError`, :class:`ApprovalExpiredError` (after
-    marking the request expired), :class:`ApprovalStateError` (already
-    decided, including a lost race).
+    :class:`ApprovalForbiddenError` (role below the stored one, or — with
+    ``registry`` — not the requester of a requester-only tool),
+    :class:`ApprovalExpiredError` (after marking the request expired),
+    :class:`ApprovalStateError` (already decided, including a lost race).
     """
-    return await _decide(session, user, request_id, ApprovalStatus.APPROVED, None, now)
+    return await _decide(session, user, request_id, ApprovalStatus.APPROVED, None, now, registry)
 
 
 async def reject_request(
@@ -446,9 +496,10 @@ async def reject_request(
     *,
     reason: str | None = None,
     now: datetime | None = None,
+    registry: ToolRegistry | None = None,
 ) -> ApprovalRequest:
     """Reject a pending request with an optional reason (same rules as approve)."""
-    return await _decide(session, user, request_id, ApprovalStatus.REJECTED, reason, now)
+    return await _decide(session, user, request_id, ApprovalStatus.REJECTED, reason, now, registry)
 
 
 async def execute_approved_action(
@@ -460,11 +511,14 @@ async def execute_approved_action(
     now: datetime | None = None,
     llm: LLMProvider | None = None,
     storage: DocumentStorage | None = None,
+    credentials_key: str | None = None,
+    settings: Settings | None = None,
 ) -> ApprovalExecution:
     """Run an approved request's stored call at most once (commits).
 
     Check order: tenant-scoped load (not-found) → stored required role
-    (forbidden) → TTL (expired, marked) → status ``approved`` (state) →
+    (forbidden) → requester-only tool executed by someone other than its
+    requester (forbidden) → TTL (expired, marked) → status ``approved`` (state) →
     binding, approver role included (a mismatch marks the request ``failed``
     and raises :class:`ApprovalBindingError`) → the tool's *current* required
     role (forbidden). Every refusal above leaves a valid approval usable.
@@ -472,15 +526,20 @@ async def execute_approved_action(
     Then an atomic ``approved → executing`` claim is committed (a loser of a
     race gets :class:`ApprovalStateError`), ``execute_tool`` runs the stored
     payload with a freshly minted single-use grant (and ``llm``/``storage``
-    in the tool context), and the request ends ``executed`` (with the
+    plus ``credentials_key``/``settings`` in the tool context — without the
+    key, a tool decrypting per-user provider credentials fails its precheck
+    closed) gated by the tenant's *current* module activations
+    (re-read with ``active_module_keys`` once per execution: a tool of a
+    module deactivated since the approval is refused there as
+    ``inactive_module``), and the request ends ``executed`` (with the
     JSON-encoded output) or ``failed`` (with the error — a precheck refusal
-    included; the handler's uncommitted writes are rolled back first). A
-    crash after the claim leaves ``executing``: never re-runnable, visible
-    for operators.
+    or an inactive module included; the handler's uncommitted writes are
+    rolled back first). A crash after the claim leaves ``executing``: never
+    re-runnable, visible for operators.
     """
     now = _utc(now)
     request = await _load(session, user, request_id)
-    await _authorize(session, user, request, "execute")
+    await _authorize(session, user, request, "execute", registry=registry)
     await _expire_if_due(session, user, request, now)
     _require_status(request, ApprovalStatus.APPROVED)
     tenant_id, stored_tool = request.tenant_id, request.tool_name
@@ -503,6 +562,9 @@ async def execute_approved_action(
     if not role_satisfies(user, spec.required_role):
         await _deny(session, user, "execute", spec.name, request_id)
 
+    # Module activation may change between approval and execution: re-read it.
+    active_modules = await active_module_keys(session, user.tenant_id)
+
     payload, action_key = dict(request.input_payload), request.action_key
     claim = {"status": ApprovalStatus.EXECUTING, "executed_by": user.id, "executed_at": now}
     if not await _transition(session, request_id, ApprovalStatus.APPROVED, claim, alive_at=now):
@@ -520,6 +582,9 @@ async def execute_approved_action(
         correlation_id=str(request_id),
         llm=llm,
         storage=storage,
+        active_modules=active_modules,
+        credentials_key=credentials_key,
+        settings=settings,
     )
     if result.status == "ok":
         outcome = {

@@ -25,3 +25,18 @@ models/
 var/
 dev.db
 *.db-journal
+
+# Web app (web/): dependencies and build output; package-lock.json stays tracked
+web/node_modules/
+web/dist/
+
+# Desktop widget (desktop/): dependencies and Rust build output; package-lock.json stays tracked
+desktop/node_modules/
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+
+# Varios
+.atl/
+.github/
+odd/
+docs/

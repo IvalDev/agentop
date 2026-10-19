@@ -56,8 +56,8 @@ Prerequisites: Python 3.12+, an xAI API key. Run everything from the repository 
    make chat user=viewer  # as any other role
    ```
 
-   Or use the [browser console](#browser-console-development-only) at
-   <http://localhost:8000/ui/>.
+   Or use the [web app](#web-app) (`make app`, then <http://localhost:8000/>), or the
+   [browser console](#browser-console-development-only) at <http://localhost:8000/ui/>.
 
 Questions to try (the documents are in Spanish):
 
@@ -126,8 +126,8 @@ Every role logs in with tenant slug `demo`.
 
 | Role | Email | Default password | Can do |
 | --- | --- | --- | --- |
-| owner | `owner@demo.test` | `demo-owner-pass` | Everything below, plus read the audit log (`GET /api/v1/audit`) |
-| admin | `admin@demo.test` | `demo-admin-pass` | Same as owner in this milestone |
+| owner | `owner@demo.test` | `demo-owner-pass` | Everything below, plus manage owners and read the audit log (`GET /api/v1/audit`) |
+| admin | `admin@demo.test` | `demo-admin-pass` | Everything below, plus [manage the team](#manage-the-team-owner-and-admin) except owners |
 | operator | `operator@demo.test` | `demo-operator-pass` | Chat, search, upload and ingest documents; review approvals for operator-level tools |
 | viewer | `viewer@demo.test` | `demo-viewer-pass` | Chat, search, list documents (read-only) |
 
@@ -135,6 +135,45 @@ The agent only offers the tools a role may run, and an approval request can only
 and decided by a role that satisfies the tool's required role. Today the only built-in
 tool is `search_documents` (viewer and up), so no chat run produces an approval request
 yet; the client already renders them for the action tools that come later.
+
+## Manage the team (owner and admin)
+
+Owners and admins manage the users of their own company; every other role gets 403. The
+company always comes from the token, never from the request.
+
+| Method and path | Body | Success |
+| --- | --- | --- |
+| `GET /api/v1/users` | none | 200 `{"users": [user, ...]}`, oldest first |
+| `POST /api/v1/users` | `email`, `full_name`, `role`, `password` | 201 user |
+| `PUT /api/v1/users/{id}/role` | `role` | 200 user |
+| `POST /api/v1/users/{id}/deactivate` | none | 200 user |
+| `POST /api/v1/users/{id}/reactivate` | none | 200 user |
+
+A user is `{"id", "email", "full_name", "role", "is_active", "created_at"}`; `role` is
+`owner`, `admin`, `operator`, or `viewer`. New emails are trimmed and stored lowercase,
+and an initial password needs 8 characters to 72 bytes.
+
+| Answer | When |
+| --- | --- |
+| 403 `forbidden` | Caller is operator or viewer; or an admin creates an owner, promotes to `owner`, or changes, deactivates, or reactivates an owner |
+| 404 `user not found` | The id is unknown or belongs to another company (both answer the same) |
+| 409 with the rule as `detail` | `email already registered`, `cannot change your own role`, `cannot deactivate yourself`, `tenant must keep at least one active owner` |
+| 422 | Invalid body, or any extra field such as `tenant_id` |
+
+A deactivated user cannot log in, and their tokens stop working on the next request; a
+role change also applies on the next request. Setting the role or state a user already
+has changes nothing. Every change is audited (`user.created`, `user.role_changed`,
+`user.deactivated`, `user.reactivated`) without the password, and refusals by the rules
+above are audited as `user.denied`.
+
+```bash
+TOKEN=$(curl -s localhost:8000/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"admin@demo.test","password":"demo-admin-pass","tenant_slug":"demo"}' \
+  | jq -r .access_token)
+curl -s localhost:8000/api/v1/users -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"new@demo.test","full_name":"New Hire","role":"viewer","password":"change-me-now"}' | jq .
+```
 
 ## Embeddings on a weak machine
 
@@ -145,6 +184,169 @@ yet; the client already renders them for the action tools that come later.
 
 Changing the embedding provider or model after seeding mixes incompatible vectors: delete
 `dev.db` and `var/storage` and run `make demo` again.
+
+## Web app
+
+The React app in `web/` is the product console: log in, then use **Chat**, **Base de
+conocimiento**, and **Configuración → Equipo**. Its interface is in Spain Spanish.
+Prerequisites: Node 22.22+ with npm, plus steps 1–3 of the [quick path](#quick-path-sqlite--grok--no-embedding-model).
+
+### Run it
+
+```bash
+make app
+```
+
+This installs the web dependencies when they are missing or outdated, builds `web/dist`, and
+starts the API on <http://localhost:8000/> with the same `.env` handling as `make dev`. Log in
+with company `demo` and any user of [the demo team](#the-demo-team), for example
+`admin@demo.test` / `demo-admin-pass`.
+
+| Route | Section | Who sees it | State |
+| --- | --- | --- | --- |
+| `/login` | Iniciar sesión | Everyone | Done: company, email, password |
+| `/chat` | Chat | Every role | Done: streamed answers, sources, history, stop, and reset ([below](#chat)) |
+| `/conocimiento` | Base de conocimiento | Every role; uploads and ingest for operator and up | Done: document list, multi-file upload with automatic ingest, retry ([below](#knowledge-base)) |
+| `/configuracion/equipo` | Configuración → Equipo | Owner and admin; other roles are sent to `/chat` | Done: members, add, change role, deactivate, reactivate ([below](#team)) |
+
+The header shows your name and role and has **Cerrar sesión**. On a phone-width screen the
+navigation collapses behind a **Menú** button.
+
+### Chat
+
+The Chat section talks to `POST /api/v1/chat/stream` (Server-Sent Events), like the dev
+console and `python -m app.demo.chat`.
+
+- **Mensaje** is a multi-line field: Enter sends, Shift+Enter adds a line, and **Enviar** does
+  the same. Focus stays in the field after sending. Messages are limited to 4000 characters.
+- The answer appears as it streams. While the agent works it shows what it is doing:
+  "Buscando en la base de conocimiento…" for `search_documents`, a generic message for any
+  other tool (tool names are never shown). The `done` event's answer replaces the streamed
+  text.
+- Under each answer, **Fuentes** lists the cited documents; each opens to show the cited
+  excerpt. The `[n]` markers in the answer stay as typed and link to their source.
+- Answers, excerpts, and file names are untrusted text: shown as plain text, never as
+  Markdown or HTML.
+- An approval request shows a notice with its id and expiry; there is no approvals panel yet.
+- Errors and stops are shown in Spanish, never the API's English text: model unavailable,
+  connection lost, answer cut short, or the step limit (`stop_reason: step_limit`).
+- **Detener** aborts the request and keeps the text that had arrived. **Nueva conversación**
+  stops any answer and forgets the history.
+- Each message replays the last 10 messages of answered turns as history, with assistant text
+  cut to 4000 characters. Stopped or failed turns are not replayed. The conversation lives in
+  memory: it survives visiting other sections, and a reload or **Cerrar sesión** clears it.
+- Screen readers: the conversation is a `log` that does not read tokens as they arrive; a
+  polite status announces the agent's activity and then the finished answer once.
+
+### Knowledge base
+
+The Base de conocimiento section uses the documents API (`GET /api/v1/documents/`, `POST
+/api/v1/documents/`, and `POST /api/v1/documents/{id}/ingest`).
+
+| What | Viewer | Operator, admin, owner |
+| --- | --- | --- |
+| Document list: name, type, size, date, and status | Yes | Yes |
+| **Añadir documentos**: upload with automatic ingest | No | Yes |
+| **Reintentar** on failed documents, **Procesar** on unprocessed ones | No | Yes |
+
+- The list is a table (caption and column headers) that stacks into one card per document on a
+  phone. Sizes and dates follow the locale. Each status has a word and a symbol, so it never
+  depends on colour: ✓ Procesado, ○ Sin procesar, ◔ Procesando, ✕ Error.
+- A failed document shows a Spanish summary. The server's own `error_message` (for example,
+  a missing embedding model) is under a collapsed **Detalle técnico**, as plain text.
+- **Archivos** takes several `.md`, `.txt`, `.pdf`, or `.docx` files; you can also drop them on
+  the form, which sends them at once. Files over 20 MB or in other formats are refused before
+  sending. The server still enforces its own limit, `AA_MAX_UPLOAD_BYTES` (20 MB by default);
+  if you raise it, the app's 20 MB check stays in `web/src/knowledge/documents.ts`.
+- Each file is uploaded and then ingested, one after another, with its progress: "En espera",
+  "Subiendo…", "Procesando…", "Listo", or "Error: …". A 413 (too large), 422 (unreadable or
+  unsupported), or 502 (embedding backend unavailable) becomes a Spanish message; the list
+  refreshes when the batch ends. Leaving the section lets the current file finish and starts no
+  other.
+- `.md`, `.txt`, `.pdf`, and `.docx` files are sent with the content type ingest reads, whatever
+  the browser reports for them (some report Markdown as `text/x-markdown`).
+- Screen readers: a polite status announces each step and a summary of the batch.
+
+### Team
+
+Configuración → Equipo is the UI for the [team API](#manage-the-team-owner-and-admin); only owners
+and admins reach it, and the API enforces every rule again.
+
+- **Personas** lists everyone in the company, oldest first: name, email, role (Propietario,
+  Administrador, Operador, Lector), state (Activo or Inactivo, with a symbol), and date added.
+  Your own row says "(tú)".
+- **Cambiar rol** and **Desactivar** open an inline confirmation under the heading, which takes
+  focus; **Cancelar** sends nothing and returns focus to the button. **Reactivar** applies at once.
+- Controls the rules forbid are not offered: your own row has none, and for an admin neither do
+  owners' rows (each says why). An admin is never offered the Propietario role, in the form or
+  when changing a role.
+- **Dar de alta a una persona** takes a full name, an email (trimmed and lowercased before
+  sending), a role (Lector by default), and an initial password of 8 characters to 72 UTF-8
+  bytes, checked before sending. Share the password with the person through a safe channel; there
+  is no password reset yet (P2).
+- Refusals are shown in Spanish, never the API's text: 403 (owner-only change), 404 (no longer
+  in the company; the list reloads), each 409 rule (email taken, your own role or account, the
+  last active owner), and 422.
+
+### Develop with hot reload
+
+```bash
+make dev       # terminal 1: the API on :8000
+make web-dev   # terminal 2: Vite on http://localhost:5173, forwarding /api to :8000
+make web-test  # typecheck, lint (with jsx-a11y), and component tests with axe checks
+```
+
+After changing the frontend, `make app` (or `npm --prefix web run build`) rebuilds `web/dist`;
+the running API serves the new files without a restart.
+
+### How the API serves it
+
+| Request | Answer |
+| --- | --- |
+| `/api/...`, `/healthz`, `/docs`, `/redoc`, `/openapi.json`, `/ui` | As before; never the web app |
+| A file in `web/dist`, such as `/assets/index-<hash>.js` | The file; hashed assets are cached for a year |
+| A missing file (`/assets/...`, or a name with an extension) | 404 JSON, never the page |
+| A path the filesystem rejects, such as `/%00` | 404 JSON |
+| Any other `GET` (`/`, `/chat`, ...) | `index.html`, and the app routes on the client |
+
+Every web-app response carries `Content-Security-Policy` (`default-src 'self'`, no inline
+scripts or styles, `object-src 'none'`, `base-uri 'self'`, `frame-ancestors 'none'`),
+`X-Frame-Options: DENY`, and `X-Content-Type-Options: nosniff`. The Vite build has no inline
+code, so it needs nothing more; adding inline scripts, `style` attributes in HTML, or `data:`
+assets means changing `WEB_APP_CSP` in `app/main.py`. The API, `/docs`, and the dev console
+`/ui` do not get these headers.
+
+The app is mounted in every environment, but only when `web/dist/index.html` exists
+(`AA_WEB_DIST_DIR` points elsewhere). Without a build, backend-only development and the test
+suite work as before.
+
+### Session and security
+
+- The access token lives in memory and in the tab's `sessionStorage`: a reload keeps you
+  logged in, closing the tab logs you out, and it never goes to `localStorage` or cookies.
+- The API has no refresh token. After `AA_ACCESS_TOKEN_EXPIRE_MINUTES` (30 by default) any
+  request answers 401 and the app returns to the login page with "Tu sesión ha caducado".
+  Planned: an httpOnly refresh cookie.
+- On reload, only a 401 from `GET /api/v1/auth/me` ends the session. A network error, 408,
+  429, or 5xx keeps the token and shows **Reintentar** (and **Cerrar sesión** to leave).
+- The API client only calls same-origin paths that start with `/api/`; any other path or URL
+  throws, so the token never leaves the API.
+- The email is trimmed and lowercased before login, because the API compares it exactly.
+- Server text is always rendered as text, and the app loads no external scripts, fonts, or CDNs.
+
+### Code layout
+
+| Path in `web/src` | Holds |
+| --- | --- |
+| `i18n/` | `es-ES.ts` catalog (every visible string) and `t()`, `formatDate()`, `formatNumber()` |
+| `api/` | `createApiClient` (bearer token, `ApiError` with `detail`, 401 handling), auth calls, `chat.ts` (SSE parser, typed chat events), `documents.ts`, and `team.ts` |
+| `session/` | `SessionProvider`, `useSession()`, roles, token storage |
+| `chat/` | `ChatProvider` and `useChat()` (the conversation, mounted by the dashboard shell), its reducer, history, and message texts |
+| `knowledge/` | The document list and upload queue hooks, file checks, error mapping, and size and type labels |
+| `team/` | The member list hook, role rules (assignable roles, locked rows), password checks, and error mapping |
+| `components/` | Presentational atoms, molecules, organisms, and templates |
+| `pages/`, `routes/` | Route containers, guards (`RequireAuth`, `RequireRole`), and `paths` |
+| `test/` | Fake API (with `createGate()` to hold a request open), `renderApp()`, the axe helper, and `fakeChat.ts` (scripted SSE streams cut mid-line and mid-character) |
 
 ## Browser console (development only)
 

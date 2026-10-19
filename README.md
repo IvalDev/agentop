@@ -31,7 +31,12 @@ make run       # uvicorn app.main:app --reload
 make demo      # seed the fictional demo company (dev only; creates the schema)
 make dev       # like `make run`, reading settings from .env when present
 make chat      # console chat client; `make chat user=viewer` for another role
+make app       # build the React web app (web/) and serve it with the API on :8000
+make web-dev   # Vite dev server with hot reload on :5173 (run `make dev` alongside)
 ```
+
+The web app (React + Vite + TypeScript, Spanish UI) needs Node 22.22+; see
+[docs/dev-setup.md](docs/dev-setup.md#web-app).
 
 **Light setup without a VPS** (SQLite, Grok as the chat model, no local inference):
 see [docs/dev-setup.md](docs/dev-setup.md). Profiles live in `deployment/dev/`.

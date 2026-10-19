@@ -2,9 +2,13 @@
 
 Covers the T6 registration contract: valid specs register and round-trip;
 duplicate names, invalid names, missing input models, the
-ACTION-must-require-approval invariant, and the T11 hook invariants
-(``approval_role`` only on ``REQUIRE_APPROVAL`` tools, callable hooks) all
-raise ``ToolRegistrationError``; unknown lookups raise ``ToolNotFoundError``.
+ACTION-must-require-approval invariant, the T11 hook invariants
+(``approval_role`` only on ``REQUIRE_APPROVAL`` tools, callable hooks), the
+google-mail G7 invariant (``requester_only_approval`` only on
+``REQUIRE_APPROVAL`` tools), and the T2 module invariant (``module``
+defaults to ``None`` for core tools; a declared key must be a lowercase
+identifier) all raise
+``ToolRegistrationError``; unknown lookups raise ``ToolNotFoundError``.
 """
 
 import pytest
@@ -38,6 +42,7 @@ def build_spec(
     handler=stub_handler,
     approval_role=None,
     precheck=None,
+    requester_only_approval: bool = False,
 ) -> ToolSpec:
     """Build a ToolSpec with test defaults; individual fields can be overridden."""
     return ToolSpec(
@@ -50,6 +55,21 @@ def build_spec(
         input_model=input_model,
         approval_role=approval_role,
         precheck=precheck,
+        requester_only_approval=requester_only_approval,
+    )
+
+
+def build_moduled_spec(module) -> ToolSpec:
+    """A spec declaring ``module`` — only the module-invariant tests use it."""
+    return ToolSpec(
+        name="demo_tool",
+        description="registry test tool",
+        kind=ToolKind.EXTRACT,
+        approval_policy=ApprovalPolicy.AUTO,
+        required_role=UserRole.OPERATOR,
+        handler=stub_handler,
+        input_model=DemoInput,
+        module=module,
     )
 
 
@@ -132,6 +152,33 @@ def test_invalid_name_raises(bad_name: str) -> None:
         registry.register(build_spec(name=bad_name))
 
 
+def test_module_defaults_to_none_for_core_tools() -> None:
+    """A spec that declares no module is a core tool: always available."""
+    registry = ToolRegistry()
+
+    registry.register(build_spec())
+
+    assert registry.get("demo_tool").module is None
+
+
+def test_valid_module_key_registers_and_round_trips() -> None:
+    """A module tool keeps its catalog key through registration."""
+    registry = ToolRegistry()
+
+    registry.register(build_moduled_spec("calendar"))
+
+    assert registry.get("demo_tool").module == "calendar"
+
+
+@pytest.mark.parametrize("bad_module", [*INVALID_NAMES, 42])
+def test_invalid_module_raises(bad_module) -> None:
+    """Module keys follow the same lowercase-identifier pattern as tool names."""
+    registry = ToolRegistry()
+
+    with pytest.raises(ToolRegistrationError, match="module"):
+        registry.register(build_moduled_spec(bad_module))
+
+
 def test_missing_input_model_raises() -> None:
     """A spec without an input model cannot validate its arguments."""
     registry = ToolRegistry()
@@ -182,6 +229,41 @@ def test_precheck_registers_on_an_auto_tool() -> None:
     registry.register(build_spec(precheck=stub_precheck))
 
     assert registry.get("demo_tool").precheck is stub_precheck
+
+
+def test_requester_only_approval_defaults_to_false() -> None:
+    """Any satisfying role may decide unless a tool opts in explicitly."""
+    registry = ToolRegistry()
+
+    registry.register(build_spec())
+
+    assert registry.get("demo_tool").requester_only_approval is False
+
+
+def test_requester_only_approval_registers_on_an_approval_tool() -> None:
+    """A tool acting on the requester's own connection keeps the flag."""
+    registry = ToolRegistry()
+    spec = build_spec(
+        kind=ToolKind.ACTION,
+        approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+        requester_only_approval=True,
+    )
+
+    registry.register(spec)
+
+    assert registry.get(spec.name).requester_only_approval is True
+
+
+@pytest.mark.parametrize(
+    "policy", [ApprovalPolicy.AUTO, ApprovalPolicy.ALLOW_WITHOUT_APPROVAL], ids=str
+)
+def test_requester_only_approval_without_approval_raises(policy: ApprovalPolicy) -> None:
+    """The flag restricts who decides an approval: meaningless on a tool that needs none."""
+    registry = ToolRegistry()
+    spec = build_spec(approval_policy=policy, requester_only_approval=True)
+
+    with pytest.raises(ToolRegistrationError, match="requester_only_approval"):
+        registry.register(spec)
 
 
 @pytest.mark.parametrize("hook", ["approval_role", "precheck"])

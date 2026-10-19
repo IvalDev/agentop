@@ -250,6 +250,46 @@ async def test_agent_actor_and_correlation_are_recorded(
     assert event.correlation_id == "chat-42"
 
 
+async def test_inactive_module_refusal_writes_a_dedicated_event(
+    seeded_db: Database, seeded_users, approval_tools, audit_log
+) -> None:
+    """A tool of an inactive module is refused once and audited as its own action."""
+    approval_tools.registry.register(
+        ToolSpec(
+            name="moduled_note",
+            description="test-only tool owned by an inactive module",
+            kind=ToolKind.ACTION,
+            approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+            required_role=UserRole.ADMIN,
+            handler=approval_tools.spy,
+            input_model=approval_tools.registry.get("send_note").input_model,
+            module="messaging",
+        )
+    )
+    admin = seeded_users[ADMIN]
+
+    result = await _run(
+        seeded_db, approval_tools, admin, "moduled_note", NOTE, active_modules=set()
+    )
+
+    assert (result.status, result.error_kind, result.error) == (
+        "error",
+        "inactive_module",
+        "inactive_module",
+    )
+    assert result.approval_request is None
+    [event] = await audit_log(seeded_db)
+    assert event.action == "tool.inactive_module"
+    assert (event.actor_user_id, event.actor_type, event.tool_name) == (
+        admin.id,
+        ActorType.USER,
+        "moduled_note",
+    )
+    assert event.payload == {"input_fields": ["body", "to"]}
+    assert event.result == {"error": "inactive_module", "module": "messaging"}
+    assert approval_tools.spy.calls == []
+
+
 # --- Approval lifecycle ------------------------------------------------------
 
 
