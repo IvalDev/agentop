@@ -30,14 +30,16 @@ from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
 from app.core.config import Settings
-from app.core.crypto import decrypt_credentials, generate_credentials_key
+from app.core.crypto import decrypt_credentials, encrypt_credentials, generate_credentials_key
 from app.core.db import Database
 from app.main import create_app
 from app.modules.audit.models import AuditEvent
 from app.modules.catalog.manifest import FieldSpec, ModuleManifest, StepSpec
 from app.modules.catalog.registry import ModuleCatalog
 from app.modules.connections.models import ConnectionStatus, UserConnection
+from app.modules.onboarding.exceptions import OnboardingCompletedError, WrongStepError
 from app.modules.onboarding.models import OnboardingState, OnboardingStatus
+from app.modules.onboarding.service import complete_redirect_step
 from app.modules.onboarding.testers import ConnectionContext
 
 BASE = "/api/v1/onboarding"
@@ -575,7 +577,7 @@ async def test_test_connection_without_registered_tester_fails_closed(
     """No tester for the module: 501, state unchanged, no connection, no event."""
     headers = await _owner(onboarding_client)
     await _activate(onboarding_client, headers, CALENDAR)
-    # ``testers`` stays empty: production ships the registry empty too.
+    # ``testers`` has no entry for ``demo_calendar``: nothing registers it.
     await _submit(
         onboarding_client, headers, CALENDAR, CALENDAR_FORM, CALENDAR_ANSWERS[CALENDAR_FORM]
     )
@@ -939,3 +941,121 @@ async def test_restart_of_a_running_flow_is_a_noop(
     state = await _state_row(seeded_db, module_key=CALENDAR)
     assert state.status is OnboardingStatus.IN_PROGRESS
     assert await audit_log(seeded_db, action="onboarding.restarted") == []
+
+
+# --- complete_redirect_step (service level; the OAuth callback seam) ---------
+#
+# The router never exposes this function: the ONLY production caller is the
+# Google OAuth callback (``app.modules.oauth.router``). These tests pin its
+# engine contract directly, including the redirect-as-final-step case where
+# the credentials payload must keep the tokens the callback stored.
+
+
+async def _complete_redirect(
+    onboarding_app: FastAPI, seeded_db: Database, seeded_users, module_key: str
+):
+    """Call the service function as the OAuth callback would."""
+    async with seeded_db.sessionmaker() as session:
+        return await complete_redirect_step(
+            session,
+            catalog=onboarding_app.state.module_catalog,
+            credentials_key=onboarding_app.state.settings.credentials_key.get_secret_value(),
+            caller=seeded_users["owner@acme.test"],
+            module_key=module_key,
+        )
+
+
+async def test_complete_redirect_step_completes_a_redirect_only_flow(
+    onboarding_app: FastAPI,
+    onboarding_client: AsyncClient,
+    seeded_db: Database,
+    seeded_users,
+    audit_log,
+) -> None:
+    """A final redirect step completes the flow with the same audit events."""
+    headers = await _owner(onboarding_client)
+    await _activate(onboarding_client, headers, REDIRECT)
+
+    view = await _complete_redirect(onboarding_app, seeded_db, seeded_users, REDIRECT)
+
+    assert view.status is OnboardingStatus.COMPLETED
+    assert view.current_step is None
+    assert view.step is None
+    state = await _state_row(seeded_db, module_key=REDIRECT)
+    assert state.status is OnboardingStatus.COMPLETED
+    assert state.secrets_encrypted is None
+    # Same completion machinery as a submitted final step: the connection is
+    # written (no state secrets existed, so the payload is the empty object).
+    connections = await _connections(seeded_db)
+    assert len(connections) == 1
+    assert connections[0].status is ConnectionStatus.CONNECTED
+    owner = seeded_users["owner@acme.test"]
+    stepped = await audit_log(seeded_db, action="onboarding.step_completed")
+    assert [event.payload for event in stepped] == [
+        {"module_key": REDIRECT, "step_key": "authorize", "status": "completed"}
+    ]
+    completed = await audit_log(seeded_db, action="onboarding.completed")
+    assert [event.payload for event in completed] == [
+        {"module_key": REDIRECT, "step_key": "authorize", "status": "completed"}
+    ]
+    assert all(event.actor_user_id == owner.id for event in stepped + completed)
+
+
+async def test_complete_redirect_step_final_keeps_stored_connection_tokens(
+    onboarding_app: FastAPI,
+    onboarding_client: AsyncClient,
+    seeded_db: Database,
+    seeded_users,
+    onboarding_key: str,
+) -> None:
+    """A redirect-as-final completion never clobbers the OAuth token blob."""
+    headers = await _owner(onboarding_client)
+    await _activate(onboarding_client, headers, REDIRECT)
+    tokens = {"access_token": "ya29.keep-me", "refresh_token": "1//keep-me"}
+    async with seeded_db.sessionmaker() as session:
+        # The OAuth callback stores the connection BEFORE completing the step.
+        session.add(
+            UserConnection(
+                tenant_id=1,
+                user_id=1,
+                module_key=REDIRECT,
+                provider="google",
+                status=ConnectionStatus.CONNECTED,
+                credentials_encrypted=encrypt_credentials(
+                    onboarding_key, json.dumps(tokens, sort_keys=True)
+                ),
+                metadata_={"provider": "google"},
+            )
+        )
+        await session.commit()
+
+    view = await _complete_redirect(onboarding_app, seeded_db, seeded_users, REDIRECT)
+
+    assert view.status is OnboardingStatus.COMPLETED
+    async with seeded_db.sessionmaker() as session:
+        row = (await session.execute(select(UserConnection))).scalars().one()
+    assert row.status is ConnectionStatus.CONNECTED
+    assert json.loads(decrypt_credentials(onboarding_key, row.credentials_encrypted)) == tokens
+
+
+async def test_complete_redirect_step_refuses_wrong_step_and_completed_flow(
+    onboarding_app: FastAPI,
+    onboarding_client: AsyncClient,
+    seeded_db: Database,
+    seeded_users,
+    testers: dict,
+) -> None:
+    """Not parked on a redirect step, or already completed: refused, no writes."""
+    headers = await _owner(onboarding_client)
+    await _activate(onboarding_client, headers, CALENDAR)
+
+    # ``demo_calendar`` is parked on its ``form`` first step — not a redirect.
+    with pytest.raises(WrongStepError):
+        await _complete_redirect(onboarding_app, seeded_db, seeded_users, CALENDAR)
+    assert await _states(seeded_db) == []
+
+    # A completed flow is refused (the callback treats this as best-effort).
+    testers[CALENDAR] = _passing
+    await _walk(onboarding_client, headers)
+    with pytest.raises(OnboardingCompletedError):
+        await _complete_redirect(onboarding_app, seeded_db, seeded_users, CALENDAR)

@@ -335,4 +335,4 @@ def test_importing_the_app_alone_populates_the_registry() -> None:
     )
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "search_documents"
+    assert result.stdout.strip() == "search_documents,list_events,create_event,cancel_event"

@@ -90,6 +90,7 @@ from typing import Any, Literal, NamedTuple
 from pydantic import BaseModel, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings
 from app.modules.agent.llm import LLMProvider
 from app.modules.approvals.grants import ApprovalGrant, consume_grant
 from app.modules.audit.models import ActorType
@@ -283,6 +284,8 @@ async def execute_tool(
     llm: LLMProvider | None = None,
     storage: DocumentStorage | None = None,
     active_modules: set[str] | None = None,
+    credentials_key: str | None = None,
+    settings: Settings | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
 
@@ -293,6 +296,13 @@ async def execute_tool(
     while core tools (``spec.module is None``) always run. ``None`` — the
     default — disables the gate entirely, preserving pre-module behavior
     for callers that do not gate.
+
+    ``credentials_key`` is the Fernet key for per-user provider connections
+    and ``settings`` the app configuration; both flow into the
+    :class:`ToolContext` for tools whose precheck/handler must decrypt
+    stored credentials or refresh tokens (calendar-mvp T3/D3). The chat
+    router wires them from ``Settings``; other callers may leave them
+    ``None`` and the tools fail closed with a precheck error.
 
     Check order (each failure returns immediately, handler is only reached by
     the last step):
@@ -321,10 +331,10 @@ async def execute_tool(
        rejects for this call's action key ⇒ ``error``/``forbidden``.
     7. Dry run ⇒ ``dry_run`` describing the call; handler not called.
     8. Handler run with a :class:`ToolContext` (``session``, the user's
-       tenant, ``embeddings``, ``llm``, ``storage``, ``correlation_id``) —
-       exceptions ⇒ ``error``/``execution`` with the generic
-       :data:`TOOL_FAILED`; the exception text goes to the server log and
-       the audit event only.
+       tenant, ``embeddings``, ``llm``, ``storage``, ``correlation_id``,
+       ``credentials_key``, ``settings``) — exceptions ⇒ ``error``/``execution``
+       with the generic :data:`TOOL_FAILED`; the exception text goes to the
+       server log and the audit event only.
     9. Output validation — ``spec.output_model`` rejects the return ⇒
        ``error``/``execution`` with :data:`INVALID_OUTPUT`.
 
@@ -340,6 +350,8 @@ async def execute_tool(
         correlation_id=correlation_id,
         llm=llm,
         storage=storage,
+        credentials_key=credentials_key,
+        settings=settings,
     )
     result, record = await _evaluate(
         registry, context, tool_name, raw_input, dry_run, approval_grant, active_modules

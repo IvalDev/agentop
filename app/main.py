@@ -20,6 +20,12 @@ from app.modules.agent.router import router as chat_router
 from app.modules.approvals.router import router as approvals_router
 from app.modules.audit.router import router as audit_router
 from app.modules.audit.service import configure_audit
+from app.modules.calendar.registry import (
+    register_calendar_tester,
+    register_default_calendar,
+    register_google_provider,
+)
+from app.modules.calendar.tools import register_calendar_tools
 from app.modules.catalog.registry import default_catalog
 from app.modules.catalog.router import router as modules_router
 from app.modules.connections.router import router as connections_router
@@ -27,12 +33,22 @@ from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.router import router as auth_router
 from app.modules.identity.users_router import router as users_router
+from app.modules.oauth.router import router as oauth_router
 from app.modules.onboarding.router import router as onboarding_router
 from app.modules.onboarding.testers import connection_testers
 from app.modules.retrieval.embeddings import build_embedding_provider
 from app.modules.retrieval.router import router as search_router
 from app.modules.tools import builtin  # noqa: F401  (registers the production tools)
 from app.modules.tools.registry import default_registry
+
+# Calendar module wiring (reviewed allowlist entries, human-approved
+# 2026-10-15): register the manifest on the process-wide catalog, plus the
+# Google provider factory, the connection tester and the chat tools. Runs once
+# at import time, like the builtin tools above.
+register_default_calendar()
+register_google_provider()
+register_calendar_tester()
+register_calendar_tools(default_registry)
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +207,8 @@ def create_app() -> FastAPI:
     application.state.llm = build_llm_provider(settings)
     application.state.tool_registry = default_registry
     application.state.module_catalog = default_catalog
+    # calendar-mvp: app.modules.calendar is deliberately not imported here —
+    # default_catalog stays empty until the reviewed allowlist change (T1 decision).
     # Per-module connection testers for onboarding's test_connection steps
     # (empty in production; module packages register theirs at import time).
     application.state.connection_testers = connection_testers
@@ -204,6 +222,7 @@ def create_app() -> FastAPI:
     application.include_router(modules_router)
     application.include_router(connections_router)
     application.include_router(onboarding_router)
+    application.include_router(oauth_router)
     application.include_router(chat_router)
     if settings.is_development:
         # Static dev console over the public API; any other environment answers 404.

@@ -56,6 +56,7 @@ export const esES = {
     chat: 'Chat',
     knowledge: 'Base de conocimiento',
     settings: 'Configuración',
+    myTools: 'Mis herramientas',
     team: 'Equipo',
     tools: 'Herramientas',
   },
@@ -77,6 +78,13 @@ export const esES = {
     tools: {
       title: 'Herramientas',
       description: 'Activa o desactiva los módulos del catálogo. El cambio se aplica a toda tu empresa.',
+    },
+    myTools: {
+      title: 'Mis herramientas',
+      description: 'Configura las herramientas que utilizas en el chat para tu propia cuenta.',
+    },
+    onboarding: {
+      title: 'Configurar la herramienta',
     },
   },
   chat: {
@@ -312,6 +320,71 @@ export const esES = {
     errors: {
       forbidden: 'No tienes permiso para cambiar los módulos de tu empresa.',
       notFound: 'Ese módulo ya no está en el catálogo.',
+      network: 'No se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
+      unexpected: 'Se ha producido un error inesperado. Inténtalo de nuevo.',
+    },
+  },
+  myTools: {
+    list: {
+      title: 'Herramientas activas',
+      caption: 'Herramientas activas de tu empresa',
+      loading: 'Cargando tus herramientas…',
+      loadError: 'No se han podido cargar tus herramientas. Comprueba la conexión e inténtalo de nuevo.',
+      retry: 'Reintentar',
+      empty:
+        'Tu administrador aún no ha activado herramientas para tu empresa. ' +
+        'Cuando active un módulo, aparecerá aquí para que puedas configurarlo.',
+      columns: {
+        module: 'Herramienta',
+        description: 'Descripción',
+        status: 'Estado',
+        actions: 'Acciones',
+      },
+      connected: 'Conectado',
+      pending: 'Sin configurar',
+      checking: 'Comprobando el estado…',
+      statusError: 'No se ha podido comprobar el estado.',
+      configure: 'Configurar',
+      actionTarget: '«{name}»',
+    },
+  },
+  onboarding: {
+    loading: 'Cargando la configuración…',
+    retry: 'Reintentar',
+    backToMyTools: 'Volver a Mis herramientas',
+    cancel: 'Cancelar',
+    redirect: {
+      connect: 'Conectar',
+    },
+    test: {
+      action: 'Probar conexión',
+      running: 'Probando la conexión…',
+    },
+    form: {
+      submit: 'Guardar y continuar',
+      submitting: 'Guardando…',
+      fieldRequired: 'Indica este campo.',
+      fieldError: 'Revisa este campo.',
+      scopesRequired: 'Selecciona al menos un permiso.',
+      invalid: 'Los datos no son válidos. Revisa los campos e inténtalo de nuevo.',
+    },
+    completed: {
+      title: 'Configuración completada',
+      description: 'La herramienta está conectada y lista para usar en el chat.',
+      reconnect: 'Reconectar',
+      reconnectTitle: '¿Reconectar la herramienta?',
+      reconnectDescription:
+        'Se eliminará la conexión actual y tendrás que configurar la herramienta de nuevo.',
+      reconnectConfirm: 'Reconectar',
+      restarted: 'Hemos restablecido la configuración. Empieza de nuevo el primer paso.',
+    },
+    stale: 'El paso de configuración ha cambiado. Hemos actualizado el estado; revísalo e inténtalo de nuevo.',
+    errors: {
+      unknownModule: 'No encontramos esa herramienta. Puede que ya no esté disponible.',
+      inactive: 'Esta herramienta no está activada para tu empresa. Pide a tu administrador que la active.',
+      testFailed: 'La conexión con el proveedor ha fallado. Comprueba la cuenta conectada e inténtalo de nuevo.',
+      testUnavailable: 'La prueba de conexión no está disponible para este módulo. Inténtalo de nuevo más tarde.',
+      testIncomplete: 'No se ha podido completar la prueba de conexión. Inténtalo de nuevo más tarde.',
       network: 'No se ha podido conectar con el servidor. Comprueba la conexión e inténtalo de nuevo.',
       unexpected: 'Se ha producido un error inesperado. Inténtalo de nuevo.',
     },

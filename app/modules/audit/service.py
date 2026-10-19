@@ -211,6 +211,13 @@ async def persist_event(session: AsyncSession, **fields: Unpack[EventFields]) ->
     ``session`` only supplies the engine (``session.bind``); its own
     transaction is neither flushed, committed, nor rolled back. A failure to
     write propagates: an action whose refusal cannot be audited fails loudly.
+
+    SQLite single-writer guard: the caller session must NOT hold an
+    uncommitted write (a flushed row) when this runs — the independent audit
+    connection would deadlock and raise ``database is locked`` on a
+    file-backed database (invisible under the shared ``:memory:`` test
+    connection). When a state change and its audit event belong together,
+    use :func:`stage_event` on the caller's transaction instead.
     """
     event = _build_event(**fields)
     bind = session.bind

@@ -81,6 +81,11 @@ class Settings(BaseSettings):
     # below), optional elsewhere — without it the connections service fails
     # closed and refuses to store credentials. Key lives outside the database.
     credentials_key: SecretStr | None = None
+    # Google OAuth (calendar-mvp D2): the app's OAuth client credentials,
+    # read only when the authorization-code + PKCE flow starts (the module is
+    # optional until used, so both stay None outside a configured deployment).
+    google_client_id: SecretStr | None = None
+    google_client_secret: SecretStr | None = None
 
     @property
     def is_development(self) -> bool:

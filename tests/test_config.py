@@ -104,3 +104,31 @@ def test_dev_environment_keeps_credentials_key_optional(
 
     assert settings.environment == "dev"
     assert settings.credentials_key is None
+
+
+def test_google_oauth_credentials_load_from_env_as_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AA_GOOGLE_CLIENT_ID / AA_GOOGLE_CLIENT_SECRET load into SecretStr fields."""
+    monkeypatch.setenv("AA_GOOGLE_CLIENT_ID", "client-id.apps.googleusercontent.com")
+    monkeypatch.setenv("AA_GOOGLE_CLIENT_SECRET", "GOCSPX-test-secret")
+
+    settings = Settings()
+
+    assert settings.google_client_id is not None
+    assert settings.google_client_id.get_secret_value() == "client-id.apps.googleusercontent.com"
+    assert settings.google_client_secret is not None
+    assert settings.google_client_secret.get_secret_value() == "GOCSPX-test-secret"
+    assert "GOCSPX-test-secret" not in repr(settings)
+    assert "GOCSPX-test-secret" not in str(settings)
+
+
+def test_google_credentials_default_to_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Google OAuth stays optional: without env both fields are None."""
+    monkeypatch.delenv("AA_GOOGLE_CLIENT_ID", raising=False)
+    monkeypatch.delenv("AA_GOOGLE_CLIENT_SECRET", raising=False)
+
+    settings = Settings()
+
+    assert settings.google_client_id is None
+    assert settings.google_client_secret is None
