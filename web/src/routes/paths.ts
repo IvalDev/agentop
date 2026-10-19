@@ -13,4 +13,6 @@ export const paths = {
   onboardingRoute: '/configuracion/herramientas/:module/onboarding',
   /** The onboarding wizard for one module — where the OAuth callback lands (D8). */
   onboarding: (module: string) => `/configuracion/herramientas/${encodeURIComponent(module)}/onboarding`,
+  /** Install the desktop widget (T7): every role, outside the Settings admin gate. */
+  installWidget: '/instalar-widget',
 } as const;

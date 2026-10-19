@@ -59,6 +59,11 @@ export function MainNav({ showAdminSections }: MainNavProps) {
             {t('nav.knowledge')}
           </NavLink>
         </li>
+        <li>
+          <NavLink className="main-nav__link" to={paths.installWidget} onClick={close}>
+            {t('nav.installWidget')}
+          </NavLink>
+        </li>
         <li className="main-nav__group">
           <span id="main-nav-settings" className="main-nav__group-label">
             {t('nav.settings')}
