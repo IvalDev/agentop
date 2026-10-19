@@ -33,15 +33,25 @@ Contract under test (google-mail M3 / acceptance criteria 3–5):
   own Gmail connection, so only the user who requested one may approve,
   reject, or execute it — another user of the tenant would otherwise send
   from (or modify) their own mailbox;
+- well-formed sends (G8): ``send_email`` sets ``From`` to the connected
+  address read from ``users.getProfile`` plus ``Date`` and ``Message-ID``;
+  an unreadable profile or an unusable address sends nothing (401/403 →
+  ``EXPIRED``, anything else → masked ``tool_failed``), and a send whose
+  answer lacks the ``SENT`` label is never reported as sent;
+- readable bodies (G8): ``get_email`` falls back to the first ``text/html``
+  part converted to plain text when no ``text/plain`` part exists;
 - there is no delete/trash tool, ever.
 """
 
 import asyncio
 import base64
 import json
+import re
 import time
+from datetime import UTC, datetime
 from email import message_from_bytes
 from email.policy import default
+from email.utils import parsedate_to_datetime
 from typing import Any
 from uuid import uuid4
 
@@ -63,10 +73,14 @@ from app.modules.approvals.service import (
 )
 from app.modules.catalog.models import ModuleActivation
 from app.modules.connections.models import ConnectionStatus, UserConnection
+from app.modules.google_mail import tools as mail_tools
 from app.modules.google_mail.provider import (
+    GOOGLE_GMAIL_MESSAGES_URL,
+    GOOGLE_GMAIL_PROFILE_URL,
     GmailAuthenticationError,
     GmailNotFoundError,
     GmailProviderError,
+    GoogleGmailProvider,
     provider_registry,
     register_provider,
 )
@@ -201,9 +215,13 @@ class FakeGmail:
         metadata_delays: dict[str, int] | None = None,
         send_error: Exception | None = None,
         modify_error: Exception | None = None,
+        profile: dict[str, Any] | None = None,
+        profile_error: Exception | None = None,
         explode: bool = False,
     ) -> None:
         self.explode = explode
+        self.profile = profile if profile is not None else {"emailAddress": "agent@acme.test"}
+        self.profile_error = profile_error
         self.listed = listed if listed is not None else []
         # Per-id ``format=metadata`` resources; an id without an entry answers
         # its listed entry (enough for tests that only check the list call).
@@ -212,7 +230,10 @@ class FakeGmail:
         # Per-id event-loop yields before answering (out-of-order completion).
         self.metadata_delays = metadata_delays if metadata_delays is not None else {}
         self.message = message if message is not None else IN_SCOPE_MESSAGE
-        self.sent = sent if sent is not None else {"id": "sent-1", "threadId": "t-9"}
+        # Gmail labels a delivered message SENT in the users.messagesSend answer.
+        self.sent = (
+            sent if sent is not None else {"id": "sent-1", "threadId": "t-9", "labelIds": ["SENT"]}
+        )
         self.modified = modified if modified is not None else {"id": "m1"}
         self.labels = (
             labels
@@ -227,6 +248,7 @@ class FakeGmail:
         self.send_error = send_error
         self.modify_error = modify_error
         self.access_tokens: list[str] = []
+        self.profile_calls = 0
         self.list_calls: list[dict[str, Any]] = []
         self.get_calls: list[str] = []
         self.metadata_calls: list[str] = []
@@ -250,7 +272,10 @@ class FakeGmailProvider:
         self._factory = factory
 
     async def get_profile(self) -> dict[str, Any]:
-        return {"emailAddress": "agent@acme.test"}
+        self._factory.profile_calls += 1
+        if self._factory.profile_error is not None:
+            raise self._factory.profile_error
+        return dict(self._factory.profile)
 
     async def list_labels(self) -> list[dict[str, Any]]:
         return list(self._factory.labels)
@@ -1216,6 +1241,149 @@ async def test_get_email_with_all_mail_scope_reads_any_message(
     assert result.output.message.label_ids == ["INBOX"]
 
 
+# --- get_email bodies: text/plain first, then readable HTML (G8) -----------------
+
+
+def _b64(text: str) -> str:
+    """base64url of one MIME part body, as Gmail's ``format=full`` carries it."""
+    return base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+
+
+def _part(mime_type: str, text: str) -> dict[str, Any]:
+    return {"mimeType": mime_type, "body": {"data": _b64(text)}}
+
+
+def _message_with(payload: dict[str, Any]) -> dict[str, Any]:
+    """``IN_SCOPE_MESSAGE`` with another MIME tree under the same headers."""
+    return {
+        **IN_SCOPE_MESSAGE,
+        "payload": {"headers": IN_SCOPE_MESSAGE["payload"]["headers"], **payload},
+    }
+
+
+#: A typical HTML-only mail: head/style/script noise around block-level text.
+NEWSLETTER_HTML = (
+    "<html><head><title>Hidden title</title><style>p { color: red; }</style></head>"
+    "<body><h1>Invoice&nbsp;42</h1>\n<p>Dear   Ana,<br>please pay &amp; reply.</p>"
+    "<script>alert('x')</script><div>Items:</div><ul><li>Hosting</li>\n  <li>Support</li></ul>"
+    "<table><tr><td>Total</td><td>&euro;10</td></tr></table></body></html>"
+)
+
+
+async def _read_body(
+    db: Database, user: CurrentUser, registry: ToolRegistry, key: str, message: dict[str, Any]
+) -> str | None:
+    """Run ``get_email`` on ``message`` (whole-mailbox scope) and return its body."""
+    await seed_scope(db, user, ALL_SCOPE)
+    await seed_connection(db, user, key=key)
+    register_provider("google", FakeGmail(message=message))
+    result = await run_tool(db, user, registry, "get_email", GET_INPUT, credentials_key=key)
+    assert result.status == "ok", result.error
+    return result.output.message.body
+
+
+async def test_get_email_converts_an_html_only_body_to_readable_text(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """No text/plain part: the HTML reaches the model as text, not tags or script."""
+    body = await _read_body(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        oauth_key,
+        _message_with(_part("text/html", NEWSLETTER_HTML)),
+    )
+
+    assert body == (
+        "Invoice 42\n\nDear Ana,\nplease pay & reply.\n\nItems:\nHosting\nSupport\nTotal €10"
+    )
+    for noise in ("<", ">", "alert", "color", "Hidden title", "&amp;", "&nbsp;"):
+        assert noise not in body
+
+
+async def test_get_email_finds_a_nested_html_only_part(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """multipart/mixed → multipart/alternative → text/html, next to an attachment."""
+    payload = {
+        "mimeType": "multipart/mixed",
+        "parts": [
+            {
+                "mimeType": "multipart/alternative",
+                "parts": [_part("text/html", "<p>Hello Ana</p>")],
+            },
+            {"mimeType": "application/pdf", "filename": "a.pdf", "body": {"attachmentId": "x"}},
+        ],
+    }
+
+    body = await _read_body(
+        seeded_db, seeded_users[OWNER], mail_registry, oauth_key, _message_with(payload)
+    )
+
+    assert body == "Hello Ana"
+
+
+async def test_get_email_prefers_text_plain_over_html(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """Both alternatives present: text/plain wins, even when the HTML part comes first."""
+    payload = {
+        "mimeType": "multipart/alternative",
+        "parts": [
+            _part("text/html", "<p>HTML version</p>"),
+            _part("text/plain", "Plain version"),
+        ],
+    }
+
+    body = await _read_body(
+        seeded_db, seeded_users[OWNER], mail_registry, oauth_key, _message_with(payload)
+    )
+
+    assert body == "Plain version"
+
+
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        ("<head><title>T</title><body><p>Hi</p>", "Hi"),  # unclosed head
+        ("<p>A&nbsp;&amp;&#39;B&#x27;</p>", "A &'B'"),
+        ("Line one<br>Line two<br><br>Line four", "Line one\nLine two\n\nLine four"),
+        ("<!-- hidden --><b>Bold</b> <i>text</i>", "Bold text"),
+        ("<html><head><style>x</style></head><body><img src='a.png'></body></html>", None),
+    ],
+    ids=["unclosed-head", "entities", "line-breaks", "inline-and-comment", "no-text"],
+)
+async def test_get_email_html_conversion_edge_cases(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, html, expected
+) -> None:
+    body = await _read_body(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        oauth_key,
+        _message_with(_part("text/html", html)),
+    )
+
+    assert body == expected
+
+
+async def test_get_email_caps_the_converted_html_body(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, monkeypatch
+) -> None:
+    """The MAX_DECODED_BODY_CHARS limit holds for converted HTML too."""
+    monkeypatch.setattr(mail_tools, "MAX_DECODED_BODY_CHARS", 12)
+
+    body = await _read_body(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        oauth_key,
+        _message_with(_part("text/html", "<p>" + "x" * 100 + "</p>")),
+    )
+
+    assert body == "x" * 12
+
+
 async def test_archive_message_inside_the_scope_removes_inbox(
     seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
 ) -> None:
@@ -1640,6 +1808,306 @@ async def test_send_email_omits_thread_id_when_not_replying(
     assert result.status == "ok"
     [call] = fake.send_calls
     assert call["thread_id"] is None
+
+
+# --- send_email sender headers and delivery confirmation (G8) -------------------
+
+#: The connected mailbox's address as ``users.getProfile`` answers it.
+SENDER = "owner.mailbox@acme.test"
+
+
+def _sent_mime(raw_mime_b64url: str) -> Any:
+    """Decode the base64url raw MIME one ``users.messagesSend`` call carried."""
+    padded = raw_mime_b64url + "=" * (-len(raw_mime_b64url) % 4)
+    return message_from_bytes(base64.urlsafe_b64decode(padded), policy=default)
+
+
+def _send_grant(raw_input: dict[str, Any] | None = None):
+    validated = SendEmailInput.model_validate(raw_input if raw_input is not None else SEND_INPUT)
+    return mint_grant(uuid4(), compute_action_key("send_email", validated))
+
+
+async def _seed_mailbox(db: Database, user: CurrentUser, key: str) -> None:
+    await seed_scope(db, user, ALL_SCOPE)
+    await seed_connection(db, user, key=key)
+
+
+async def test_send_email_sets_from_to_the_connected_address_with_date_and_message_id(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """The observed "(unknown sender)": From is the users.getProfile address, never omitted."""
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail(profile={"emailAddress": SENDER, "messagesTotal": 3})
+    register_provider("google", fake)
+    before = datetime.now(UTC).replace(microsecond=0)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=_send_grant(),
+    )
+
+    after = datetime.now(UTC)
+    assert result.status == "ok", result.error
+    [call] = fake.send_calls
+    mime = _sent_mime(call["raw_mime_b64url"])
+    assert mime["From"] == SENDER
+    assert mime["To"] == "ana@example.com"
+    sent_at = parsedate_to_datetime(mime["Date"])
+    assert sent_at.tzinfo is not None
+    assert before <= sent_at <= after
+    assert re.fullmatch(r"<[^<>@\s]+@acme\.test>", mime["Message-ID"])
+
+
+@pytest.mark.parametrize("granted", [True, False], ids=["approved-execution", "request"])
+async def test_send_email_rejected_profile_read_prechecks_reconnect_and_sends_nothing(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, granted
+) -> None:
+    """A 401/403 on users.getProfile is the actionable EXPIRED, before approval and send."""
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail(profile_error=GmailAuthenticationError("Gmail API answered 401"))
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=_send_grant() if granted else None,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {EXPIRED}"
+    assert fake.send_calls == []
+
+
+@pytest.mark.parametrize(
+    "profile_error",
+    [
+        GmailProviderError("Gmail API answered 500"),
+        httpx.ConnectError("refused", request=httpx.Request("GET", GOOGLE_GMAIL_PROFILE_URL)),
+    ],
+    ids=["provider-error", "transport-error"],
+)
+async def test_send_email_unreadable_profile_is_masked_and_sends_nothing(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, profile_error
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail(profile_error=profile_error)
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=_send_grant(),
+    )
+
+    assert (result.status, result.error, result.error_kind) == ("error", "tool_failed", "execution")
+    assert "ya29" not in result.model_dump_json()
+    assert fake.send_calls == []
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        {},
+        {"emailAddress": ""},
+        {"emailAddress": 7},
+        {"emailAddress": "not-an-address"},
+        {"emailAddress": "@acme.test"},
+        {"emailAddress": "a@b@acme.test"},
+        {"emailAddress": " agent@acme.test"},
+        {"emailAddress": "Agent <agent@acme.test>"},
+        {"emailAddress": "agent@acme.test\r\nBcc: spy@evil.test"},
+    ],
+    ids=[
+        "missing",
+        "empty",
+        "not-a-string",
+        "no-at",
+        "no-local-part",
+        "two-ats",
+        "padded",
+        "display-name",
+        "header-injection",
+    ],
+)
+async def test_send_email_without_a_usable_sender_address_sends_nothing(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, profile
+) -> None:
+    """Never guess or splice a sender: an unusable profile address is a masked failure."""
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail(profile=profile)
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=_send_grant(),
+    )
+
+    assert (result.status, result.error, result.error_kind) == ("error", "tool_failed", "execution")
+    assert fake.send_calls == []
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_error"),
+    [
+        (401, f"precheck_failed: {EXPIRED}"),
+        (403, f"precheck_failed: {EXPIRED}"),
+        (500, "tool_failed"),
+    ],
+)
+async def test_send_email_never_posts_messages_send_when_the_profile_read_fails(
+    seeded_db: Database,
+    seeded_users,
+    mail_registry: ToolRegistry,
+    oauth_key,
+    status,
+    expected_error,
+) -> None:
+    """Wire level (real adapter): a failed users.getProfile means no messages/send request."""
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, str(request.url)))
+        if str(request.url) == GOOGLE_GMAIL_PROFILE_URL:
+            return httpx.Response(status, json={"error": {"code": status}})
+        return httpx.Response(200, json={"id": "sent-1", "labelIds": ["SENT"]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        register_provider(
+            "google", lambda access_token: GoogleGmailProvider(access_token, client=client)
+        )
+        result = await run_tool(
+            seeded_db,
+            seeded_users[OWNER],
+            mail_registry,
+            "send_email",
+            SEND_INPUT,
+            credentials_key=oauth_key,
+            approval_grant=_send_grant(),
+        )
+
+    assert result.error == expected_error
+    assert seen, "the profile must be read before any send"
+    assert all(url == GOOGLE_GMAIL_PROFILE_URL for _, url in seen)
+    assert ("POST", GOOGLE_GMAIL_MESSAGES_URL) not in seen
+
+
+async def test_send_email_posts_mime_from_the_profile_address_over_the_wire(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    """Wire level (real adapter): the posted raw MIME carries From, threadId passes through."""
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    raw_input = {**SEND_INPUT, "thread_id": "t-9"}
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and str(request.url) == GOOGLE_GMAIL_PROFILE_URL:
+            return httpx.Response(200, json={"emailAddress": SENDER, "messagesTotal": 3})
+        if request.method == "POST" and str(request.url) == GOOGLE_GMAIL_MESSAGES_URL:
+            posted.append(json.loads(request.content))
+            return httpx.Response(
+                200, json={"id": "sent-1", "threadId": "t-9", "labelIds": ["SENT"]}
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        register_provider(
+            "google", lambda access_token: GoogleGmailProvider(access_token, client=client)
+        )
+        result = await run_tool(
+            seeded_db,
+            seeded_users[OWNER],
+            mail_registry,
+            "send_email",
+            raw_input,
+            credentials_key=oauth_key,
+            approval_grant=_send_grant(raw_input),
+        )
+
+    assert result.status == "ok", result.error
+    assert (result.output.id, result.output.thread_id) == ("sent-1", "t-9")
+    [body] = posted
+    assert body["threadId"] == "t-9"
+    mime = _sent_mime(body["raw"])
+    assert mime["From"] == SENDER
+    assert mime["Date"] and mime["Message-ID"]
+
+
+@pytest.mark.parametrize(
+    "labels", [["SENT"], ["SENT", "INBOX", "UNREAD"]], ids=["sent", "sent-to-self"]
+)
+async def test_send_email_labelled_sent_is_reported_as_sent(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, labels
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail(sent={"id": "sent-1", "threadId": "t-9", "labelIds": labels})
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=_send_grant(),
+    )
+
+    assert result.status == "ok", result.error
+    assert result.output.id == "sent-1"
+
+
+@pytest.mark.parametrize(
+    "sent",
+    [
+        {"id": "sent-1", "threadId": "t-9"},
+        {"id": "sent-1", "threadId": "t-9", "labelIds": []},
+        {"id": "sent-1", "threadId": "t-9", "labelIds": ["INBOX"]},
+        {"id": "sent-1", "threadId": "t-9", "labelIds": "SENT"},
+    ],
+    ids=["labels-absent", "labels-empty", "labels-without-sent", "labels-not-a-list"],
+)
+async def test_send_email_without_the_sent_label_is_not_reported_as_sent(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, sent, caplog
+) -> None:
+    """Observed on 1a1532e2dfb00a3d: no labelIds at all — never claim that mail was sent."""
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail(sent=sent)
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=_send_grant(),
+    )
+
+    assert (result.status, result.error, result.error_kind) == ("error", "tool_failed", "execution")
+    assert "ya29" not in result.model_dump_json()
+    assert len(fake.send_calls) == 1
+    # The masked failure keeps its reason server-side (log + audit), never for the caller.
+    assert "Gmail did not mark the message as sent" in caplog.text
 
 
 # --- list_labels and failure mapping --------------------------------------------

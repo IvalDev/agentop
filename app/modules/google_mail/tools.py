@@ -23,13 +23,20 @@ Tool shapes (M3 — the approval policies differ on purpose, criterion 4):
 - ``get_email`` — ``EXTRACT`` / viewer, no approval: one full message,
   refused with the actionable ``OUT_OF_SCOPE`` reason when the message's
   ``labelIds`` do not contain the selected label (criterion 3's heart);
-  ``ALL`` skips the check;
+  ``ALL`` skips the check. The body is the first ``text/plain`` part, or —
+  for HTML-only mail — the first ``text/html`` part converted to plain
+  text with the stdlib parser (G8);
 - ``list_labels`` — ``EXTRACT`` / viewer, no approval: the mailbox's
   label ids + display names (metadata only);
 - ``send_email`` — ``ACTION`` / operator, ``REQUIRE_APPROVAL``: builds a
-  proper RFC 822 MIME (stdlib ``email``), base64url-encodes it, and sends
-  it (``threadId`` when replying). EXEMPT from the label-membership check
-  — a new message belongs to no folder — but approval is ALWAYS required;
+  proper RFC 822 MIME (stdlib ``email``) whose ``From`` is the connected
+  address (``users.getProfile``) plus ``Date`` and ``Message-ID``,
+  base64url-encodes it, and sends it (``threadId`` when replying). Gmail
+  does NOT fill a missing ``From`` (G8: such a send arrived as "(unknown
+  sender)" with no ``SENT`` label), so no readable address means no send,
+  and an answer without the ``SENT`` label is never reported as sent.
+  EXEMPT from the label-membership check — a new message belongs to no
+  folder — but approval is ALWAYS required;
 - ``archive_message`` — ``ACTION`` / operator, ``REQUIRE_APPROVAL``:
   ``modify`` removing ``INBOX``, only after verifying the message is
   inside the scope;
@@ -72,15 +79,21 @@ it right before an approved handler, so approval never widens the scope.
 A 401/403 on that fetch (a revoked grant) is the ``EXPIRED`` reason.
 The handler of ``get_email`` then fetches the message once more to return
 it (the precheck/handler contract has no channel to pass data through).
+``send_email``'s precheck likewise reads the sender profile (read-only), so
+a revoked grant answers ``EXPIRED`` before the approval gate and again
+right before the approved handler, which reads the address once more.
 """
 
 import asyncio
 import base64
 import json
 import logging
+import re
 import time
+from datetime import UTC, datetime
 from email.message import EmailMessage as MimeMessage
-from email.utils import getaddresses
+from email.utils import format_datetime, getaddresses, make_msgid, parseaddr
+from html.parser import HTMLParser
 from typing import Any
 
 import httpx
@@ -102,6 +115,7 @@ from app.modules.google_mail.provider import (
     GmailAuthenticationError,
     GmailNotFoundError,
     GmailProvider,
+    GmailProviderError,
     get_provider,
 )
 from app.modules.google_mail.scope import ALL_SCOPE, ScopeSelection, get_effective_scope
@@ -143,9 +157,14 @@ MAX_SUBJECT_LENGTH = 998  # RFC 5322 line-length budget for a subject.
 MAX_BODY_LENGTH = 100_000
 #: Cap of the plain-text body the tools hand the model (huge mails stay usable).
 MAX_DECODED_BODY_CHARS = 20_000
+#: Cap of the HTML source parsed for an HTML-only body (bounds the parser's work).
+MAX_HTML_SOURCE_CHARS = 1_000_000
 
 #: The label ``archive_message`` removes (Gmail's system inbox label).
 INBOX_LABEL = "INBOX"
+
+#: The label Gmail puts on a message it actually sent (``users.messagesSend`` answer).
+SENT_LABEL = "SENT"
 
 #: System labels ``add_label`` never applies: Gmail purges Trash and Spam
 #: after 30 days, so applying either one would delete mail (never in the MVP).
@@ -509,11 +528,62 @@ async def _scoped_message_precheck(context: ToolContext, validated_input: BaseMo
         raise ToolPrecheckError(OUT_OF_SCOPE)
 
 
+def _is_plain_address(value: Any) -> bool:
+    """True for one bare ``local@domain`` address (no display name, spaces, or controls).
+
+    The profile address becomes the ``From`` header verbatim, so anything
+    that parses differently from itself (a display name, a second ``@``,
+    an injected header line) is refused rather than repaired.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    if any(char.isspace() or not char.isprintable() for char in value):
+        return False
+    if parseaddr(value) != ("", value):
+        return False
+    local, _, domain = value.rpartition("@")
+    return bool(local) and bool(domain) and "@" not in local
+
+
+async def _sender_address(provider: GmailProvider) -> str:
+    """The connected mailbox's address (``users.getProfile``): the message's ``From``.
+
+    Raises:
+        ToolPrecheckError: Gmail rejected the token (401/403) — ``EXPIRED``
+            (from a precheck; inside a handler the executor masks it).
+        GmailProviderError: the profile carries no single bare address (the
+            executor masks it as ``tool_failed``); other provider and
+            transport errors propagate the same way. Nothing is sent.
+    """
+    try:
+        profile = await provider.get_profile()
+    except GmailAuthenticationError:
+        logger.warning("google_mail rejected the stored token; the user must reconnect")
+        raise ToolPrecheckError(EXPIRED) from None
+    address = profile.get("emailAddress") if isinstance(profile, dict) else None
+    if not _is_plain_address(address):
+        raise GmailProviderError("Gmail profile has no usable emailAddress")
+    return address
+
+
+async def _send_email_precheck(context: ToolContext, validated_input: BaseModel) -> None:
+    """Precheck of ``send_email``: connection + a readable sender address.
+
+    Reads the profile (read-only — a precheck must not change state) so a
+    revoked grant answers ``EXPIRED`` before the user is asked to approve a
+    send that cannot happen, and again right before the approved handler.
+    No label check: a new message belongs to no folder.
+    """
+    _, row, access_token = await _scoped_connection(context)
+    await _sender_address(_provider_for(row, access_token))
+
+
 # --- MIME building (stdlib email) ------------------------------------------------
 
 
 def _build_raw_mime(
     *,
+    sender: str,
     to: list[str],
     subject: str,
     body: str,
@@ -522,16 +592,21 @@ def _build_raw_mime(
 ) -> str:
     """One RFC 822 message, base64url-encoded for ``users.messagesSend``.
 
-    No ``From`` header: Gmail sets it to the authenticated user (the
-    connected mailbox), so the tool never guesses the sender address.
+    ``From`` is ``sender`` — the connected address from ``users.getProfile``:
+    Gmail does not fill a missing ``From`` (G8, the "(unknown sender)" send).
+    ``Date`` is the current UTC time and ``Message-ID`` a fresh id on the
+    sender's domain, so the message is well formed without relying on Gmail.
     """
     message = MimeMessage()
+    message["From"] = sender
     message["To"] = ", ".join(to)
-    message["Subject"] = subject
     if cc:
         message["Cc"] = ", ".join(cc)
     if bcc:
         message["Bcc"] = ", ".join(bcc)
+    message["Subject"] = subject
+    message["Date"] = format_datetime(datetime.now(UTC))
+    message["Message-ID"] = make_msgid(domain=sender.rpartition("@")[2])
     message.set_content(body)
     return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
 
@@ -545,20 +620,116 @@ def _decode_body_data(data: str) -> str:
     return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
 
 
-def _plain_text_body(part: Any) -> str | None:
-    """The first ``text/plain`` body inside a ``format=full`` MIME tree."""
+def _first_part_text(part: Any, mime_type: str) -> str | None:
+    """The decoded body of the first ``mime_type`` part inside a ``format=full`` tree."""
     if not isinstance(part, dict):
         return None
-    mime_type = part.get("mimeType")
+    part_type = part.get("mimeType")
     body = part.get("body") if isinstance(part.get("body"), dict) else {}
     data = body.get("data")
-    if mime_type == "text/plain" and isinstance(data, str) and data:
-        return _decode_body_data(data)[:MAX_DECODED_BODY_CHARS]
-    for child in part.get("parts") or []:
-        found = _plain_text_body(child)
+    if isinstance(part_type, str) and part_type.lower() == mime_type:
+        if isinstance(data, str) and data:
+            return _decode_body_data(data)
+    children = part.get("parts")
+    for child in children if isinstance(children, list) else []:
+        found = _first_part_text(child, mime_type)
         if found is not None:
             return found
     return None
+
+
+class _HtmlTextExtractor(HTMLParser):
+    """Readable plain text out of one HTML body (stdlib parser, no rendering).
+
+    Drops ``head``/``title``/``script``/``style`` content, turns block-level
+    tags into line breaks (paragraphs and headings into a blank line),
+    separates table cells with a space, and collapses source whitespace the
+    way a browser does. Entities are unescaped by ``convert_charrefs``.
+    """
+
+    _SKIPPED = frozenset({"head", "title", "script", "style"})
+    _PARAGRAPHS = frozenset({"p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"})
+    _LINES = frozenset({"div", "li", "tr", "ul", "ol", "table", "hr"})
+    _CELLS = frozenset({"td", "th"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._chunks: list[str] = []
+        self._skip_depth = 0
+        self._trailing_newlines = 0
+
+    def _break(self, count: int) -> None:
+        """End the current text with at least ``count`` newlines (none before any text)."""
+        if self._chunks and self._trailing_newlines < count:
+            self._chunks.append("\n" * (count - self._trailing_newlines))
+            self._trailing_newlines = count
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "body":
+            self._skip_depth = 0  # an unclosed <head> must not swallow the body
+        elif tag in self._SKIPPED:
+            self._skip_depth += 1
+        elif self._skip_depth:
+            return
+        elif tag == "br":
+            self._chunks.append("\n")
+            self._trailing_newlines += 1
+        elif tag in self._PARAGRAPHS:
+            self._break(2)
+        elif tag in self._LINES:
+            self._break(1)
+        elif tag in self._CELLS and self._chunks:
+            self._chunks.append(" ")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIPPED:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        elif self._skip_depth:
+            return
+        elif tag in self._PARAGRAPHS:
+            self._break(2)
+        elif tag in self._LINES:
+            self._break(1)
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth:
+            return
+        text = re.sub(r"\s+", " ", data)
+        if not text.strip():
+            if self._chunks and not self._trailing_newlines:
+                self._chunks.append(" ")  # keeps "<b>A</b> <i>B</i>" apart
+            return
+        self._chunks.append(text)
+        self._trailing_newlines = 0
+
+    def text(self) -> str:
+        """The collected text: lines trimmed, at most one blank line in a row."""
+        lines = [re.sub(r" {2,}", " ", line).strip() for line in "".join(self._chunks).split("\n")]
+        return re.sub(r"\n{3,}", "\n\n", "\n".join(lines)).strip()
+
+
+def _html_to_text(html: str) -> str:
+    """Convert one HTML body to readable plain text (bounded source, stdlib only)."""
+    extractor = _HtmlTextExtractor()
+    extractor.feed(html[:MAX_HTML_SOURCE_CHARS])
+    extractor.close()
+    return extractor.text()
+
+
+def _message_body(payload: Any) -> str | None:
+    """The body the model reads: ``text/plain`` first, else the HTML as text.
+
+    Many mails ship only ``text/html`` (G8): without the fallback they reached
+    the model with no body at all. Either way the text is capped at
+    :data:`MAX_DECODED_BODY_CHARS`; an HTML body without text is ``None``.
+    """
+    plain = _first_part_text(payload, "text/plain")
+    if plain is not None:
+        return plain[:MAX_DECODED_BODY_CHARS]
+    html = _first_part_text(payload, "text/html")
+    if html is None:
+        return None
+    return _html_to_text(html)[:MAX_DECODED_BODY_CHARS] or None
 
 
 def _header_map(payload: dict[str, Any]) -> dict[str, str]:
@@ -605,7 +776,7 @@ def _map_message(item: dict[str, Any]) -> EmailMessage:
         sender=headers.get("from") or None,
         to=[address for _, address in getaddresses([headers.get("to", "")])],
         date=headers.get("date") or None,
-        body=_plain_text_body(payload),
+        body=_message_body(payload),
     )
 
 
@@ -699,10 +870,19 @@ async def list_labels_handler(
 async def send_email_handler(
     context: ToolContext, validated_input: SendEmailInput
 ) -> SendEmailOutput:
-    """Send one MIME message (exempt from the label check, never from approval)."""
+    """Send one MIME message from the connected address (label-exempt, never approval-exempt).
+
+    The sender is read again here (the precheck cannot pass it through the
+    frozen context); without a usable address nothing is sent. Gmail's
+    answer must carry the ``SENT`` label: the G8 send that arrived as
+    "(unknown sender)" came back with no ``labelIds`` at all, so an answer
+    without ``SENT`` is a masked failure, never a reported success.
+    """
     _, row, access_token = await _scoped_connection(context)
     provider = _provider_for(row, access_token)
+    sender = await _sender_address(provider)
     raw = _build_raw_mime(
+        sender=sender,
         to=validated_input.to,
         subject=validated_input.subject,
         body=validated_input.body,
@@ -710,6 +890,10 @@ async def send_email_handler(
         bcc=validated_input.bcc,
     )
     payload = await provider.send_message(raw_mime_b64url=raw, thread_id=validated_input.thread_id)
+    labels = payload.get("labelIds")
+    if not isinstance(labels, list) or SENT_LABEL not in labels:
+        logger.warning("google_mail send answered without the SENT label")
+        raise GmailProviderError("Gmail did not mark the message as sent")
     thread_id = payload.get("threadId")
     return SendEmailOutput(
         id=str(payload.get("id", "")),
@@ -815,7 +999,7 @@ SEND_EMAIL = ToolSpec(
     handler=send_email_handler,
     input_model=SendEmailInput,
     output_model=SendEmailOutput,
-    precheck=google_mail_precheck,
+    precheck=_send_email_precheck,
     module=MODULE_KEY,
     # Runs on the requester's own Gmail connection: only they may decide it (G7).
     requester_only_approval=True,
