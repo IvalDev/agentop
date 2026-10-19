@@ -1,5 +1,5 @@
 .PHONY: install lint format test run migrate migrate-revision bootstrap demo dev chat \
-	app web-build web-dev web-test widget-dev widget-build widget-package
+	app web-build web-dev web-test widget-dev widget-build widget-package widget-publish
 
 # Development settings file read by `make demo` and `make dev` when it exists: copy one
 # of deployment/dev/*.env.example to .env (git-ignored). Variables already set in the
@@ -103,3 +103,12 @@ widget-build: $(WIDGET_DEPS)
 # desktop/src-tauri/target/release/bundle/{deb,appimage}/. See docs/desktop-widget.md.
 widget-package: $(WIDGET_DEPS)
 	. "$$HOME/.cargo/env" && npm --prefix $(WIDGET_DIR) run tauri build -- --bundles deb,appimage
+
+# Publish the bundles built by widget-package into the directory the API serves
+# (AA_WIDGET_INSTALLERS_DIR, ./var/widget-installers by default). The console's
+# "Instalar widget" page lists them on the next request: no restart needed.
+widget-publish: widget-package
+	mkdir -p var/widget-installers
+	cp desktop/src-tauri/target/release/bundle/deb/*.deb var/widget-installers/
+	cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage var/widget-installers/
+	@ls -lh var/widget-installers/

@@ -78,6 +78,10 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     # Web app: served at ``/`` only when this directory holds an ``index.html``.
     web_dist_dir: str = str(DEFAULT_WEB_DIST_DIR)
+    # Desktop widget installers (T7): where `make widget-publish` copies the
+    # bundles `make widget-package` produced. Read on every request, so a new
+    # build is offered without a restart; a missing directory publishes nothing.
+    widget_installers_dir: str = "./var/widget-installers"
     bootstrap_email: str = ""
     bootstrap_password: str = ""
     # Connections (T3): Fernet key encrypting per-user connection credentials
@@ -95,6 +99,11 @@ class Settings(BaseSettings):
     def is_development(self) -> bool:
         """Whether ``environment`` is one of :data:`DEVELOPMENT_ENVIRONMENTS`."""
         return self.environment in DEVELOPMENT_ENVIRONMENTS
+
+    @property
+    def widget_installers_path(self) -> Path:
+        """Absolute publication directory of the desktop widget installers."""
+        return Path(self.widget_installers_dir).expanduser().resolve()
 
     @model_validator(mode="after")
     def require_jwt_secret_in_production(self) -> "Settings":
