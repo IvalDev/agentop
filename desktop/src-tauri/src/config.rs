@@ -29,13 +29,28 @@ const CONFIG_KEY: &str = "server_url";
 /// Reads the environment and the XDG config file on a best-effort basis; the
 /// default is used when neither yields a usable URL.
 pub fn current_widget_url() -> Url {
+    let (env_value, config_contents) = configured_server_inputs();
+    resolve_widget_url(env_value.as_deref(), config_contents.as_deref())
+}
+
+/// Returns the configured server URL from the current environment.
+///
+/// Shared by the widget window and the local connector so both always talk to
+/// the same server.
+pub fn current_server_url() -> Url {
+    let (env_value, config_contents) = configured_server_inputs();
+    resolve_server_url(env_value.as_deref(), config_contents.as_deref())
+}
+
+/// Reads the two configuration sources (`AA_SERVER_URL` and the TOML file).
+fn configured_server_inputs() -> (Option<String>, Option<String>) {
     let env_value = std::env::var("AA_SERVER_URL").ok();
     let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let config_contents = config_file_path(xdg_config_home.as_deref(), home.as_deref())
         .and_then(|path| std::fs::read_to_string(path).ok());
 
-    resolve_widget_url(env_value.as_deref(), config_contents.as_deref())
+    (env_value, config_contents)
 }
 
 /// Resolves the widget URL (`{server}/widget`) from the two configuration sources.

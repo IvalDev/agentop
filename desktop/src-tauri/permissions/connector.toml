@@ -1,0 +1,29 @@
+# App-level permission for the local workspace connector window (D1).
+#
+# The window loads local bundled assets (`connector.html`), so its capability
+# is local and bound to the `connector` window. The commands never return the
+# folder path: the page only learns whether a folder was granted.
+
+[[permission]]
+identifier = "allow-connector-commands"
+description = "Enables the local workspace connector commands without any pre-configured scope."
+commands.allow = [
+    "grant_folder",
+    "pair_connector",
+    "connector_status",
+    "disconnect_connector",
+    "reconnect_connector",
+    "forget_connector",
+]
+
+[[permission]]
+identifier = "deny-connector-commands"
+description = "Denies the local workspace connector commands without any pre-configured scope."
+commands.deny = [
+    "grant_folder",
+    "pair_connector",
+    "connector_status",
+    "disconnect_connector",
+    "reconnect_connector",
+    "forget_connector",
+]

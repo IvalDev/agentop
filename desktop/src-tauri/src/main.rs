@@ -1,4 +1,5 @@
 mod config;
+mod connector;
 mod navigation;
 mod notifications;
 mod shortcut;
@@ -27,6 +28,42 @@ pub(crate) fn show_main(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
+    }
+}
+
+/// Opens or focuses the local workspace window.
+///
+/// The window is created on demand and loads `connector.html` from the bundled
+/// assets. Closing it only hides it: the connector keeps running while the app
+/// stays in the tray.
+pub(crate) fn show_connector(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("connector") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+        return;
+    }
+
+    let builder =
+        WebviewWindowBuilder::new(app, "connector", WebviewUrl::App("connector.html".into()))
+            .title("Espacio de trabajo")
+            .inner_size(460.0, 620.0)
+            .resizable(true)
+            .center();
+
+    match builder.build() {
+        Ok(window) => {
+            let close_handle = window.clone();
+            window.on_window_event(move |event| {
+                if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    api.prevent_close();
+                    if let Err(error) = close_handle.hide() {
+                        eprintln!("widget: could not hide the connector window: {error}");
+                    }
+                }
+            });
+        }
+        Err(error) => eprintln!("widget: could not open the connector window: {error}"),
     }
 }
 
@@ -141,6 +178,8 @@ fn reconcile_autostart(app: &tauri::AppHandle, desired: bool) -> bool {
 /// Builds the tray icon and its menu: toggles first, separator, exit last.
 fn build_tray(app: &tauri::AppHandle, always_on_top: bool, autostart: bool) -> tauri::Result<()> {
     let toggle_item = MenuItem::with_id(app, "toggle", "Mostrar / Ocultar", true, None::<&str>)?;
+    let workspace_item =
+        MenuItem::with_id(app, "workspace", "Espacio de trabajo", true, None::<&str>)?;
     let always_on_top_item = CheckMenuItem::with_id(
         app,
         "always_on_top",
@@ -164,6 +203,7 @@ fn build_tray(app: &tauri::AppHandle, always_on_top: bool, autostart: bool) -> t
         app,
         &[
             &toggle_item,
+            &workspace_item,
             &always_on_top_item,
             &autostart_item,
             &separator,
@@ -183,6 +223,7 @@ fn build_tray(app: &tauri::AppHandle, always_on_top: bool, autostart: bool) -> t
         .show_menu_on_left_click(true)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "toggle" => toggle_main(app),
+            "workspace" => show_connector(app),
             "always_on_top" => toggle_always_on_top(app),
             "autostart" => toggle_autostart(app),
             "quit" => app.exit(0),
@@ -321,6 +362,7 @@ fn main() {
             }
         }))
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             // The webview never opens links through the plugin's JS bridge:
             // navigations are decided in `build_main_window` instead.
@@ -348,7 +390,15 @@ fn main() {
     };
 
     builder
-        .invoke_handler(tauri::generate_handler![assistant_response_done])
+        .invoke_handler(tauri::generate_handler![
+            assistant_response_done,
+            connector::grant_folder,
+            connector::pair_connector,
+            connector::connector_status,
+            connector::disconnect_connector,
+            connector::reconnect_connector,
+            connector::forget_connector
+        ])
         .setup(move |app| {
             let handle = app.handle().clone();
             let preferences_state = current_preferences_state();
@@ -362,6 +412,10 @@ fn main() {
                 &preferences_state.preferences,
                 test_response_notification,
             )?;
+
+            // Loads the connector config and reconnects the workspace in the
+            // background when the device is paired.
+            connector::initialize(&handle);
 
             // First run: the autostart key is absent, so the resolved default
             // (enabled) is persisted before reconciling, keeping the file and
