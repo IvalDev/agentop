@@ -86,6 +86,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.modules.agent.llm import LLMProvider
+from app.modules.connectors.hub import ConnectorRequester
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.models import UserRole
 from app.modules.retrieval.embeddings import EmbeddingProvider
@@ -132,6 +133,8 @@ class ToolContext:
     ``timezone`` is the resolved IANA name of the requesting user in a chat
     run (``"UTC"`` when the browser sent none or an unknown one); it is
     ``None`` outside chat runs, e.g. when an approved request executes.
+    ``connectors`` is the live hub of the user's local workspace devices;
+    folder tools fail their precheck when it is ``None``.
     """
 
     session: AsyncSession
@@ -143,6 +146,7 @@ class ToolContext:
     storage: DocumentStorage | None = None
     credentials_key: str | None = None
     settings: Settings | None = None
+    connectors: ConnectorRequester | None = None
     timezone: str | None = None
 
 

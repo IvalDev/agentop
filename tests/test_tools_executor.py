@@ -778,9 +778,14 @@ async def test_without_active_modules_there_is_no_module_gate(
 #: deliberate, reviewed change rather than a side effect of an import.
 #: calendar-mvp allowlist change, human-approved 2026-10-15; google-mail
 #: G1+G3 allowlist change, human-approved 2026-10-18 (six scoped Gmail
-#: tools: three free reads, three approval-gated actions).
+#: tools: three free reads, three approval-gated actions); agent-workspace L1
+#: allowlist change: the two connector-backed reads of the user's granted
+#: folder (their ``path`` is relative to that folder and jailed by the
+#: connector; the server never opens a file).
 BUILTIN_TOOL_ALLOWLIST = {
     "search_documents",
+    "list_files",
+    "read_file",
     "list_events",
     "create_event",
     "cancel_event",
@@ -794,6 +799,10 @@ BUILTIN_TOOL_ALLOWLIST = {
 
 #: Input field names that would hint at shell, SQL, or filesystem access.
 FORBIDDEN_INPUT_FIELDS = {"command", "cmd", "shell", "script", "sql", "path", "file_path"}
+
+#: Connector tools take a *relative* folder path on purpose: it is validated
+#: server-side and jailed again by the local connector.
+CONNECTOR_PATH_TOOLS = {"list_files", "read_file"}
 
 
 async def _tenant_id(db: Database, slug: str) -> int:
@@ -850,11 +859,21 @@ def test_default_registry_exposes_only_allowlisted_tools() -> None:
 
 
 def test_builtin_inputs_are_closed_and_expose_no_shell_sql_or_path() -> None:
-    """Builtin inputs forbid extra fields and carry no shell/SQL/path arguments."""
+    """Builtin inputs forbid extra fields and carry no shell/SQL arguments.
+
+    The connector tools are the reviewed exception: their only argument is a
+    relative path inside the folder the user granted, and the connector jails
+    it again.
+    """
     for spec in default_registry.list_specs():
         assert spec.input_model is not None
         assert spec.input_model.model_config.get("extra") == "forbid", spec.name
-        assert not set(spec.input_model.model_fields) & FORBIDDEN_INPUT_FIELDS, spec.name
+        forbidden = (
+            FORBIDDEN_INPUT_FIELDS - {"path"}
+            if spec.name in CONNECTOR_PATH_TOOLS
+            else FORBIDDEN_INPUT_FIELDS
+        )
+        assert not set(spec.input_model.model_fields) & forbidden, spec.name
 
 
 async def test_search_documents_returns_only_callers_tenant_hits(seeded_db: Database) -> None:

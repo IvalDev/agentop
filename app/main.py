@@ -29,6 +29,9 @@ from app.modules.calendar.tools import register_calendar_tools
 from app.modules.catalog.registry import default_catalog
 from app.modules.catalog.router import router as modules_router
 from app.modules.connections.router import router as connections_router
+from app.modules.connectors.hub import ConnectorHub
+from app.modules.connectors.router import router as connectors_router
+from app.modules.connectors.tools import register_connector_tools
 from app.modules.documents.router import router as documents_router
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.google_mail.registry import (
@@ -65,6 +68,11 @@ register_calendar_tools(default_registry)
 register_default_google_mail()
 register_google_mail_provider()
 register_google_mail_tester()
+
+# Local workspace connector wiring (agent-workspace L1): the two folder-read
+# tools are core tools (no catalog module), so they are offered to every
+# tenant whose user has a connector online. Registers once at import time.
+register_connector_tools(default_registry)
 
 logger = logging.getLogger(__name__)
 
@@ -200,10 +208,12 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         logger.warning("AA_DATABASE_URL is not set; database features are disabled")
     application.state.db = db
 
-    yield
-
-    if db is not None:
-        await db.dispose()
+    try:
+        yield
+    finally:
+        await application.state.connectors.close_all()
+        if db is not None:
+            await db.dispose()
 
 
 def create_app() -> FastAPI:
@@ -223,6 +233,8 @@ def create_app() -> FastAPI:
     application.state.llm = build_llm_provider(settings)
     application.state.tool_registry = default_registry
     application.state.module_catalog = default_catalog
+    # In-process live connectors (single-worker L1); closed on shutdown.
+    application.state.connectors = ConnectorHub()
     # default_catalog already holds the calendar and google_mail manifests:
     # the wiring blocks at the top of this module register them once at
     # import time (reviewed allowlist changes).
@@ -238,6 +250,7 @@ def create_app() -> FastAPI:
     application.include_router(audit_router)
     application.include_router(modules_router)
     application.include_router(connections_router)
+    application.include_router(connectors_router)
     application.include_router(onboarding_router)
     application.include_router(oauth_router)
     application.include_router(chat_router)
