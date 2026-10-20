@@ -8,7 +8,7 @@ trazabilidad: la inferencia es local con Ollama por defecto, cada acción sensib
 en el chat y todo queda auditado.
 
 **Accesos rápidos:** [Cómo instalar](#cómo-instalar) · [Arquitectura](#arquitectura) ·
-[Cómo contribuir](#cómo-contribuir-flujo-de-pr) · [Guía de desarrollo](docs/dev-setup.md)
+[Cómo contribuir](#cómo-contribuir-flujo-de-pr)
 
 ## La idea
 
@@ -137,7 +137,6 @@ flowchart LR
 | `desktop/` | Widget de escritorio: Tauri 2 (Rust) |
 | `tests/` | Suite de pytest del backend |
 | `deployment/` | Docker Compose y perfiles de desarrollo (`deployment/dev/`) |
-| `docs/` | Guías de desarrollo, Gmail y widget |
 
 **Proveedores.** Chat: `ollama` (predeterminado), `openai_compatible` (por ejemplo xAI Grok) o
 `fake` (tests). Embeddings: `ollama` (`nomic-embed-text`, 768 dimensiones) o `fake`. Base de
@@ -160,7 +159,7 @@ datos: SQLite (`aiosqlite`) o PostgreSQL con pgvector. Los archivos se guardan e
 | Python | 3.12 o superior | Backend (`pyproject.toml`) |
 | Node.js + npm | 22.22 o superior | Consola web (`web/package.json`) |
 | Ollama o una clave de xAI | — | Modelo de chat, según el perfil elegido |
-| Rust (rustup) y librerías de Tauri | — | Solo para el widget ([ver requisitos](docs/desktop-widget.md#prerrequisitos)) |
+| Rust (rustup) y librerías de Tauri | — | Solo para el widget |
 
 ### Ruta rápida
 
@@ -183,8 +182,8 @@ Ejecuta todo desde la raíz del repositorio.
    | `ollama.env.example` | Predeterminado del producto: chat y embeddings locales; nada sale de la máquina | `ollama pull qwen2.5:7b-instruct && ollama pull nomic-embed-text` (varios GB de RAM) |
    | `grok.env.example` | Equipo modesto: chat con xAI Grok y embeddings `fake` | `AA_LLM_API_KEY` de xAI; solo datos sintéticos |
 
-   Ambos usan SQLite (`dev.db`). Para PostgreSQL, consulta
-   [SQLite o Postgres](docs/dev-setup.md#sqlite-or-postgres).
+   Ambos usan SQLite (`dev.db`). Para PostgreSQL, cambia `AA_DATABASE_URL` por la cadena de
+   conexión de tu base.
 
 3. Revisa `.env`. Los ajustes se leen de variables con prefijo `AA_` (`app/core/config.py`):
 
@@ -253,7 +252,8 @@ levanta la API en el puerto 8000 con PostgreSQL, Redis, MinIO y Ollama (lee `.en
 6. Como administrador: **Configuración → Herramientas** → activar el módulo. Cada persona lo
    conecta en **Configuración → Mis herramientas**.
 
-Detalles de permisos, alcance del buzón y protocolo de prueba: [docs/google-mail.md](docs/google-mail.md).
+Los detalles de permisos, alcance del buzón y protocolo de prueba se mantienen en la guía
+local de Gmail.
 
 ### Opcional: widget de escritorio
 
@@ -263,7 +263,8 @@ Detalles de permisos, alcance del buzón y protocolo de prueba: [docs/google-mai
 | `make widget-package` | Genera el `.deb` y el AppImage en `desktop/src-tauri/target/release/bundle/` |
 | `make widget-publish` | Empaqueta y copia los instaladores a `var/widget-installers/`, que sirve la API |
 
-Instalación, atajos de teclado y solución de problemas: [docs/desktop-widget.md](docs/desktop-widget.md).
+La instalación, los atajos de teclado y la solución de problemas se mantienen en la guía
+local del widget.
 
 ## Cómo contribuir: flujo de PR
 
@@ -382,6 +383,5 @@ No borres la rama del padre hasta haber cambiado la base del hijo.
 | Almacenamiento en MinIO y cola Redis + RQ | Previstos; hoy los archivos van a disco y la ingesta es síncrona |
 | Migraciones de Alembic | Configuradas, sin revisiones; `make demo` crea el esquema en desarrollo |
 
-**Documentación:** [docs/dev-setup.md](docs/dev-setup.md) (entorno ligero, equipo de demo, API
-de equipo, RAG paso a paso) · [docs/google-mail.md](docs/google-mail.md) ·
-[docs/desktop-widget.md](docs/desktop-widget.md)
+**Documentación:** las guías detalladas de desarrollo, Gmail y widget se mantienen fuera del
+repositorio, como material de trabajo local.
