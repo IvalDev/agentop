@@ -211,7 +211,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
-        await application.state.connectors.close_all()
+        # A half-built app (or a reload that caught main.py mid-edit) may not
+        # have the hub yet; shutdown must never abort before disposing the pool.
+        hub: ConnectorHub | None = getattr(application.state, "connectors", None)
+        if hub is not None:
+            await hub.close_all()
         if db is not None:
             await db.dispose()
 
