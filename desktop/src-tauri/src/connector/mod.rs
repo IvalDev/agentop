@@ -147,8 +147,14 @@ pub struct GrantFolderResult {
 }
 
 /// Opens the native folder picker and stores the canonical granted root.
+///
+/// The command must stay `async`: sync commands run on the main thread, and
+/// `blocking_pick_folder` queues the dialog with `run_on_main_thread` before
+/// waiting for it — blocking the event loop that has to open it deadlocks the
+/// whole window. An async command runs on the async runtime, so the picker
+/// gets the main thread for itself (same pattern tauri-plugin-dialog uses).
 #[tauri::command]
-pub fn grant_folder(app: AppHandle) -> Result<GrantFolderResult, String> {
+pub async fn grant_folder(app: AppHandle) -> Result<GrantFolderResult, String> {
     use tauri_plugin_dialog::DialogExt;
 
     let picked = app
