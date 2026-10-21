@@ -613,3 +613,61 @@ mod tests {
         assert_eq!(join_relative("sub/", "a.txt"), "sub/a.txt");
     }
 }
+
+#[cfg(unix)]
+#[cfg(test)]
+mod v1_probe_tests {
+    //! Independent L1 probes: path jail and read caps against the granted root.
+    use super::*;
+    use crate::connector::test_support::TempDir;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn v1_probe_jail_rejects_every_escape_and_caps_hold() {
+        let dir = TempDir::new("v1-probe");
+        let raw = dir.path().join("root");
+        fs::create_dir_all(&raw).expect("root must be created");
+        fs::write(raw.join("ok.md"), b"fine").expect("file must be written");
+        let secret = dir.path().join("secret-outside.txt");
+        fs::write(&secret, b"leaked").expect("file must be written");
+        symlink(&secret, raw.join("escape.txt")).expect("symlink must be created");
+        let root = fs::canonicalize(&raw).expect("root must canonicalize");
+
+        assert_eq!(
+            resolve(&root, "../secret-outside.txt").unwrap_err().code,
+            "invalid_path"
+        );
+        assert_eq!(
+            resolve(&root, "/etc/passwd").unwrap_err().code,
+            "invalid_path"
+        );
+        assert_eq!(
+            resolve(&root, "ok.md\0.png").unwrap_err().code,
+            "invalid_path"
+        );
+        assert_eq!(
+            resolve(&root, "escape.txt").unwrap_err().code,
+            "invalid_path"
+        );
+        assert!(read_file(&root, "escape.txt").is_err());
+        let listing = list_files(&root, "").expect("root listing must work");
+        assert!(
+            listing
+                .entries
+                .iter()
+                .all(|entry| entry.name != "escape.txt"),
+            "symlink leaked into the listing: {listing:?}"
+        );
+        for entry in &listing.entries {
+            assert!(!entry.path.starts_with('/'), "{}", entry.path);
+            assert!(
+                !entry.path.contains(&root.to_string_lossy()[..]),
+                "{}",
+                entry.path
+            );
+        }
+        fs::write(raw.join("big.txt"), vec![0u8; MAX_READ_BYTES as usize + 1])
+            .expect("big file must be written");
+        assert_eq!(read_file(&root, "big.txt").unwrap_err().code, "too_large");
+    }
+}
