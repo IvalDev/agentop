@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "connector",
+  "description": "Local workspace connector window: folder picker, pairing and connector status.",
+  "windows": ["connector"],
+  "local": true,
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "allow-connector-commands"
+  ]
+}

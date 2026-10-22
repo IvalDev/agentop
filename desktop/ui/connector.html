@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Espacio de trabajo</title>
+    <link rel="stylesheet" href="connector.css" />
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <h1>Espacio de trabajo</h1>
+        <p class="subtitle">
+          El agente trabaja en una carpeta de este equipo. La carpeta no se
+          muestra en la app: ábrela desde tu sistema operativo.
+        </p>
+      </header>
+
+      <section class="card" aria-labelledby="device-title">
+        <div class="device-row">
+          <div>
+            <h2 id="device-title">Equipo</h2>
+            <p id="device-name" class="device-name">Sin emparejar</p>
+          </div>
+          <span id="connection-badge" class="badge badge-idle">Sin emparejar</span>
+        </div>
+        <p id="server" class="hint"></p>
+      </section>
+
+      <section class="card" aria-labelledby="folder-title">
+        <h2 id="folder-title">1. Carpeta del espacio de trabajo</h2>
+        <p class="hint">
+          Elige la carpeta que quieres compartir con el agente. El agente solo
+          puede leer dentro de ella.
+        </p>
+        <p id="folder-state" class="folder-state">Falta elegir una carpeta</p>
+        <button id="grant-folder" type="button">Elegir carpeta</button>
+      </section>
+
+      <section class="card" aria-labelledby="pair-title">
+        <h2 id="pair-title">2. Conectar este equipo</h2>
+        <p class="hint">
+          En la web, abre My Tools → Espacio de trabajo local, genera un código y
+          pégalo aquí.
+        </p>
+        <form id="pair-form" class="form">
+          <label for="pair-code">Código de emparejamiento</label>
+          <input
+            id="pair-code"
+            name="code"
+            type="text"
+            autocomplete="one-time-code"
+            spellcheck="false"
+            placeholder="ABCD-EFGH"
+            maxlength="16"
+            required
+          />
+          <label for="device-input">Nombre del equipo</label>
+          <input
+            id="device-input"
+            name="name"
+            type="text"
+            maxlength="80"
+            placeholder="Mi equipo"
+            required
+          />
+          <button id="pair-button" type="submit">Conectar este equipo</button>
+        </form>
+      </section>
+
+      <p id="error" class="message error" role="alert" hidden></p>
+      <p id="notice" class="message notice" role="status" hidden></p>
+
+      <section class="card" aria-labelledby="actions-title">
+        <h2 id="actions-title">Conexión</h2>
+        <div class="actions">
+          <button id="reconnect" type="button" class="secondary">
+            Reconectar
+          </button>
+          <button id="disconnect" type="button" class="secondary">
+            Desconectar
+          </button>
+          <button id="forget" type="button" class="danger">Olvidar equipo</button>
+        </div>
+        <p class="hint">
+          Al desconectar, el agente deja de acceder a la carpeta hasta que
+          vuelvas a conectar el equipo. Al olvidar el equipo se borra el
+          emparejamiento; la carpeta queda en tu equipo.
+        </p>
+      </section>
+    </main>
+    <script src="connector.js" defer></script>
+  </body>
+</html>
