@@ -9,7 +9,10 @@ raising, so API handlers never need to translate tool errors into HTTP
 responses by hand.
 
 Tools raise :class:`ToolPrecheckError` from their ``precheck`` to refuse a
-call (the executor turns it into a ``precheck_failed`` result).
+call (the executor turns it into a ``precheck_failed`` result). A handler
+whose refusal is only known once it runs — a remote side that owns the final
+check — raises :class:`ToolRefusalError`, the one handler exception the
+executor reports with its reason instead of masking it.
 :class:`ToolApprovalRoleError` is raised by
 :func:`~app.modules.tools.executor.resolve_approval_role` when a tool's
 ``approval_role`` resolver fails, so no caller ever falls back to a guessed
@@ -53,3 +56,13 @@ class ToolPrecheckError(ToolError):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class ToolRefusalError(ToolPrecheckError):
+    """A handler refused the call with a user-safe reason after its precheck passed.
+
+    The executor masks every other handler exception — a bare
+    :class:`ToolPrecheckError` included — as ``tool_failed``; this one is
+    reported exactly like a precheck refusal (``precheck_failed: <reason>``).
+    The same rules for ``reason`` apply.
+    """

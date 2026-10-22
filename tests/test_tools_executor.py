@@ -22,7 +22,11 @@ from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, UserRole
 from app.modules.retrieval.embeddings import EmbeddingError, FakeEmbeddingProvider
 from app.modules.tools import builtin
-from app.modules.tools.exceptions import ToolApprovalRoleError, ToolPrecheckError
+from app.modules.tools.exceptions import (
+    ToolApprovalRoleError,
+    ToolPrecheckError,
+    ToolRefusalError,
+)
 from app.modules.tools.executor import compute_action_key, execute_tool, resolve_approval_role
 from app.modules.tools.registry import (
     ApprovalPolicy,
@@ -686,6 +690,53 @@ async def test_unexpected_precheck_exception_is_masked_as_tool_failed(
     assert await audit_log(identity_db, action="tool.precheck_failed") == []
 
 
+async def test_handler_refusal_is_reported_like_a_precheck_refusal(
+    identity_db: Database, audit_log
+) -> None:
+    """A handler's ``ToolRefusalError`` reaches the caller as ``precheck_failed: <reason>``."""
+    handler = SpyHandler({"sent": True}, error=ToolRefusalError("folder already exists"))
+    registry = gated_registry(handler=handler)
+    key = compute_action_key("gated_action", DemoInput(value=3))
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry,
+            session,
+            make_user(),
+            "gated_action",
+            {"value": 3},
+            approval_grant=mint_grant(uuid4(), key),
+        )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == "precheck_failed: folder already exists"
+    assert len(handler.calls) == 1
+    [refused] = await audit_log(identity_db, action="tool.precheck_failed")
+    assert refused.result == {"error": "precheck_failed", "reason": "folder already exists"}
+    assert await audit_log(identity_db, action="tool.failed") == []
+
+
+async def test_plain_precheck_error_raised_by_a_handler_stays_masked(
+    identity_db: Database, audit_log
+) -> None:
+    """Only ``ToolRefusalError`` escapes a handler; a bare ``ToolPrecheckError`` is masked."""
+    handler = SpyHandler({"sent": True}, error=ToolPrecheckError("token expired"))
+    registry = gated_registry(handler=handler)
+    key = compute_action_key("gated_action", DemoInput(value=3))
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry,
+            session,
+            make_user(),
+            "gated_action",
+            {"value": 3},
+            approval_grant=mint_grant(uuid4(), key),
+        )
+
+    assert (result.status, result.error_kind, result.error) == ("error", "execution", "tool_failed")
+    [failed] = await audit_log(identity_db, action="tool.failed")
+    assert failed.result == {"error": "token expired"}
+
+
 # --- Module gating (T2) -------------------------------------------------------
 
 
@@ -778,9 +829,18 @@ async def test_without_active_modules_there_is_no_module_gate(
 #: deliberate, reviewed change rather than a side effect of an import.
 #: calendar-mvp allowlist change, human-approved 2026-10-15; google-mail
 #: G1+G3 allowlist change, human-approved 2026-10-18 (six scoped Gmail
-#: tools: three free reads, three approval-gated actions).
+#: tools: three free reads, three approval-gated actions); agent-workspace L1
+#: allowlist change: the two connector-backed reads of the user's granted
+#: folder (their ``path`` is relative to that folder and jailed by the
+#: connector; the server never opens a file).
 BUILTIN_TOOL_ALLOWLIST = {
     "search_documents",
+    "list_files",
+    "read_file",
+    "write_file",
+    "create_folder",
+    "move_path",
+    "delete_path",
     "list_events",
     "create_event",
     "cancel_event",
@@ -794,6 +854,17 @@ BUILTIN_TOOL_ALLOWLIST = {
 
 #: Input field names that would hint at shell, SQL, or filesystem access.
 FORBIDDEN_INPUT_FIELDS = {"command", "cmd", "shell", "script", "sql", "path", "file_path"}
+
+#: Connector tools take a *relative* folder path on purpose: it is validated
+#: server-side and jailed again by the local connector.
+CONNECTOR_PATH_TOOLS = {
+    "list_files",
+    "read_file",
+    "write_file",
+    "create_folder",
+    "move_path",
+    "delete_path",
+}
 
 
 async def _tenant_id(db: Database, slug: str) -> int:
@@ -850,11 +921,21 @@ def test_default_registry_exposes_only_allowlisted_tools() -> None:
 
 
 def test_builtin_inputs_are_closed_and_expose_no_shell_sql_or_path() -> None:
-    """Builtin inputs forbid extra fields and carry no shell/SQL/path arguments."""
+    """Builtin inputs forbid extra fields and carry no shell/SQL arguments.
+
+    The connector tools are the reviewed exception: their only argument is a
+    relative path inside the folder the user granted, and the connector jails
+    it again.
+    """
     for spec in default_registry.list_specs():
         assert spec.input_model is not None
         assert spec.input_model.model_config.get("extra") == "forbid", spec.name
-        assert not set(spec.input_model.model_fields) & FORBIDDEN_INPUT_FIELDS, spec.name
+        forbidden = (
+            FORBIDDEN_INPUT_FIELDS - {"path"}
+            if spec.name in CONNECTOR_PATH_TOOLS
+            else FORBIDDEN_INPUT_FIELDS
+        )
+        assert not set(spec.input_model.model_fields) & forbidden, spec.name
 
 
 async def test_search_documents_returns_only_callers_tenant_hits(seeded_db: Database) -> None:

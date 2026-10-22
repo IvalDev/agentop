@@ -26,7 +26,8 @@ as :data:`INVALID_OUTPUT` (the detail goes to the server log and the
 ``tool.failed`` audit event only), validation errors list field locations
 and messages without echoing input values, and a precheck refusal is
 ``precheck_failed: <reason>`` with the tool's own user-safe reason
-(:class:`~app.modules.tools.exceptions.ToolPrecheckError`).
+(:class:`~app.modules.tools.exceptions.ToolPrecheckError`, or a handler's
+:class:`~app.modules.tools.exceptions.ToolRefusalError`).
 
 Role checks compare an explicit rank map (lower = more privileged), mirroring
 the declaration order of :class:`~app.modules.identity.models.UserRole`:
@@ -95,6 +96,7 @@ from app.modules.agent.llm import LLMProvider
 from app.modules.approvals.grants import ApprovalGrant, consume_grant
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
+from app.modules.connectors.hub import ConnectorRequester
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.models import UserRole
 from app.modules.retrieval.embeddings import EmbeddingProvider
@@ -102,6 +104,7 @@ from app.modules.tools.exceptions import (
     ToolApprovalRoleError,
     ToolNotFoundError,
     ToolPrecheckError,
+    ToolRefusalError,
 )
 from app.modules.tools.registry import (
     ApprovalPolicy,
@@ -200,6 +203,22 @@ def _tool_failed(
     ), _AuditRecord("tool.failed", canonical, {"error": str(exc) or type(exc).__name__})
 
 
+def _refused(
+    tool_name: str, canonical: dict[str, Any], exc: ToolPrecheckError
+) -> tuple[ToolExecutionResult, _AuditRecord]:
+    """Refusal with the tool's own user-safe reason: ``precheck_failed: <reason>``."""
+    return ToolExecutionResult(
+        tool_name=tool_name,
+        status="error",
+        error=f"{PRECHECK_FAILED}: {exc.reason}",
+        error_kind="precheck",
+    ), _AuditRecord(
+        "tool.precheck_failed",
+        canonical,
+        {"error": PRECHECK_FAILED, "reason": exc.reason},
+    )
+
+
 def _input_fields(raw_input: Any) -> dict[str, Any]:
     """Field names of unvalidated input: never its values."""
     names = sorted(map(str, raw_input)) if isinstance(raw_input, dict) else []
@@ -287,6 +306,7 @@ async def execute_tool(
     credentials_key: str | None = None,
     settings: Settings | None = None,
     timezone: str | None = None,
+    connectors: ConnectorRequester | None = None,
 ) -> ToolExecutionResult:
     """Execute ``tool_name`` under authorization, validation, and policy gates.
 
@@ -306,6 +326,8 @@ async def execute_tool(
     ``None`` and the tools fail closed with a precheck error. ``timezone``
     is the requesting user's resolved IANA name, set by the agent loop and
     passed through to :class:`ToolContext` (``None`` for other callers).
+    ``connectors`` is the live local-workspace hub; folder tools refuse the
+    call when it is missing or the user's device is offline.
 
     Check order (each failure returns immediately, handler is only reached by
     the last step):
@@ -335,9 +357,11 @@ async def execute_tool(
     7. Dry run ⇒ ``dry_run`` describing the call; handler not called.
     8. Handler run with a :class:`ToolContext` (``session``, the user's
        tenant, ``embeddings``, ``llm``, ``storage``, ``correlation_id``,
-       ``credentials_key``, ``settings``, ``timezone``) — exceptions ⇒
+       ``credentials_key``, ``settings``, ``timezone``, ``connectors``) — exceptions ⇒
        ``error``/``execution`` with the generic :data:`TOOL_FAILED`; the
-       exception text goes to the server log and the audit event only.
+       exception text goes to the server log and the audit event only. The
+       one exception is :class:`ToolRefusalError` ⇒ ``error``/``precheck``
+       with ``precheck_failed: <reason>``, exactly like a precheck refusal.
     9. Output validation — ``spec.output_model`` rejects the return ⇒
        ``error``/``execution`` with :data:`INVALID_OUTPUT`.
 
@@ -356,6 +380,7 @@ async def execute_tool(
         credentials_key=credentials_key,
         settings=settings,
         timezone=timezone,
+        connectors=connectors,
     )
     result, record = await _evaluate(
         registry, context, tool_name, raw_input, dry_run, approval_grant, active_modules
@@ -435,16 +460,7 @@ async def _evaluate(
         try:
             await spec.precheck(context, validated_input)
         except ToolPrecheckError as exc:
-            return ToolExecutionResult(
-                tool_name=spec.name,
-                status="error",
-                error=f"{PRECHECK_FAILED}: {exc.reason}",
-                error_kind="precheck",
-            ), _AuditRecord(
-                "tool.precheck_failed",
-                canonical,
-                {"error": PRECHECK_FAILED, "reason": exc.reason},
-            )
+            return _refused(spec.name, canonical, exc)
         except Exception as exc:
             logger.exception("tool %s precheck failed", spec.name)
             return _tool_failed(spec.name, canonical, exc)
@@ -496,6 +512,8 @@ async def _evaluate(
 
     try:
         output = await spec.handler(context, validated_input)
+    except ToolRefusalError as exc:
+        return _refused(spec.name, canonical, exc)
     except Exception as exc:
         logger.exception("tool %s failed", spec.name)
         return _tool_failed(spec.name, canonical, exc)

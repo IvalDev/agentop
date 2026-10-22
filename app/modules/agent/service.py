@@ -103,6 +103,7 @@ from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event
 from app.modules.catalog.registry import ModuleCatalog
 from app.modules.catalog.service import active_module_keys
+from app.modules.connectors.hub import ConnectorRequester
 from app.modules.documents.storage import DocumentStorage
 from app.modules.retrieval.embeddings import EmbeddingProvider
 from app.modules.tools.builtin import SearchDocumentsOutput
@@ -165,6 +166,9 @@ class AgentDeps:
     #: Module catalog the engines read their agent profiles from
     #: (``app.state.module_catalog``); ``None`` leaves only ``knowledge``.
     catalog: ModuleCatalog | None = None
+    #: Live local-workspace connectors (``app.state.connectors``); the folder
+    #: tools fail their precheck when it is ``None`` or the user is offline.
+    connectors: ConnectorRequester | None = None
 
 
 def new_run_id() -> str:
@@ -419,6 +423,7 @@ class AgentRun:
                 credentials_key=self._deps.credentials_key,
                 settings=self._deps.settings,
                 timezone=self._user_time.timezone,
+                connectors=self._deps.connectors,
             )
             summary, content, new_approval = await self._handle(call_id, name, result)
         self._summaries.append(summary)

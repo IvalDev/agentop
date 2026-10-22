@@ -38,6 +38,7 @@ from app.modules.approvals.service import (
     reject_request,
 )
 from app.modules.catalog.models import ModuleActivation
+from app.modules.connectors.hub import ConnectorHub
 from app.modules.documents.storage import LocalDocumentStorage
 from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import UserRole
@@ -667,6 +668,27 @@ async def test_approved_execution_gives_the_tool_the_llm_and_storage(
     for context in (precheck_context, handler_context):
         assert context.llm is llm
         assert context.storage is storage
+
+
+async def test_approved_execution_gives_the_tool_the_connector_hub(
+    seeded_db: Database, seeded_users, tiered_tools
+) -> None:
+    """The precheck and the handler of an approved call see the live workspace hub (L2/S6)."""
+    hub = ConnectorHub()
+    owner = seeded_users[OWNER]
+    request_id = await _create(seeded_db, tiered_tools, owner, tool="route_note")
+    await _approve(seeded_db, owner, request_id)
+
+    async with seeded_db.sessionmaker() as session:
+        outcome = await execute_approved_action(
+            session, tiered_tools.registry, owner, request_id, now=T0, connectors=hub
+        )
+
+    assert outcome.request.status is ApprovalStatus.EXECUTED
+    [precheck_context] = tiered_tools.precheck.contexts
+    [handler_context] = tiered_tools.spy.contexts
+    for context in (precheck_context, handler_context):
+        assert context.connectors is hub
 
 
 async def test_approved_execution_gives_the_tool_the_credentials_key_and_settings(

@@ -40,6 +40,7 @@ from app.modules.approvals import models as _approval_models  # noqa: F401  (reg
 from app.modules.audit import models as _audit_models  # noqa: F401  (registers tables)
 from app.modules.catalog import models as _catalog_models  # noqa: F401  (registers tables)
 from app.modules.connections import models as _connections_models  # noqa: F401  (registers tables)
+from app.modules.connectors import models as _connector_models  # noqa: F401  (registers tables)
 from app.modules.documents.models import Document, DocumentChunk, DocumentStatus
 from app.modules.documents.service import create_document, ingest_document
 from app.modules.documents.storage import DocumentStorage, LocalDocumentStorage
