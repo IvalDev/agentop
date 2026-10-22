@@ -29,9 +29,10 @@ A tool that ran but failed — a precheck refusal included
 (``execution_error`` ``precheck_failed: <reason>``) — still answers 200 with
 status ``failed`` and ``execution_error``: the approval was consumed either
 way. Execution gives the tool the app's chat model (``app.state.llm``),
-document storage (``app.state.storage``), settings, and credentials key —
-the same objects the chat and documents routes use — so an approved call
-that decrypts per-user provider credentials runs like it would in chat.
+document storage (``app.state.storage``), settings, credentials key, and the
+live local-workspace hub (``app.state.connectors``) — the same objects the
+chat and documents routes use — so an approved call that decrypts per-user
+provider credentials or writes to a granted folder runs like it would in chat.
 """
 
 from typing import Annotated
@@ -60,6 +61,7 @@ from app.modules.approvals.service import (
     list_approval_requests,
     reject_request,
 )
+from app.modules.connectors.router import HubDep
 from app.modules.documents.router import StorageDep
 from app.modules.identity.deps import CurrentUser, get_current_user
 from app.modules.tools.registry import ToolRegistry
@@ -188,6 +190,7 @@ async def execute(
     llm: LLMDep,
     storage: StorageDep,
     settings: SettingsDep,
+    connectors: HubDep,
 ) -> ApprovalResponse:
     """Run an approved request's stored call exactly once."""
     try:
@@ -204,6 +207,7 @@ async def execute(
                 settings.credentials_key.get_secret_value() if settings.credentials_key else None
             ),
             settings=settings,
+            connectors=connectors,
         )
     except ApprovalError as exc:
         raise _http_error(exc) from exc
