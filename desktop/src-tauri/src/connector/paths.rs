@@ -2,8 +2,10 @@
 //!
 //! Every relative path from the server is joined to the granted root and
 //! canonicalized; anything that resolves outside the root (including symlink
-//! escapes) is rejected. The operations only read: `list_files` and
-//! `read_file`.
+//! escapes) is rejected. Read operations (`list_files`, `read_file`)
+//! canonicalize the target itself; write operations (`write_file`,
+//! `create_folder`, `move_path`, `delete_path`) canonicalize the destination's
+//! parent because the target may not exist yet, and never follow symlinks.
 
 use std::fs;
 use std::io::{ErrorKind, Read};
@@ -41,6 +43,10 @@ impl OpError {
 
     pub fn invalid_path(message: impl Into<String>) -> Self {
         Self::new("invalid_path", message)
+    }
+
+    pub fn already_exists() -> Self {
+        Self::new("already_exists", "Ya existe un elemento con ese nombre.")
     }
 
     /// Maps an I/O failure to one of the contract error codes.
@@ -82,6 +88,34 @@ pub struct ReadResult {
     pub size: u64,
 }
 
+/// Result of `write_file`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WriteResult {
+    pub path: String,
+    pub bytes: u64,
+    pub created: bool,
+}
+
+/// Result of `create_folder`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FolderResult {
+    pub path: String,
+}
+
+/// Result of `move_path`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MoveResult {
+    pub from_path: String,
+    pub to_path: String,
+}
+
+/// Result of `delete_path`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeleteResult {
+    pub path: String,
+    pub removed: u64,
+}
+
 /// Canonicalizes the folder the user granted and requires it to be a folder.
 pub fn canonicalize_root(path: &Path) -> Result<PathBuf, OpError> {
     let canonical = fs::canonicalize(path).map_err(|error| OpError::from_io(&error))?;
@@ -97,6 +131,52 @@ pub fn canonicalize_root(path: &Path) -> Result<PathBuf, OpError> {
 ///
 /// `root` must already be canonical (see [`canonicalize_root`]).
 pub fn resolve(root: &Path, relative: &str) -> Result<PathBuf, OpError> {
+    validate_relative(relative)?;
+
+    let candidate = Path::new(relative);
+    let canonical =
+        fs::canonicalize(root.join(candidate)).map_err(|error| OpError::from_io(&error))?;
+    if !canonical.starts_with(root) {
+        return Err(OpError::invalid_path(
+            "La ruta está fuera de la carpeta concedida.",
+        ));
+    }
+    Ok(canonical)
+}
+
+/// Resolves a write destination that may not exist yet.
+///
+/// The leaf's parent directory is canonicalized (it must exist and stay
+/// inside the root, so a symlinked parent that escapes is rejected) and the
+/// leaf must be a plain file or folder name. The returned path is the final
+/// target: the canonical parent joined with the validated leaf.
+pub fn resolve_destination(root: &Path, relative: &str) -> Result<PathBuf, OpError> {
+    validate_relative(relative)?;
+
+    let candidate = Path::new(relative);
+    let leaf = candidate.file_name().ok_or_else(|| {
+        OpError::invalid_path("La ruta debe apuntar a un elemento dentro de la carpeta.")
+    })?;
+
+    let parent = match candidate.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            let canonical =
+                fs::canonicalize(root.join(parent)).map_err(|error| OpError::from_io(&error))?;
+            if !canonical.starts_with(root) {
+                return Err(OpError::invalid_path(
+                    "La ruta está fuera de la carpeta concedida.",
+                ));
+            }
+            canonical
+        }
+        _ => root.to_path_buf(),
+    };
+
+    Ok(parent.join(leaf))
+}
+
+/// Validates the shape of a relative path before it touches the filesystem.
+fn validate_relative(relative: &str) -> Result<(), OpError> {
     if relative.chars().count() > MAX_RELATIVE_PATH_LEN {
         return Err(OpError::invalid_path("La ruta es demasiado larga."));
     }
@@ -123,15 +203,7 @@ pub fn resolve(root: &Path, relative: &str) -> Result<PathBuf, OpError> {
             Component::CurDir | Component::Normal(_) => {}
         }
     }
-
-    let canonical =
-        fs::canonicalize(root.join(candidate)).map_err(|error| OpError::from_io(&error))?;
-    if !canonical.starts_with(root) {
-        return Err(OpError::invalid_path(
-            "La ruta está fuera de la carpeta concedida.",
-        ));
-    }
-    Ok(canonical)
+    Ok(())
 }
 
 /// Lists a directory inside the granted root.
@@ -213,19 +285,138 @@ pub fn read_file(root: &Path, relative: &str) -> Result<ReadResult, OpError> {
     })
 }
 
-/// Executes one request operation against the granted root.
-pub fn execute(root: &Path, op: &str, args: &Value) -> Result<Value, OpError> {
-    let relative = match args.get("path") {
-        None | Some(Value::Null) => "",
-        Some(Value::String(value)) => value.as_str(),
-        Some(_) => {
-            return Err(OpError::invalid_path("El parámetro path debe ser texto."));
+/// Creates or overwrites a UTF-8 text file inside the granted root.
+///
+/// The parent folder must already exist. A symlink at the target is rejected
+/// instead of followed, and the byte cap is re-checked on the machine as
+/// defence in depth.
+pub fn write_file(root: &Path, relative: &str, content: &str) -> Result<WriteResult, OpError> {
+    if content.len() > MAX_READ_BYTES as usize {
+        return Err(OpError::new(
+            "too_large",
+            "El archivo supera el límite de 5 MB.",
+        ));
+    }
+
+    let target = resolve_destination(root, relative)?;
+    let existing = fs::symlink_metadata(&target).ok();
+    if let Some(metadata) = &existing {
+        if metadata.file_type().is_symlink() {
+            return Err(OpError::invalid_path(
+                "La ruta es un enlace simbólico y no se puede modificar.",
+            ));
         }
+    }
+
+    fs::write(&target, content).map_err(|error| OpError::from_io(&error))?;
+
+    Ok(WriteResult {
+        path: relative.to_owned(),
+        bytes: content.len() as u64,
+        created: existing.is_none(),
+    })
+}
+
+/// Creates a folder inside the granted root; fails when something already
+/// exists at that path (checked without following symlinks).
+pub fn create_folder(root: &Path, relative: &str) -> Result<FolderResult, OpError> {
+    let target = resolve_destination(root, relative)?;
+    if fs::symlink_metadata(&target).is_ok() {
+        return Err(OpError::already_exists());
+    }
+
+    fs::create_dir(&target).map_err(|error| OpError::from_io(&error))?;
+
+    Ok(FolderResult {
+        path: relative.to_owned(),
+    })
+}
+
+/// Moves or renames a file, folder or symlink inside the granted root.
+///
+/// The destination is never overwritten: an existing entry (including a
+/// symlink) fails with `already_exists`, and the destination's parent must
+/// exist. Symlinks are moved as links and never followed.
+pub fn move_path(root: &Path, from: &str, to: &str) -> Result<MoveResult, OpError> {
+    let source = resolve_destination(root, from)?;
+    let destination = resolve_destination(root, to)?;
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(OpError::already_exists());
+    }
+
+    fs::rename(&source, &destination).map_err(|error| OpError::from_io(&error))?;
+
+    Ok(MoveResult {
+        from_path: from.to_owned(),
+        to_path: to.to_owned(),
+    })
+}
+
+/// Deletes a file, folder or symlink inside the granted root.
+///
+/// Folders are removed with all their content (recursive, control total);
+/// symlinks are removed as links and never followed. `removed` counts every
+/// filesystem entry taken out, the target included.
+pub fn delete_path(root: &Path, relative: &str) -> Result<DeleteResult, OpError> {
+    let target = resolve_destination(root, relative)?;
+    let metadata = fs::symlink_metadata(&target).map_err(|error| OpError::from_io(&error))?;
+
+    let removed = if metadata.file_type().is_dir() {
+        remove_tree(&target)? + 1
+    } else {
+        fs::remove_file(&target).map_err(|error| OpError::from_io(&error))?;
+        1
     };
 
+    Ok(DeleteResult {
+        path: relative.to_owned(),
+        removed,
+    })
+}
+
+/// Removes a directory and everything inside without following symlinks.
+///
+/// Returns the entries removed under the directory (the directory itself is
+/// not counted; the caller adds it).
+fn remove_tree(directory: &Path) -> Result<u64, OpError> {
+    let entries = fs::read_dir(directory).map_err(|error| OpError::from_io(&error))?;
+    let mut removed = 0u64;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| OpError::from_io(&error))?;
+        // `file_type` never follows symlinks, so a link is removed as a link.
+        let file_type = entry
+            .file_type()
+            .map_err(|error| OpError::from_io(&error))?;
+        if file_type.is_dir() {
+            removed += remove_tree(&entry.path())?;
+        } else {
+            fs::remove_file(entry.path()).map_err(|error| OpError::from_io(&error))?;
+        }
+        removed += 1;
+    }
+
+    fs::remove_dir(directory).map_err(|error| OpError::from_io(&error))?;
+    Ok(removed)
+}
+
+/// Executes one request operation against the granted root.
+pub fn execute(root: &Path, op: &str, args: &Value) -> Result<Value, OpError> {
     let result = match op {
-        "list_files" => serde_json::to_value(list_files(root, relative)?),
-        "read_file" => serde_json::to_value(read_file(root, relative)?),
+        "list_files" => serde_json::to_value(list_files(root, optional_path(args)?)?),
+        "read_file" => serde_json::to_value(read_file(root, optional_path(args)?)?),
+        "write_file" => serde_json::to_value(write_file(
+            root,
+            required_arg(args, "path")?,
+            required_arg(args, "content")?,
+        )?),
+        "create_folder" => serde_json::to_value(create_folder(root, required_arg(args, "path")?)?),
+        "move_path" => serde_json::to_value(move_path(
+            root,
+            required_arg(args, "from_path")?,
+            required_arg(args, "to_path")?,
+        )?),
+        "delete_path" => serde_json::to_value(delete_path(root, required_arg(args, "path")?)?),
         _ => return Err(OpError::new("io_error", "Operación no soportada.")),
     };
 
@@ -235,6 +426,27 @@ pub fn execute(root: &Path, op: &str, args: &Value) -> Result<Value, OpError> {
             format!("No se pudo serializar el resultado: {error}"),
         )
     })
+}
+
+/// Reads the optional `path` argument; `list_files` and `read_file` default
+/// it to the workspace root.
+fn optional_path(args: &Value) -> Result<&str, OpError> {
+    match args.get("path") {
+        None | Some(Value::Null) => Ok(""),
+        Some(Value::String(value)) => Ok(value.as_str()),
+        Some(_) => Err(OpError::invalid_path("El parámetro path debe ser texto.")),
+    }
+}
+
+/// Reads a required string argument such as `content`, `from_path` or
+/// `to_path`.
+fn required_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, OpError> {
+    match args.get(name) {
+        Some(Value::String(value)) => Ok(value.as_str()),
+        _ => Err(OpError::invalid_path(format!(
+            "El parámetro {name} debe ser texto."
+        ))),
+    }
 }
 
 /// Formats a filesystem timestamp as UTC ISO-8601 (`2023-11-14T22:13:20Z`).
@@ -611,6 +823,444 @@ mod tests {
         assert_eq!(join_relative("", "a.txt"), "a.txt");
         assert_eq!(join_relative("sub", "a.txt"), "sub/a.txt");
         assert_eq!(join_relative("sub/", "a.txt"), "sub/a.txt");
+    }
+
+    #[test]
+    fn unknown_operations_stay_unsupported() {
+        let fixture = fixture("unknown-op");
+
+        let error = execute(&fixture.root, "export_everything", &json!({}))
+            .expect_err("unknown operation must fail");
+        assert_eq!(error, OpError::new("io_error", "Operación no soportada."));
+    }
+
+    #[test]
+    fn write_file_creates_and_overwrites_with_the_contract_shape() {
+        let fixture = fixture("write-create");
+
+        let created = execute(
+            &fixture.root,
+            "write_file",
+            &json!({"path": "sub/nuevo.txt", "content": "hola"}),
+        )
+        .expect("create must succeed");
+        assert_eq!(
+            created,
+            json!({"path": "sub/nuevo.txt", "bytes": 4, "created": true})
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("sub/nuevo.txt")).expect("file must exist"),
+            "hola"
+        );
+
+        let overwrote = execute(
+            &fixture.root,
+            "write_file",
+            &json!({"path": "sub/nuevo.txt", "content": "adiós"}),
+        )
+        .expect("overwrite must succeed");
+        assert_eq!(
+            overwrote,
+            json!({"path": "sub/nuevo.txt", "bytes": 6, "created": false})
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("sub/nuevo.txt")).expect("file must exist"),
+            "adiós"
+        );
+    }
+
+    #[test]
+    fn write_file_requires_an_existing_parent_folder() {
+        let fixture = fixture("write-parent");
+
+        let error = execute(
+            &fixture.root,
+            "write_file",
+            &json!({"path": "falta/archivo.txt", "content": "x"}),
+        )
+        .expect_err("missing parent must fail");
+        assert_eq!(error.code, "not_found");
+        assert!(!fixture.root.join("falta").exists());
+    }
+
+    #[test]
+    fn write_file_enforces_the_byte_cap_before_touching_the_disk() {
+        let fixture = fixture("write-cap");
+        fs::write(fixture.root.join("grande.txt"), b"original").expect("fixture must be written");
+        let oversized = "a".repeat(MAX_READ_BYTES as usize + 1);
+
+        let error = execute(
+            &fixture.root,
+            "write_file",
+            &json!({"path": "grande.txt", "content": oversized}),
+        )
+        .expect_err("oversized content must fail");
+        assert_eq!(error.code, "too_large");
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("grande.txt")).expect("file must exist"),
+            "original",
+            "the rejected write must leave the file untouched"
+        );
+
+        let error = execute(
+            &fixture.root,
+            "write_file",
+            &json!({"path": "nuevo-grande.txt", "content": oversized}),
+        )
+        .expect_err("oversized content must fail");
+        assert_eq!(error.code, "too_large");
+        assert!(!fixture.root.join("nuevo-grande.txt").exists());
+    }
+
+    #[test]
+    fn write_file_requires_text_content() {
+        let fixture = fixture("write-args");
+
+        let error = execute(&fixture.root, "write_file", &json!({"path": "ok.txt"}))
+            .expect_err("missing content must fail");
+        assert_eq!(
+            error,
+            OpError::invalid_path("El parámetro content debe ser texto.")
+        );
+        let error = execute(
+            &fixture.root,
+            "write_file",
+            &json!({"path": "ok.txt", "content": 7}),
+        )
+        .expect_err("non-text content must fail");
+        assert_eq!(error.code, "invalid_path");
+    }
+
+    #[test]
+    fn create_folder_creates_and_reports_existing_elements() {
+        let fixture = fixture("create-folder");
+
+        let created = execute(&fixture.root, "create_folder", &json!({"path": "nueva"}))
+            .expect("create must succeed");
+        assert_eq!(created, json!({"path": "nueva"}));
+        assert!(fixture.root.join("nueva").is_dir());
+
+        let again = execute(&fixture.root, "create_folder", &json!({"path": "nueva"}))
+            .expect_err("existing folder must fail");
+        assert_eq!(again.code, "already_exists");
+
+        let existing = execute(&fixture.root, "create_folder", &json!({"path": "sub"}))
+            .expect_err("existing entry must fail");
+        assert_eq!(existing.code, "already_exists");
+
+        assert_eq!(
+            error_code(execute(
+                &fixture.root,
+                "create_folder",
+                &json!({"path": "falta/nueva"})
+            )),
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn move_path_renames_moves_and_never_overwrites() {
+        let fixture = fixture("move");
+
+        let renamed = execute(
+            &fixture.root,
+            "move_path",
+            &json!({"from_path": "b.txt", "to_path": "bravo.txt"}),
+        )
+        .expect("rename must succeed");
+        assert_eq!(
+            renamed,
+            json!({"from_path": "b.txt", "to_path": "bravo.txt"})
+        );
+        assert!(fixture.root.join("bravo.txt").exists());
+        assert!(!fixture.root.join("b.txt").exists());
+
+        let moved = execute(
+            &fixture.root,
+            "move_path",
+            &json!({"from_path": "a.md", "to_path": "sub/a.md"}),
+        )
+        .expect("move must succeed");
+        assert_eq!(moved["to_path"], "sub/a.md");
+        assert!(fixture.root.join("sub/a.md").exists());
+
+        let folder = execute(
+            &fixture.root,
+            "move_path",
+            &json!({"from_path": "sub", "to_path": "renombrada"}),
+        )
+        .expect("folder move must succeed");
+        assert_eq!(folder["to_path"], "renombrada");
+        assert!(fixture.root.join("renombrada/a.md").exists());
+
+        fs::write(fixture.root.join("uno.txt"), b"1").expect("fixture must be written");
+        fs::write(fixture.root.join("dos.txt"), b"2").expect("fixture must be written");
+        let error = execute(
+            &fixture.root,
+            "move_path",
+            &json!({"from_path": "uno.txt", "to_path": "dos.txt"}),
+        )
+        .expect_err("existing destination must fail");
+        assert_eq!(error.code, "already_exists");
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("uno.txt")).expect("file must exist"),
+            "1"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("dos.txt")).expect("file must exist"),
+            "2"
+        );
+    }
+
+    #[test]
+    fn move_path_requires_an_existing_source_and_destination_parent() {
+        let fixture = fixture("move-missing");
+
+        assert_eq!(
+            error_code(execute(
+                &fixture.root,
+                "move_path",
+                &json!({"from_path": "fantasma.txt", "to_path": "ok.txt"})
+            )),
+            "not_found"
+        );
+        assert_eq!(
+            error_code(execute(
+                &fixture.root,
+                "move_path",
+                &json!({"from_path": "a.md", "to_path": "falta/a.md"})
+            )),
+            "not_found"
+        );
+        assert!(fixture.root.join("a.md").exists());
+    }
+
+    #[test]
+    fn delete_path_removes_files_and_folders_reporting_entries() {
+        let fixture = fixture("delete");
+
+        let deleted = execute(&fixture.root, "delete_path", &json!({"path": "b.txt"}))
+            .expect("delete must succeed");
+        assert_eq!(deleted, json!({"path": "b.txt", "removed": 1}));
+        assert!(!fixture.root.join("b.txt").exists());
+
+        // `sub` holds `c.txt`: the folder plus its child are two entries.
+        let deleted = execute(&fixture.root, "delete_path", &json!({"path": "sub"}))
+            .expect("delete must succeed");
+        assert_eq!(deleted, json!({"path": "sub", "removed": 2}));
+        assert!(!fixture.root.join("sub").exists());
+
+        assert_eq!(
+            error_code(execute(
+                &fixture.root,
+                "delete_path",
+                &json!({"path": "sub"})
+            )),
+            "not_found"
+        );
+    }
+
+    #[test]
+    fn write_ops_reject_escaping_paths() {
+        let fixture = fixture("write-jail");
+
+        for relative in ["../fuera.txt", "/etc/passwd", "a\0b"] {
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "write_file",
+                    &json!({"path": relative, "content": "x"})
+                )),
+                "invalid_path",
+                "relative={relative:?}"
+            );
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "create_folder",
+                    &json!({"path": relative})
+                )),
+                "invalid_path",
+                "relative={relative:?}"
+            );
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "delete_path",
+                    &json!({"path": relative})
+                )),
+                "invalid_path",
+                "relative={relative:?}"
+            );
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "move_path",
+                    &json!({"from_path": relative, "to_path": "ok.txt"})
+                )),
+                "invalid_path",
+                "from={relative:?}"
+            );
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "move_path",
+                    &json!({"from_path": "a.md", "to_path": relative})
+                )),
+                "invalid_path",
+                "to={relative:?}"
+            );
+        }
+
+        let overlong = "a".repeat(MAX_RELATIVE_PATH_LEN + 1);
+        assert_eq!(
+            error_code(execute(
+                &fixture.root,
+                "write_file",
+                &json!({"path": overlong, "content": "x"})
+            )),
+            "invalid_path"
+        );
+    }
+
+    #[test]
+    fn write_ops_cannot_target_the_workspace_root() {
+        let fixture = fixture("write-root");
+
+        for relative in ["", "."] {
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "write_file",
+                    &json!({"path": relative, "content": "x"})
+                )),
+                "invalid_path",
+                "relative={relative:?}"
+            );
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "create_folder",
+                    &json!({"path": relative})
+                )),
+                "invalid_path",
+                "relative={relative:?}"
+            );
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "delete_path",
+                    &json!({"path": relative})
+                )),
+                "invalid_path",
+                "relative={relative:?}"
+            );
+            assert_eq!(
+                error_code(execute(
+                    &fixture.root,
+                    "move_path",
+                    &json!({"from_path": "a.md", "to_path": relative})
+                )),
+                "invalid_path",
+                "to={relative:?}"
+            );
+        }
+        assert!(
+            fixture.root.join("a.md").exists(),
+            "the workspace must stay intact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_file_never_writes_through_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture("write-symlink");
+        symlink(
+            fixture._dir.path().join("outside.txt"),
+            fixture.root.join("enlace.txt"),
+        )
+        .expect("symlink must be created");
+
+        let error = execute(
+            &fixture.root,
+            "write_file",
+            &json!({"path": "enlace.txt", "content": "nuevo"}),
+        )
+        .expect_err("writing through a symlink must fail");
+        assert_eq!(error.code, "invalid_path");
+        assert_eq!(
+            fs::read_to_string(fixture._dir.path().join("outside.txt")).expect("file must exist"),
+            "secret",
+            "the outside target must stay untouched"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn move_path_moves_a_symlink_as_a_link() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture("move-symlink");
+        symlink(fixture.root.join("a.md"), fixture.root.join("enlace.md"))
+            .expect("symlink must be created");
+
+        let moved = execute(
+            &fixture.root,
+            "move_path",
+            &json!({"from_path": "enlace.md", "to_path": "sub/enlace.md"}),
+        )
+        .expect("link move must succeed");
+        assert_eq!(
+            moved,
+            json!({"from_path": "enlace.md", "to_path": "sub/enlace.md"})
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.root.join("a.md")).expect("file must exist"),
+            "alfa",
+            "the link target must stay in place"
+        );
+        assert!(fs::symlink_metadata(fixture.root.join("sub/enlace.md"))
+            .expect("moved link must exist")
+            .file_type()
+            .is_symlink());
+
+        symlink(fixture.root.join("a.md"), fixture.root.join("ocupado.md"))
+            .expect("symlink must be created");
+        let error = execute(
+            &fixture.root,
+            "move_path",
+            &json!({"from_path": "b.txt", "to_path": "ocupado.md"}),
+        )
+        .expect_err("existing symlink destination must fail");
+        assert_eq!(error.code, "already_exists");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn delete_path_never_follows_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = fixture("delete-symlink");
+        let outside_dir = fixture._dir.path().join("outside-delete");
+        fs::create_dir_all(&outside_dir).expect("outside directory must be created");
+        fs::write(outside_dir.join("secret.txt"), b"secret").expect("fixture must be written");
+
+        let folder = fixture.root.join("todo");
+        fs::create_dir_all(folder.join("interno")).expect("fixture directory must be created");
+        fs::write(folder.join("interno").join("x.txt"), b"x").expect("fixture must be written");
+        symlink(&outside_dir, folder.join("enlace")).expect("symlink must be created");
+
+        let deleted = execute(&fixture.root, "delete_path", &json!({"path": "todo"}))
+            .expect("delete must succeed");
+        // todo + interno + x.txt + enlace = 4 entries, outside target untouched.
+        assert_eq!(deleted, json!({"path": "todo", "removed": 4}));
+        assert!(!folder.exists());
+        assert!(
+            outside_dir.join("secret.txt").exists(),
+            "the symlink target outside the root must survive"
+        );
     }
 }
 
