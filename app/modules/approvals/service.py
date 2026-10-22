@@ -94,6 +94,7 @@ from app.modules.approvals.models import ApprovalRequest, ApprovalStatus
 from app.modules.audit.models import ActorType
 from app.modules.audit.service import persist_event, stage_event
 from app.modules.catalog.service import active_module_keys
+from app.modules.connectors.hub import ConnectorRequester
 from app.modules.documents.storage import DocumentStorage
 from app.modules.identity.deps import TenantContext
 from app.modules.identity.models import UserRole
@@ -513,6 +514,7 @@ async def execute_approved_action(
     storage: DocumentStorage | None = None,
     credentials_key: str | None = None,
     settings: Settings | None = None,
+    connectors: ConnectorRequester | None = None,
 ) -> ApprovalExecution:
     """Run an approved request's stored call at most once (commits).
 
@@ -526,9 +528,11 @@ async def execute_approved_action(
     Then an atomic ``approved → executing`` claim is committed (a loser of a
     race gets :class:`ApprovalStateError`), ``execute_tool`` runs the stored
     payload with a freshly minted single-use grant (and ``llm``/``storage``
-    plus ``credentials_key``/``settings`` in the tool context — without the
-    key, a tool decrypting per-user provider credentials fails its precheck
-    closed) gated by the tenant's *current* module activations
+    plus ``credentials_key``/``settings`` and the ``connectors`` hub in the
+    tool context — without the key, a tool decrypting per-user provider
+    credentials fails its precheck closed, and without the hub a local-folder
+    tool fails its precheck offline) gated by the tenant's *current* module
+    activations
     (re-read with ``active_module_keys`` once per execution: a tool of a
     module deactivated since the approval is refused there as
     ``inactive_module``), and the request ends ``executed`` (with the
@@ -585,6 +589,7 @@ async def execute_approved_action(
         active_modules=active_modules,
         credentials_key=credentials_key,
         settings=settings,
+        connectors=connectors,
     )
     if result.status == "ok":
         outcome = {

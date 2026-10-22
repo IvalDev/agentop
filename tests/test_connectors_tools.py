@@ -6,16 +6,37 @@ touches the filesystem: it validates the relative path, forwards the operation,
 and turns the connector's bytes into text (``.txt``/``.md`` inline, ``.pdf``
 and ``.docx`` through the documents extractor in a thread). Nothing is
 persisted.
+
+Contract L2 (S6): ``write_file``, ``create_folder``, ``move_path``, and
+``delete_path`` are approval-gated ACTION tools: their precheck refuses an
+offline workspace, an escaped path, or oversized content *before* any approval
+request exists, and the approved input is exactly what reaches the connector.
 """
 
 import base64
+from datetime import UTC, datetime, timedelta
 from io import BytesIO
+from uuid import UUID
 
 import pytest
 from docx import Document as DocxDocument
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
+from app.core.config import Settings
 from app.core.db import Database
+from app.modules.approvals.exceptions import (
+    ApprovalExpiredError,
+    ApprovalForbiddenError,
+    ApprovalStateError,
+)
+from app.modules.approvals.models import ApprovalStatus
+from app.modules.approvals.service import (
+    approve_request,
+    create_approval_request,
+    execute_approved_action,
+    get_approval_request,
+    reject_request,
+)
 from app.modules.connectors import tools as connector_tools
 from app.modules.connectors.hub import ConnectorResponseError
 from app.modules.connectors.tools import (
@@ -46,9 +67,23 @@ INVALID_PATH = "La ruta no es válida. Usa una ruta relativa dentro de la carpet
 UNSUPPORTED_EXTENSION = "Solo se pueden leer archivos .txt, .md, .pdf o .docx."
 TOO_LARGE = "El archivo supera el límite de 5 MB."
 READ_FAILED = "No se pudo leer el archivo."
+ALREADY_EXISTS = "Ya existe un elemento con ese nombre en la carpeta concedida."
+CONTENT_TOO_LARGE = "El contenido supera el límite de 50 000 caracteres."
 MAX_FILE_BYTES = 5 * 1024 * 1024
 MAX_TEXT_CHARS = 50_000
 MAX_LIST_ENTRIES = 1_000
+
+#: Inputs of the four L2 write tools, as the model would send them.
+WRITE_CALLS = {
+    "write_file": {"path": "notes.txt", "content": "hola"},
+    "create_folder": {"path": "docs"},
+    "move_path": {"from_path": "a.txt", "to_path": "b.txt"},
+    "delete_path": {"path": "a.txt"},
+}
+
+T0 = datetime(2026, 10, 20, 9, 0, tzinfo=UTC)
+TTL_SECONDS = 3600
+APPROVAL_SETTINGS = Settings(approval_ttl_seconds=TTL_SECONDS)
 
 
 class FakeRequester:
@@ -69,9 +104,7 @@ class FakeRequester:
     def is_online(self, user_id: int) -> bool:
         return self.online
 
-    async def request(
-        self, user_id: int, op: str, args: dict, timeout: float = 30.0
-    ) -> dict:
+    async def request(self, user_id: int, op: str, args: dict, timeout: float = 30.0) -> dict:
         self.calls.append((user_id, op, args, timeout))
         if self.error is not None:
             raise self.error
@@ -250,9 +283,7 @@ async def test_the_executor_puts_the_connector_hub_in_the_tool_context(
     user = seeded_users["viewer@acme.test"]
 
     async with seeded_db.sessionmaker() as session:
-        result = await execute_tool(
-            registry, session, user, "peek_hub", {}, connectors=requester
-        )
+        result = await execute_tool(registry, session, user, "peek_hub", {}, connectors=requester)
 
     assert result.status == "ok"
     assert captured == [requester]
@@ -291,9 +322,7 @@ async def test_list_files_handler_fails_readably_when_the_device_went_offline(
     user = seeded_users["viewer@acme.test"]
 
     with pytest.raises(ToolPrecheckError) as exc:
-        await list_files(
-            context(FakeRequester(online=False), user), ListFilesInput()
-        )
+        await list_files(context(FakeRequester(online=False), user), ListFilesInput())
 
     assert exc.value.reason == OFFLINE
 
@@ -430,3 +459,423 @@ def test_connector_tool_inputs_forbid_extra_fields() -> None:
         assert issubclass(model, BaseModel)
         assert model.model_config.get("extra") == "forbid"
         assert set(model.model_fields) == {"path"}
+
+
+# --- L2 writes (S6): declaration, prechecks, handlers, and the approval gate ---
+
+
+def write_registry() -> ToolRegistry:
+    """A local registry carrying the production connector reads and writes."""
+    registry = ToolRegistry()
+    register_connector_tools(registry)
+    return registry
+
+
+async def _request_approval(
+    db: Database, registry: ToolRegistry, user: CurrentUser, tool_name: str, raw_input: dict
+) -> UUID:
+    """Persist the pending approval a chat turn would leave behind."""
+    async with db.sessionmaker() as session:
+        request = await create_approval_request(
+            session,
+            registry,
+            user,
+            tool_name,
+            raw_input,
+            settings=APPROVAL_SETTINGS,
+            now=T0,
+        )
+        await session.commit()
+        return request.id
+
+
+async def _approve(
+    db: Database, registry: ToolRegistry, user: CurrentUser, request_id: UUID
+) -> None:
+    async with db.sessionmaker() as session:
+        await approve_request(session, user, request_id, now=T0, registry=registry)
+
+
+async def _execute_approved(
+    db: Database,
+    registry: ToolRegistry,
+    user: CurrentUser,
+    request_id: UUID,
+    requester,
+    now: datetime = T0,
+):
+    async with db.sessionmaker() as session:
+        return await execute_approved_action(
+            session, registry, user, request_id, now=now, connectors=requester
+        )
+
+
+@pytest.mark.parametrize("name", sorted(WRITE_CALLS))
+def test_write_tools_are_viewer_actions_that_always_need_approval(name: str) -> None:
+    """The four writes are ACTION + REQUIRE_APPROVAL, declared once each."""
+    spec = write_registry().get(name)
+
+    assert spec.kind is ToolKind.ACTION
+    assert spec.approval_policy is ApprovalPolicy.REQUIRE_APPROVAL
+    assert spec.required_role is UserRole.VIEWER
+    assert spec.requester_only_approval is True
+    assert spec.module is None
+    assert spec.precheck is not None
+    assert spec.output_model is not None
+
+
+def test_write_tool_inputs_are_closed_and_named_per_contract() -> None:
+    """Each write takes exactly the fields of the L2 contract and nothing else."""
+    registry = write_registry()
+    expected = {
+        "write_file": {"path", "content"},
+        "create_folder": {"path"},
+        "move_path": {"from_path", "to_path"},
+        "delete_path": {"path"},
+    }
+
+    for name, fields in expected.items():
+        model = registry.get(name).input_model
+        assert model.model_config.get("extra") == "forbid", name
+        assert set(model.model_fields) == fields, name
+
+
+@pytest.mark.parametrize(
+    ("tool", "field"),
+    [
+        ("write_file", "path"),
+        ("create_folder", "path"),
+        ("move_path", "from_path"),
+        ("move_path", "to_path"),
+        ("delete_path", "path"),
+    ],
+)
+def test_write_tool_paths_are_capped_at_1024_characters(tool: str, field: str) -> None:
+    """A relative path longer than the contract allows never reaches a precheck."""
+    registry = write_registry()
+    raw_input = dict(WRITE_CALLS[tool])
+    raw_input[field] = "x" * 1025
+    model = registry.get(tool).input_model
+
+    with pytest.raises(ValidationError):
+        model.model_validate(raw_input)
+
+
+@pytest.mark.parametrize("tool", sorted(WRITE_CALLS))
+async def test_write_tool_prechecks_refuse_an_offline_workspace(
+    seeded_users: dict[str, CurrentUser], tool: str
+) -> None:
+    """Offline is a precheck refusal for every write, before any connector call."""
+    user = seeded_users["viewer@acme.test"]
+    spec = write_registry().get(tool)
+    requester = FakeRequester(online=False)
+    payload = spec.input_model.model_validate(WRITE_CALLS[tool])
+
+    with pytest.raises(ToolPrecheckError) as exc:
+        await spec.precheck(context(requester, user), payload)
+
+    assert exc.value.reason == OFFLINE
+    assert requester.calls == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",
+        "C:\\Windows\\win.ini",
+        "../secret.txt",
+        "notes/../../secret.txt",
+        "notes/..",
+        "bad\x00name.txt",
+    ],
+)
+async def test_write_tools_reject_paths_outside_the_workspace(
+    seeded_users: dict[str, CurrentUser], path: str
+) -> None:
+    """Every path field of every write applies the same jail rules."""
+    user = seeded_users["viewer@acme.test"]
+    registry = write_registry()
+    cases = (
+        ("write_file", {"path": path, "content": "hola"}),
+        ("create_folder", {"path": path}),
+        ("move_path", {"from_path": path, "to_path": "target.txt"}),
+        ("move_path", {"from_path": "source.txt", "to_path": path}),
+        ("delete_path", {"path": path}),
+    )
+
+    for tool, raw_input in cases:
+        spec = registry.get(tool)
+        payload = spec.input_model.model_validate(raw_input)
+        with pytest.raises(ToolPrecheckError) as exc:
+            await spec.precheck(context(FakeRequester(), user), payload)
+        assert exc.value.reason == INVALID_PATH
+
+
+async def test_write_file_accepts_fifty_thousand_characters_and_rejects_one_more(
+    seeded_users: dict[str, CurrentUser],
+) -> None:
+    """The content limit is exactly 50 000 characters, refused with the contract text."""
+    user = seeded_users["viewer@acme.test"]
+    spec = write_registry().get("write_file")
+    requester = FakeRequester(result={"path": "long.txt", "bytes": 0, "created": True})
+
+    await spec.precheck(
+        context(requester, user),
+        spec.input_model.model_validate({"path": "long.txt", "content": "a" * MAX_TEXT_CHARS}),
+    )
+    assert requester.calls == []
+
+    with pytest.raises(ToolPrecheckError) as exc:
+        await spec.precheck(
+            context(requester, user),
+            spec.input_model.model_validate(
+                {"path": "long.txt", "content": "a" * (MAX_TEXT_CHARS + 1)}
+            ),
+        )
+    assert exc.value.reason == CONTENT_TOO_LARGE
+    assert requester.calls == []
+
+
+@pytest.mark.parametrize(
+    ("online", "raw_input", "reason"),
+    [
+        (False, {"path": "notes.txt", "content": "hola"}, OFFLINE),
+        (True, {"path": "../secret.txt", "content": "hola"}, INVALID_PATH),
+        (True, {"path": "big.txt", "content": "a" * (MAX_TEXT_CHARS + 1)}, CONTENT_TOO_LARGE),
+    ],
+)
+async def test_a_refused_write_precheck_never_reaches_the_approval_gate(
+    seeded_db: Database,
+    seeded_users: dict[str, CurrentUser],
+    online: bool,
+    raw_input: dict,
+    reason: str,
+) -> None:
+    """No approval request exists for an offline device, a bad path, or too much text."""
+    registry = write_registry()
+    requester = FakeRequester(online=online)
+    user = seeded_users["viewer@acme.test"]
+
+    async with seeded_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry, session, user, "write_file", raw_input, connectors=requester
+        )
+
+    assert result.status == "error"
+    assert result.error_kind == "precheck"
+    assert result.error == f"precheck_failed: {reason}"
+    assert result.approval_request is None
+    assert requester.calls == []
+
+
+async def test_write_file_creates_or_overwrites_through_the_connector(
+    seeded_users: dict[str, CurrentUser],
+) -> None:
+    """The server forwards path and content verbatim and echoes the byte count."""
+    user = seeded_users["viewer@acme.test"]
+    requester = FakeRequester(result={"path": "docs/notes.txt", "bytes": 4, "created": True})
+
+    output = await connector_tools.write_file(
+        context(requester, user),
+        connector_tools.WriteFileInput(path="docs/notes.txt", content="hola"),
+    )
+
+    assert (output.path, output.bytes, output.created) == ("docs/notes.txt", 4, True)
+    assert requester.calls == [
+        (user.id, "write_file", {"path": "docs/notes.txt", "content": "hola"}, 30.0)
+    ]
+
+
+async def test_create_folder_and_move_path_forward_the_relative_paths(
+    seeded_users: dict[str, CurrentUser],
+) -> None:
+    """Folder creation and moves send exactly their contract arguments."""
+    user = seeded_users["viewer@acme.test"]
+
+    folder_requester = FakeRequester(result={"path": "docs"})
+    folder = await connector_tools.create_folder(
+        context(folder_requester, user), connector_tools.CreateFolderInput(path="docs")
+    )
+    assert folder.path == "docs"
+    assert folder_requester.calls == [(user.id, "create_folder", {"path": "docs"}, 30.0)]
+
+    move_requester = FakeRequester(result={"from_path": "a.txt", "to_path": "b.txt"})
+    moved = await connector_tools.move_path(
+        context(move_requester, user),
+        connector_tools.MovePathInput(from_path="a.txt", to_path="b.txt"),
+    )
+    assert (moved.from_path, moved.to_path) == ("a.txt", "b.txt")
+    assert move_requester.calls == [
+        (user.id, "move_path", {"from_path": "a.txt", "to_path": "b.txt"}, 30.0)
+    ]
+
+
+async def test_delete_path_returns_the_number_of_removed_entries(
+    seeded_users: dict[str, CurrentUser],
+) -> None:
+    """A recursive delete reports how many entries the connector removed."""
+    user = seeded_users["viewer@acme.test"]
+    requester = FakeRequester(result={"path": "docs", "removed": 3})
+
+    output = await connector_tools.delete_path(
+        context(requester, user), connector_tools.DeletePathInput(path="docs")
+    )
+
+    assert (output.path, output.removed) == ("docs", 3)
+    assert requester.calls == [(user.id, "delete_path", {"path": "docs"}, 30.0)]
+
+
+@pytest.mark.parametrize(
+    ("tool", "payload"),
+    [
+        ("create_folder", {"path": "docs"}),
+        ("move_path", {"from_path": "a.txt", "to_path": "b.txt"}),
+    ],
+)
+async def test_already_exists_is_a_readable_refusal(
+    seeded_users: dict[str, CurrentUser], tool: str, payload: dict
+) -> None:
+    """The connector decides existence; the server only translates its code."""
+    user = seeded_users["viewer@acme.test"]
+    spec = write_registry().get(tool)
+    requester = FakeRequester(error=ConnectorResponseError("already_exists", "exists"))
+
+    with pytest.raises(ToolPrecheckError) as exc:
+        await getattr(connector_tools, tool)(
+            context(requester, user), spec.input_model.model_validate(payload)
+        )
+
+    assert exc.value.reason == ALREADY_EXISTS
+
+
+def test_existing_read_tools_keep_their_auto_extract_declaration() -> None:
+    """Registering the four writes leaves the L1 reads auto-approved and read-only."""
+    registry = write_registry()
+
+    for name in ("list_files", "read_file"):
+        spec = registry.get(name)
+        assert spec.kind is ToolKind.EXTRACT
+        assert spec.approval_policy is ApprovalPolicy.AUTO
+        assert spec.requester_only_approval is False
+        assert spec.precheck is not None
+
+
+@pytest.mark.parametrize("tool", sorted(WRITE_CALLS))
+async def test_a_write_without_a_grant_asks_for_approval_and_touches_nothing(
+    seeded_db: Database, seeded_users: dict[str, CurrentUser], tool: str
+) -> None:
+    """Every write stops at ``approval_required``; the connector is never called."""
+    registry = write_registry()
+    requester = FakeRequester(result={})
+    user = seeded_users["viewer@acme.test"]
+
+    async with seeded_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry, session, user, tool, WRITE_CALLS[tool], connectors=requester
+        )
+
+    assert result.status == "approval_required"
+    assert result.approval_request is not None
+    assert result.approval_request.tool_name == tool
+    assert result.approval_request.input == WRITE_CALLS[tool]
+    assert result.approval_request.required_role == "viewer"
+    assert requester.calls == []
+
+
+async def test_an_approved_write_executes_exactly_the_approved_input(
+    seeded_db: Database, seeded_users: dict[str, CurrentUser]
+) -> None:
+    """The grant the approvals service mints runs the stored payload once."""
+    registry = write_registry()
+    viewer = seeded_users["viewer@acme.test"]
+    approved_input = {"path": "notes.txt", "content": "hola"}
+    requester = FakeRequester(result={"path": "notes.txt", "bytes": 4, "created": True})
+    request_id = await _request_approval(seeded_db, registry, viewer, "write_file", approved_input)
+    await _approve(seeded_db, registry, viewer, request_id)
+
+    outcome = await _execute_approved(seeded_db, registry, viewer, request_id, requester)
+
+    assert outcome.request.status is ApprovalStatus.EXECUTED
+    assert outcome.request.execution_result == {
+        "path": "notes.txt",
+        "bytes": 4,
+        "created": True,
+    }
+    assert outcome.result.status == "ok"
+    assert outcome.result.output.model_dump() == {
+        "path": "notes.txt",
+        "bytes": 4,
+        "created": True,
+    }
+    assert requester.calls == [(viewer.id, "write_file", approved_input, 30.0)]
+
+
+async def test_only_the_requester_may_approve_a_write(
+    seeded_db: Database, seeded_users: dict[str, CurrentUser]
+) -> None:
+    """The granted folder belongs to the requester: another user cannot approve."""
+    registry = write_registry()
+    viewer = seeded_users["viewer@acme.test"]
+    admin = seeded_users["admin@acme.test"]
+    requester = FakeRequester(result={})
+    request_id = await _request_approval(
+        seeded_db, registry, viewer, "write_file", {"path": "notes.txt", "content": "hola"}
+    )
+
+    with pytest.raises(ApprovalForbiddenError):
+        await _approve(seeded_db, registry, admin, request_id)
+
+    assert requester.calls == []
+    async with seeded_db.sessionmaker() as session:
+        stored = await get_approval_request(session, viewer, request_id)
+    assert stored.status is ApprovalStatus.PENDING
+
+
+async def test_a_rejected_write_executes_nothing(
+    seeded_db: Database, seeded_users: dict[str, CurrentUser]
+) -> None:
+    """Rejection ends the request; the connector never sees the call."""
+    registry = write_registry()
+    viewer = seeded_users["viewer@acme.test"]
+    requester = FakeRequester(result={})
+    request_id = await _request_approval(
+        seeded_db, registry, viewer, "write_file", {"path": "notes.txt", "content": "hola"}
+    )
+    async with seeded_db.sessionmaker() as session:
+        await reject_request(session, viewer, request_id, reason="no", now=T0, registry=registry)
+
+    with pytest.raises(ApprovalStateError):
+        await _execute_approved(seeded_db, registry, viewer, request_id, requester)
+
+    assert requester.calls == []
+    async with seeded_db.sessionmaker() as session:
+        stored = await get_approval_request(session, viewer, request_id)
+    assert stored.status is ApprovalStatus.REJECTED
+
+
+async def test_an_expired_write_executes_nothing(
+    seeded_db: Database, seeded_users: dict[str, CurrentUser]
+) -> None:
+    """Expiry is detected at execution time; the connector never sees the call."""
+    registry = write_registry()
+    viewer = seeded_users["viewer@acme.test"]
+    requester = FakeRequester(result={})
+    request_id = await _request_approval(
+        seeded_db, registry, viewer, "write_file", {"path": "notes.txt", "content": "hola"}
+    )
+    await _approve(seeded_db, registry, viewer, request_id)
+
+    with pytest.raises(ApprovalExpiredError):
+        await _execute_approved(
+            seeded_db,
+            registry,
+            viewer,
+            request_id,
+            requester,
+            now=T0 + timedelta(seconds=TTL_SECONDS + 1),
+        )
+
+    assert requester.calls == []
+    async with seeded_db.sessionmaker() as session:
+        stored = await get_approval_request(session, viewer, request_id)
+    assert stored.status is ApprovalStatus.EXPIRED

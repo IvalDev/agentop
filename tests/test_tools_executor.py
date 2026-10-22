@@ -22,7 +22,11 @@ from app.modules.identity.deps import CurrentUser
 from app.modules.identity.models import Tenant, UserRole
 from app.modules.retrieval.embeddings import EmbeddingError, FakeEmbeddingProvider
 from app.modules.tools import builtin
-from app.modules.tools.exceptions import ToolApprovalRoleError, ToolPrecheckError
+from app.modules.tools.exceptions import (
+    ToolApprovalRoleError,
+    ToolPrecheckError,
+    ToolRefusalError,
+)
 from app.modules.tools.executor import compute_action_key, execute_tool, resolve_approval_role
 from app.modules.tools.registry import (
     ApprovalPolicy,
@@ -686,6 +690,53 @@ async def test_unexpected_precheck_exception_is_masked_as_tool_failed(
     assert await audit_log(identity_db, action="tool.precheck_failed") == []
 
 
+async def test_handler_refusal_is_reported_like_a_precheck_refusal(
+    identity_db: Database, audit_log
+) -> None:
+    """A handler's ``ToolRefusalError`` reaches the caller as ``precheck_failed: <reason>``."""
+    handler = SpyHandler({"sent": True}, error=ToolRefusalError("folder already exists"))
+    registry = gated_registry(handler=handler)
+    key = compute_action_key("gated_action", DemoInput(value=3))
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry,
+            session,
+            make_user(),
+            "gated_action",
+            {"value": 3},
+            approval_grant=mint_grant(uuid4(), key),
+        )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == "precheck_failed: folder already exists"
+    assert len(handler.calls) == 1
+    [refused] = await audit_log(identity_db, action="tool.precheck_failed")
+    assert refused.result == {"error": "precheck_failed", "reason": "folder already exists"}
+    assert await audit_log(identity_db, action="tool.failed") == []
+
+
+async def test_plain_precheck_error_raised_by_a_handler_stays_masked(
+    identity_db: Database, audit_log
+) -> None:
+    """Only ``ToolRefusalError`` escapes a handler; a bare ``ToolPrecheckError`` is masked."""
+    handler = SpyHandler({"sent": True}, error=ToolPrecheckError("token expired"))
+    registry = gated_registry(handler=handler)
+    key = compute_action_key("gated_action", DemoInput(value=3))
+    async with identity_db.sessionmaker() as session:
+        result = await execute_tool(
+            registry,
+            session,
+            make_user(),
+            "gated_action",
+            {"value": 3},
+            approval_grant=mint_grant(uuid4(), key),
+        )
+
+    assert (result.status, result.error_kind, result.error) == ("error", "execution", "tool_failed")
+    [failed] = await audit_log(identity_db, action="tool.failed")
+    assert failed.result == {"error": "token expired"}
+
+
 # --- Module gating (T2) -------------------------------------------------------
 
 
@@ -786,6 +837,10 @@ BUILTIN_TOOL_ALLOWLIST = {
     "search_documents",
     "list_files",
     "read_file",
+    "write_file",
+    "create_folder",
+    "move_path",
+    "delete_path",
     "list_events",
     "create_event",
     "cancel_event",
@@ -802,7 +857,14 @@ FORBIDDEN_INPUT_FIELDS = {"command", "cmd", "shell", "script", "sql", "path", "f
 
 #: Connector tools take a *relative* folder path on purpose: it is validated
 #: server-side and jailed again by the local connector.
-CONNECTOR_PATH_TOOLS = {"list_files", "read_file"}
+CONNECTOR_PATH_TOOLS = {
+    "list_files",
+    "read_file",
+    "write_file",
+    "create_folder",
+    "move_path",
+    "delete_path",
+}
 
 
 async def _tenant_id(db: Database, slug: str) -> int:

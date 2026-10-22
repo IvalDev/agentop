@@ -21,6 +21,7 @@ from app.core.db import Database
 from app.main import create_app
 from app.modules.approvals.models import ApprovalRequest
 from app.modules.approvals.service import approve_request, create_approval_request
+from app.modules.tools.exceptions import ToolPrecheckError
 
 TTL_SECONDS = 3600
 APPROVAL_SETTINGS = Settings(approval_ttl_seconds=TTL_SECONDS)
@@ -46,6 +47,27 @@ async def approvals_client(approvals_app: FastAPI) -> AsyncClient:
     transport = ASGITransport(app=approvals_app)
     async with AsyncClient(transport=transport, base_url="http://test") as async_client:
         yield async_client
+
+
+@pytest.fixture
+def hub_note(approval_tools) -> list:
+    """``send_note`` copy whose precheck refuses until the live hub reaches its context.
+
+    L2/S6 wires the process workspace hub into approve → execute, so a folder
+    write approved over HTTP must run with the same ``app.state.connectors``
+    object the chat route passes to ``execute_tool``.
+    """
+    seen: list = []
+
+    async def require_hub(context, validated_input) -> None:
+        seen.append(context.connectors)
+        if context.connectors is None:
+            raise ToolPrecheckError("El espacio de trabajo no está conectado.")
+
+    approval_tools.registry.register(
+        replace(approval_tools.registry.get("send_note"), name="hub_note", precheck=require_hub)
+    )
+    return seen
 
 
 async def _headers(
@@ -218,6 +240,28 @@ async def test_requester_approves_and_executes_exactly_once(
     assert replayed.status_code == 409
     assert len(approval_tools.spy.calls) == 1
     assert approval_tools.spy.calls[0][2].model_dump() == {**NOTE, "priority": 1}
+
+
+async def test_execute_hands_the_tool_the_process_connector_hub(
+    approvals_client: AsyncClient,
+    approvals_app: FastAPI,
+    seeded_db: Database,
+    seeded_users,
+    approval_tools,
+    hub_note: list,
+) -> None:
+    """POST /{id}/execute gives the tool the app's hub (L2/S6); without it the write dies."""
+    admin = seeded_users["admin@acme.test"]
+    request_id = await _create(seeded_db, approval_tools, admin, tool="hub_note")
+    headers = await _admin(approvals_client)
+    approved = await approvals_client.post(f"{BASE}/{request_id}/approve", headers=headers)
+
+    executed = await approvals_client.post(f"{BASE}/{request_id}/execute", headers=headers)
+
+    assert approved.status_code == 200
+    assert executed.status_code == 200
+    assert executed.json()["status"] == "executed"
+    assert hub_note == [approvals_app.state.connectors]
 
 
 async def test_second_decision_conflicts(

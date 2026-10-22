@@ -1,4 +1,4 @@
-"""Read-only folder tools served by the user's local connector (L1).
+"""Folder tools served by the user's local connector (L1 reads, L2 writes).
 
 The server never opens a file: ``list_files`` and ``read_file`` validate a
 relative path, ask the online connector for it, and (for reads) turn the
@@ -6,8 +6,23 @@ returned bytes into text. ``.txt``/``.md`` decode as UTF-8; ``.pdf``/``.docx``
 use :func:`app.modules.documents.extract.extract_text` in a worker thread.
 Text is clipped to 50 000 characters and nothing is persisted.
 
-Refusals are :class:`ToolPrecheckError` values so the executor shows the model
-a short, user-safe reason (the offline message is the L1 contract text).
+The L2 writes — ``write_file``, ``create_folder``, ``move_path``, and
+``delete_path`` — are ``ACTION`` tools that always require a human approval
+(``REQUIRE_APPROVAL``, requester-only because the folder belongs to that
+user). Their precheck refuses an offline workspace, an escaped path, or a
+``content`` over 50 000 characters *before* any approval request exists; the
+approved input then travels verbatim to the connector, which owns existence
+(``already_exists``/``not_found``) and the path jail on the device. The server
+never learns the absolute path and keeps no copy of the folder: a write's
+content lives only in its approval request and audit trail, like the body of
+an email the agent sends.
+
+Precheck refusals are :class:`ToolPrecheckError` values and the handlers'
+refusals (the connector's answer, an invalid response) are
+:class:`ToolRefusalError` values, so the executor shows the human and the model
+a short, user-safe reason either way (the offline message is the L1 contract
+text). Writes get their own wording for the connector's ``not_found``,
+``permission_denied``, and ``io_error``, and never target the granted root.
 """
 
 import asyncio
@@ -28,7 +43,7 @@ from app.modules.connectors.hub import (
 )
 from app.modules.documents.extract import DOCX_CONTENT_TYPE, extract_text
 from app.modules.identity.models import UserRole
-from app.modules.tools.exceptions import ToolPrecheckError
+from app.modules.tools.exceptions import ToolPrecheckError, ToolRefusalError
 from app.modules.tools.registry import (
     ApprovalPolicy,
     ToolContext,
@@ -51,23 +66,32 @@ _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 WORKSPACE_OFFLINE_MESSAGE = (
     "El espacio de trabajo no está conectado. Abre el widget y conecta tu carpeta."
 )
-INVALID_PATH_MESSAGE = (
-    "La ruta no es válida. Usa una ruta relativa dentro de la carpeta concedida."
-)
+INVALID_PATH_MESSAGE = "La ruta no es válida. Usa una ruta relativa dentro de la carpeta concedida."
 UNSUPPORTED_EXTENSION_MESSAGE = "Solo se pueden leer archivos .txt, .md, .pdf o .docx."
 FILE_TOO_LARGE_MESSAGE = "El archivo supera el límite de 5 MB."
 READ_FAILED_MESSAGE = "No se pudo leer el archivo."
 INVALID_RESPONSE_MESSAGE = "El conector devolvió una respuesta no válida."
+CONTENT_TOO_LARGE_MESSAGE = "El contenido supera el límite de 50 000 caracteres."
+ALREADY_EXISTS_MESSAGE = "Ya existe un elemento con ese nombre en la carpeta concedida."
 _FILE_NOT_FOUND_MESSAGE = "El archivo no existe."
 _PERMISSION_DENIED_MESSAGE = "No hay permiso para acceder al archivo."
 
 _CONNECTOR_ERROR_MESSAGES = {
     "invalid_path": INVALID_PATH_MESSAGE,
     "not_found": _FILE_NOT_FOUND_MESSAGE,
+    "already_exists": ALREADY_EXISTS_MESSAGE,
     "permission_denied": _PERMISSION_DENIED_MESSAGE,
     "too_large": FILE_TOO_LARGE_MESSAGE,
     "io_error": READ_FAILED_MESSAGE,
 }
+#: Write wording for the codes whose read message would mislead after a write.
+_WRITE_ERROR_MESSAGES = {
+    **_CONNECTOR_ERROR_MESSAGES,
+    "not_found": "No existe ningún elemento con esa ruta en la carpeta concedida.",
+    "permission_denied": "No hay permiso para modificar ese elemento de la carpeta concedida.",
+    "io_error": "No se pudo completar la operación en la carpeta concedida.",
+}
+_WRITE_OPS = frozenset({"write_file", "create_folder", "move_path", "delete_path"})
 
 
 class ListFilesInput(BaseModel):
@@ -120,6 +144,90 @@ class ReadFileOutput(BaseModel):
     size: int
 
 
+class WriteFileInput(BaseModel):
+    """Typed input of ``write_file``: a relative path plus its UTF-8 text."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        min_length=1,
+        max_length=MAX_PATH_CHARS,
+        description="File path relative to the granted workspace.",
+    )
+    content: str = Field(
+        description="UTF-8 text to write; replaces any previous file contents.",
+    )
+
+
+class WriteFileOutput(BaseModel):
+    """What ``write_file`` reported: the path, its byte size, and creation."""
+
+    path: str
+    bytes: int
+    created: bool
+
+
+class CreateFolderInput(BaseModel):
+    """Typed input of ``create_folder``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        min_length=1,
+        max_length=MAX_PATH_CHARS,
+        description="Folder path relative to the granted workspace.",
+    )
+
+
+class CreateFolderOutput(BaseModel):
+    """The folder the connector created."""
+
+    path: str
+
+
+class MovePathInput(BaseModel):
+    """Typed input of ``move_path``: both ends relative to the granted root."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    from_path: str = Field(
+        min_length=1,
+        max_length=MAX_PATH_CHARS,
+        description="Current path relative to the granted workspace.",
+    )
+    to_path: str = Field(
+        min_length=1,
+        max_length=MAX_PATH_CHARS,
+        description="Destination path relative to the granted workspace.",
+    )
+
+
+class MovePathOutput(BaseModel):
+    """The move the connector performed."""
+
+    from_path: str
+    to_path: str
+
+
+class DeletePathInput(BaseModel):
+    """Typed input of ``delete_path``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(
+        min_length=1,
+        max_length=MAX_PATH_CHARS,
+        description="File or folder path relative to the granted workspace.",
+    )
+
+
+class DeletePathOutput(BaseModel):
+    """The path removed and how many entries it held (folders are recursive)."""
+
+    path: str
+    removed: int
+
+
 def _checked_path(path: str) -> str:
     """Return the POSIX-normalized path or refuse traversal/absolute paths."""
     if len(path) > MAX_PATH_CHARS or "\x00" in path:
@@ -128,6 +236,14 @@ def _checked_path(path: str) -> str:
     if normalized.startswith("/") or _DRIVE_PREFIX.match(normalized):
         raise ToolPrecheckError(INVALID_PATH_MESSAGE)
     if ".." in normalized.split("/"):
+        raise ToolPrecheckError(INVALID_PATH_MESSAGE)
+    return normalized
+
+
+def _checked_target(path: str) -> str:
+    """Like :func:`_checked_path`, but the granted root itself is never a write target."""
+    normalized = _checked_path(path)
+    if PurePosixPath(normalized) == PurePosixPath("."):
         raise ToolPrecheckError(INVALID_PATH_MESSAGE)
     return normalized
 
@@ -156,50 +272,68 @@ async def precheck_read_file(context: ToolContext, validated_input: ReadFileInpu
         raise ToolPrecheckError(UNSUPPORTED_EXTENSION_MESSAGE)
 
 
-def _precheck_message(exc: ConnectorHubError) -> str:
+async def precheck_write_file(context: ToolContext, validated_input: WriteFileInput) -> None:
+    """Refuse an offline workspace, an escaped path, or oversized content."""
+    _require_online(context)
+    _checked_target(validated_input.path)
+    if len(validated_input.content) > MAX_TEXT_CHARS:
+        raise ToolPrecheckError(CONTENT_TOO_LARGE_MESSAGE)
+
+
+async def precheck_single_path(
+    context: ToolContext, validated_input: CreateFolderInput | DeletePathInput
+) -> None:
+    """Refuse an offline workspace, an escaped path, or the root for one-path writes."""
+    _require_online(context)
+    _checked_target(validated_input.path)
+
+
+async def precheck_move_path(context: ToolContext, validated_input: MovePathInput) -> None:
+    """Refuse an offline workspace, an escaped path, or the root on either end of the move."""
+    _require_online(context)
+    _checked_target(validated_input.from_path)
+    _checked_target(validated_input.to_path)
+
+
+def _precheck_message(exc: ConnectorHubError, op: str) -> str:
+    messages = _WRITE_ERROR_MESSAGES if op in _WRITE_OPS else _CONNECTOR_ERROR_MESSAGES
     if isinstance(exc, (ConnectorOfflineError, ConnectorTimeoutError)):
         return WORKSPACE_OFFLINE_MESSAGE
     if isinstance(exc, ConnectorResponseError):
-        return _CONNECTOR_ERROR_MESSAGES.get(exc.code, READ_FAILED_MESSAGE)
-    return READ_FAILED_MESSAGE
+        return messages.get(exc.code, messages["io_error"])
+    return messages["io_error"]
 
 
-async def _request(
-    context: ToolContext, op: str, args: dict[str, object]
-) -> dict[str, object]:
+async def _request(context: ToolContext, op: str, args: dict[str, object]) -> dict[str, object]:
     """Send one operation to the user's connector, translating its failures."""
     connectors = context.connectors
     if connectors is None or not connectors.is_online(context.user.id):
-        raise ToolPrecheckError(WORKSPACE_OFFLINE_MESSAGE)
+        raise ToolRefusalError(WORKSPACE_OFFLINE_MESSAGE)
     try:
         result = await connectors.request(
             context.user.id, op, args, timeout=REQUEST_TIMEOUT_SECONDS
         )
     except ConnectorHubError as exc:
-        raise ToolPrecheckError(_precheck_message(exc)) from exc
+        raise ToolRefusalError(_precheck_message(exc, op)) from exc
     if not isinstance(result, dict):
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     return result
 
 
-async def list_files(
-    context: ToolContext, validated_input: ListFilesInput
-) -> ListFilesOutput:
+async def list_files(context: ToolContext, validated_input: ListFilesInput) -> ListFilesOutput:
     """List one folder of the user's granted workspace through the connector."""
     result = await _request(context, "list_files", {"path": validated_input.path})
     entries = result.get("entries")
     if not isinstance(entries, list):
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     return ListFilesOutput(path=validated_input.path, entries=entries[:MAX_LIST_ENTRIES])
 
 
-async def read_file(
-    context: ToolContext, validated_input: ReadFileInput
-) -> ReadFileOutput:
+async def read_file(context: ToolContext, validated_input: ReadFileInput) -> ReadFileOutput:
     """Read one allowed file and return its extracted, clipped text."""
     extension = _extension(validated_input.path)
     if extension not in ALLOWED_EXTENSIONS:
-        raise ToolPrecheckError(UNSUPPORTED_EXTENSION_MESSAGE)
+        raise ToolRefusalError(UNSUPPORTED_EXTENSION_MESSAGE)
 
     result = await _request(context, "read_file", {"path": validated_input.path})
     data_b64 = result.get("data_b64")
@@ -210,16 +344,16 @@ async def read_file(
         or isinstance(reported_size, bool)
         or reported_size < 0
     ):
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     if reported_size > MAX_FILE_BYTES or len(data_b64) > MAX_BASE64_CHARS:
-        raise ToolPrecheckError(FILE_TOO_LARGE_MESSAGE)
+        raise ToolRefusalError(FILE_TOO_LARGE_MESSAGE)
 
     try:
         data = base64.b64decode(data_b64, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ToolPrecheckError(READ_FAILED_MESSAGE) from exc
+        raise ToolRefusalError(READ_FAILED_MESSAGE) from exc
     if len(data) > MAX_FILE_BYTES:
-        raise ToolPrecheckError(FILE_TOO_LARGE_MESSAGE)
+        raise ToolRefusalError(FILE_TOO_LARGE_MESSAGE)
 
     if extension in {".txt", ".md"}:
         text = data.decode("utf-8", errors="replace")
@@ -228,7 +362,7 @@ async def read_file(
         try:
             text = await asyncio.to_thread(extract_text, data, content_type)
         except Exception as exc:
-            raise ToolPrecheckError(READ_FAILED_MESSAGE) from exc
+            raise ToolRefusalError(READ_FAILED_MESSAGE) from exc
 
     truncated = len(text) > MAX_TEXT_CHARS
     return ReadFileOutput(
@@ -237,6 +371,51 @@ async def read_file(
         truncated=truncated,
         size=len(data),
     )
+
+
+async def write_file(context: ToolContext, validated_input: WriteFileInput) -> WriteFileOutput:
+    """Create or overwrite one text file through the connector."""
+    result = await _request(
+        context,
+        "write_file",
+        {"path": validated_input.path, "content": validated_input.content},
+    )
+    written, created = result.get("bytes"), result.get("created")
+    if (
+        not isinstance(written, int)
+        or isinstance(written, bool)
+        or written < 0
+        or not isinstance(created, bool)
+    ):
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
+    return WriteFileOutput(path=validated_input.path, bytes=written, created=created)
+
+
+async def create_folder(
+    context: ToolContext, validated_input: CreateFolderInput
+) -> CreateFolderOutput:
+    """Create one folder; existence is decided by the connector."""
+    await _request(context, "create_folder", {"path": validated_input.path})
+    return CreateFolderOutput(path=validated_input.path)
+
+
+async def move_path(context: ToolContext, validated_input: MovePathInput) -> MovePathOutput:
+    """Move or rename one path; the connector never overwrites the destination."""
+    await _request(
+        context,
+        "move_path",
+        {"from_path": validated_input.from_path, "to_path": validated_input.to_path},
+    )
+    return MovePathOutput(from_path=validated_input.from_path, to_path=validated_input.to_path)
+
+
+async def delete_path(context: ToolContext, validated_input: DeletePathInput) -> DeletePathOutput:
+    """Delete one path (recursively for folders) through the connector."""
+    result = await _request(context, "delete_path", {"path": validated_input.path})
+    removed = result.get("removed")
+    if not isinstance(removed, int) or isinstance(removed, bool) or removed < 0:
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
+    return DeletePathOutput(path=validated_input.path, removed=removed)
 
 
 LIST_FILES = ToolSpec(
@@ -269,8 +448,84 @@ READ_FILE = ToolSpec(
     precheck=precheck_read_file,
 )
 
+WRITE_FILE = ToolSpec(
+    name="write_file",
+    description=(
+        "Create or overwrite a UTF-8 text file in the user's granted local workspace. "
+        "Paths are relative to the workspace root. The user is always asked to confirm "
+        "before it is written."
+    ),
+    kind=ToolKind.ACTION,
+    approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+    required_role=UserRole.VIEWER,
+    handler=write_file,
+    input_model=WriteFileInput,
+    output_model=WriteFileOutput,
+    precheck=precheck_write_file,
+    # The granted folder belongs to the requester: only they may decide (S6).
+    requester_only_approval=True,
+)
+
+CREATE_FOLDER = ToolSpec(
+    name="create_folder",
+    description=(
+        "Create a folder in the user's granted local workspace. Paths are relative "
+        "to the workspace root. The user is always asked to confirm before it is "
+        "created."
+    ),
+    kind=ToolKind.ACTION,
+    approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+    required_role=UserRole.VIEWER,
+    handler=create_folder,
+    input_model=CreateFolderInput,
+    output_model=CreateFolderOutput,
+    precheck=precheck_single_path,
+    # The granted folder belongs to the requester: only they may decide (S6).
+    requester_only_approval=True,
+)
+
+MOVE_PATH = ToolSpec(
+    name="move_path",
+    description=(
+        "Move or rename a file or folder inside the user's granted local workspace. "
+        "Paths are relative to the workspace root and an existing destination is never "
+        "overwritten. The user is always asked to confirm before it is moved."
+    ),
+    kind=ToolKind.ACTION,
+    approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+    required_role=UserRole.VIEWER,
+    handler=move_path,
+    input_model=MovePathInput,
+    output_model=MovePathOutput,
+    precheck=precheck_move_path,
+    # The granted folder belongs to the requester: only they may decide (S6).
+    requester_only_approval=True,
+)
+
+DELETE_PATH = ToolSpec(
+    name="delete_path",
+    description=(
+        "Delete a file or a folder with its contents from the user's granted local "
+        "workspace. Paths are relative to the workspace root. The user is always asked "
+        "to confirm before it is deleted."
+    ),
+    kind=ToolKind.ACTION,
+    approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+    required_role=UserRole.VIEWER,
+    handler=delete_path,
+    input_model=DeletePathInput,
+    output_model=DeletePathOutput,
+    precheck=precheck_single_path,
+    # The granted folder belongs to the requester: only they may decide (S6).
+    requester_only_approval=True,
+)
+
 
 def register_connector_tools(registry: ToolRegistry) -> None:
-    """Register the two connector tools on ``registry`` (once per process)."""
+    """Register the connector tools on ``registry`` (once per process)."""
     registry.register(LIST_FILES)
     registry.register(READ_FILE)
+    registry.register(WRITE_FILE)
+    registry.register(CREATE_FOLDER)
+    registry.register(MOVE_PATH)
+    registry.register(DELETE_PATH)
