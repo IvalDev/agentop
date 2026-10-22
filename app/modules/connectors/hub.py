@@ -169,9 +169,7 @@ class ConnectorHub:
             raise ConnectorOfflineError("no connector is online for this user")
 
         request_id = str(uuid4())
-        future: asyncio.Future[dict[str, Any]] = (
-            asyncio.get_running_loop().create_future()
-        )
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = _Pending(connection.connector_id, future)
         try:
             await connection.websocket.send_json(
@@ -211,9 +209,7 @@ class ConnectorHub:
 
     def _latest(self, user_id: int) -> _Connection | None:
         candidates = [
-            connection
-            for connection in self._connections.values()
-            if connection.user_id == user_id
+            connection for connection in self._connections.values() if connection.user_id == user_id
         ]
         if not candidates:
             return None

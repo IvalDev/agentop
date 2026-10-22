@@ -94,9 +94,7 @@ async def create_pairing_code(
     return row, format_pairing_code(raw_code)
 
 
-async def pair_connector(
-    db: AsyncSession, code: str, name: str
-) -> tuple[Connector, str]:
+async def pair_connector(db: AsyncSession, code: str, name: str) -> tuple[Connector, str]:
     """Redeem ``code`` into a connector for its owner; return the raw token once.
 
     Raises:
@@ -132,9 +130,7 @@ async def pair_connector(
     return connector, raw_token
 
 
-async def list_for_user(
-    db: AsyncSession, *, tenant_id: int, user_id: int
-) -> list[Connector]:
+async def list_for_user(db: AsyncSession, *, tenant_id: int, user_id: int) -> list[Connector]:
     """The caller's own active connectors, newest first."""
     result = await db.execute(
         select(Connector)
