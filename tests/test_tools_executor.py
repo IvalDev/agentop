@@ -786,6 +786,10 @@ BUILTIN_TOOL_ALLOWLIST = {
     "search_documents",
     "list_files",
     "read_file",
+    "write_file",
+    "create_folder",
+    "move_path",
+    "delete_path",
     "list_events",
     "create_event",
     "cancel_event",
@@ -802,7 +806,14 @@ FORBIDDEN_INPUT_FIELDS = {"command", "cmd", "shell", "script", "sql", "path", "f
 
 #: Connector tools take a *relative* folder path on purpose: it is validated
 #: server-side and jailed again by the local connector.
-CONNECTOR_PATH_TOOLS = {"list_files", "read_file"}
+CONNECTOR_PATH_TOOLS = {
+    "list_files",
+    "read_file",
+    "write_file",
+    "create_folder",
+    "move_path",
+    "delete_path",
+}
 
 
 async def _tenant_id(db: Database, slug: str) -> int:
