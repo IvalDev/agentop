@@ -66,6 +66,7 @@ def get_agent_deps(
         credentials_key=(
             settings.credentials_key.get_secret_value() if settings.credentials_key else None
         ),
+        connectors=request.app.state.connectors,
     )
 
 

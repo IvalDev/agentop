@@ -481,5 +481,6 @@ def test_importing_the_app_alone_populates_the_registry() -> None:
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == (
         "search_documents,list_events,create_event,cancel_event,"
-        "search_emails,get_email,list_labels,send_email,archive_message,add_label"
+        "search_emails,get_email,list_labels,send_email,archive_message,add_label,"
+        "list_files,read_file"
     )
