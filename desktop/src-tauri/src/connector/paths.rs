@@ -1321,3 +1321,314 @@ mod v1_probe_tests {
         assert_eq!(read_file(&root, "big.txt").unwrap_err().code, "too_large");
     }
 }
+
+#[cfg(unix)]
+#[cfg(test)]
+mod v2_probe_tests {
+    //! Independent L2 probes (S7): write jail on a real temp tree, never following symlinks.
+    use super::*;
+    use crate::connector::test_support::TempDir;
+    use serde_json::json;
+    use std::os::unix::fs::symlink;
+
+    /// Snapshot of a tree without following symlinks: (relative path, kind, payload).
+    fn snapshot(base: &Path) -> Vec<(String, &'static str, Vec<u8>)> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, &'static str, Vec<u8>)>) {
+            for entry in fs::read_dir(dir).expect("dir must be readable") {
+                let path = entry.expect("entry").path();
+                let rel = path
+                    .strip_prefix(base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                let meta = fs::symlink_metadata(&path).expect("metadata");
+                if meta.file_type().is_symlink() {
+                    let target = fs::read_link(&path).expect("link");
+                    out.push((rel, "link", target.to_string_lossy().as_bytes().to_vec()));
+                } else if meta.is_dir() {
+                    out.push((rel, "dir", Vec::new()));
+                    walk(base, &path, out);
+                } else {
+                    out.push((rel, "file", fs::read(&path).expect("file")));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(base, base, &mut out);
+        out.sort();
+        out
+    }
+
+    struct World {
+        dir: TempDir,
+        root: PathBuf,
+        outside: PathBuf,
+    }
+
+    /// root/{a.md, sub/c.txt, esc -> outside/, leak.txt -> outside/secret.txt,
+    /// dangling -> outside/nuevo.txt, self -> root}; outside/{secret.txt, deep/x.txt}.
+    fn world(name: &str) -> World {
+        let dir = TempDir::new(name);
+        let raw = dir.path().join("root");
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(raw.join("sub")).unwrap();
+        fs::create_dir_all(outside.join("deep")).unwrap();
+        fs::write(raw.join("a.md"), b"alfa").unwrap();
+        fs::write(raw.join("sub/c.txt"), b"charlie").unwrap();
+        fs::write(outside.join("secret.txt"), b"secret").unwrap();
+        fs::write(outside.join("deep/x.txt"), b"x").unwrap();
+        symlink(&outside, raw.join("esc")).unwrap();
+        symlink(outside.join("secret.txt"), raw.join("leak.txt")).unwrap();
+        symlink(outside.join("nuevo.txt"), raw.join("dangling")).unwrap();
+        symlink(&raw, raw.join("self")).unwrap();
+        let root = fs::canonicalize(&raw).unwrap();
+        World { dir, root, outside }
+    }
+
+    fn code(result: Result<Value, OpError>) -> &'static str {
+        result.expect_err("operation must fail").code
+    }
+
+    #[test]
+    fn v2_probe_rejected_writes_leave_both_trees_unchanged() {
+        let w = world("v2-reject");
+        let before = snapshot(w.dir.path());
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                "write_file",
+                json!({"path": "../evil.txt", "content": "x"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "/tmp/evil.txt", "content": "x"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "a\0.txt", "content": "x"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "sub/../../evil.txt", "content": "x"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "leak.txt", "content": "pwned"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "dangling", "content": "pwned"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "esc/secret.txt", "content": "pwned"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "esc/new.txt", "content": "pwned"}),
+                "invalid_path",
+            ),
+            (
+                "write_file",
+                json!({"path": "sub", "content": "x"}),
+                "io_error",
+            ),
+            (
+                "create_folder",
+                json!({"path": "esc/nueva"}),
+                "invalid_path",
+            ),
+            (
+                "create_folder",
+                json!({"path": "esc/deep/nueva"}),
+                "invalid_path",
+            ),
+            ("create_folder", json!({"path": "sub"}), "already_exists"),
+            (
+                "create_folder",
+                json!({"path": "leak.txt"}),
+                "already_exists",
+            ),
+            (
+                "delete_path",
+                json!({"path": "esc/secret.txt"}),
+                "invalid_path",
+            ),
+            ("delete_path", json!({"path": "esc/deep"}), "invalid_path"),
+            ("delete_path", json!({"path": "../outside"}), "invalid_path"),
+            ("delete_path", json!({"path": "fantasma"}), "not_found"),
+            (
+                "move_path",
+                json!({"from_path": "esc/secret.txt", "to_path": "robado.txt"}),
+                "invalid_path",
+            ),
+            (
+                "move_path",
+                json!({"from_path": "a.md", "to_path": "esc/a.md"}),
+                "invalid_path",
+            ),
+            (
+                "move_path",
+                json!({"from_path": "a.md", "to_path": "sub"}),
+                "already_exists",
+            ),
+            (
+                "move_path",
+                json!({"from_path": "a.md", "to_path": "leak.txt"}),
+                "already_exists",
+            ),
+            (
+                "move_path",
+                json!({"from_path": "a.md", "to_path": "dangling"}),
+                "already_exists",
+            ),
+            (
+                "move_path",
+                json!({"from_path": "sub", "to_path": "sub/dentro"}),
+                "io_error",
+            ),
+        ];
+        for (op, args, expected) in cases {
+            assert_eq!(code(execute(&w.root, op, &args)), expected, "{op} {args}");
+            assert_eq!(
+                snapshot(w.dir.path()),
+                before,
+                "{op} {args} changed the data"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_probe_the_granted_root_cannot_be_deleted_moved_or_overwritten() {
+        let w = world("v2-root");
+        let before = snapshot(w.dir.path());
+        for relative in ["", ".", "./", "./.", ".//", "sub/.."] {
+            assert_eq!(
+                code(execute(&w.root, "delete_path", &json!({"path": relative}))),
+                "invalid_path",
+                "{relative:?}"
+            );
+            assert_eq!(
+                code(execute(
+                    &w.root,
+                    "write_file",
+                    &json!({"path": relative, "content": "x"})
+                )),
+                "invalid_path",
+                "{relative:?}"
+            );
+            assert_eq!(
+                code(execute(
+                    &w.root,
+                    "move_path",
+                    &json!({"from_path": relative, "to_path": "otra"})
+                )),
+                "invalid_path",
+                "{relative:?}"
+            );
+            assert_eq!(
+                code(execute(
+                    &w.root,
+                    "create_folder",
+                    &json!({"path": relative})
+                )),
+                "invalid_path",
+                "{relative:?}"
+            );
+        }
+        assert_eq!(snapshot(w.dir.path()), before);
+        assert!(w.root.is_dir());
+    }
+
+    #[test]
+    fn v2_probe_links_are_removed_or_moved_as_links() {
+        let w = world("v2-links");
+        // Deleting the escaping directory link removes only the link.
+        assert_eq!(
+            execute(&w.root, "delete_path", &json!({"path": "esc"})).unwrap(),
+            json!({"path": "esc", "removed": 1})
+        );
+        assert!(w.outside.join("deep/x.txt").exists() && w.outside.join("secret.txt").exists());
+        // A link to the root itself is removed as a link; the root survives.
+        assert_eq!(
+            execute(&w.root, "delete_path", &json!({"path": "self/"})).unwrap()["removed"],
+            1
+        );
+        assert!(w.root.join("a.md").exists());
+        // Moving a link that points outside moves the link, never the target.
+        execute(
+            &w.root,
+            "move_path",
+            &json!({"from_path": "leak.txt", "to_path": "sub/leak.txt"}),
+        )
+        .unwrap();
+        assert!(fs::symlink_metadata(w.root.join("sub/leak.txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(w.outside.join("secret.txt")).unwrap(), b"secret");
+        // Recursive delete of a folder holding a link to an outside folder.
+        symlink(&w.outside, w.root.join("sub/fuera")).unwrap();
+        fs::create_dir_all(w.root.join("sub/n1/n2")).unwrap();
+        fs::write(w.root.join("sub/n1/n2/z.txt"), b"z").unwrap();
+        // sub + c.txt + leak.txt + fuera + n1 + n2 + z.txt = 7
+        assert_eq!(
+            execute(&w.root, "delete_path", &json!({"path": "sub"})).unwrap(),
+            json!({"path": "sub", "removed": 7})
+        );
+        assert!(w.outside.join("deep/x.txt").exists() && w.outside.join("secret.txt").exists());
+    }
+
+    #[test]
+    fn v2_probe_writes_inside_the_root_and_caps_size() {
+        let w = world("v2-write");
+        let made = execute(
+            &w.root,
+            "write_file",
+            &json!({"path": "sub/nuevo.md", "content": "ñ"}),
+        )
+        .unwrap();
+        assert_eq!(
+            made,
+            json!({"path": "sub/nuevo.md", "bytes": 2, "created": true})
+        );
+        // A path through the in-root link to the root itself stays inside.
+        execute(
+            &w.root,
+            "write_file",
+            &json!({"path": "self/via.txt", "content": "v"}),
+        )
+        .unwrap();
+        assert_eq!(fs::read(w.root.join("via.txt")).unwrap(), b"v");
+        let before = snapshot(w.dir.path());
+        let big = "a".repeat(MAX_READ_BYTES as usize + 1);
+        assert_eq!(
+            code(execute(
+                &w.root,
+                "write_file",
+                &json!({"path": "a.md", "content": big})
+            )),
+            "too_large"
+        );
+        assert_eq!(snapshot(w.dir.path()), before);
+        // move never overwrites an existing (empty) folder either.
+        fs::create_dir(w.root.join("vacia")).unwrap();
+        fs::create_dir(w.root.join("otra")).unwrap();
+        let before = snapshot(w.dir.path());
+        assert_eq!(
+            code(execute(
+                &w.root,
+                "move_path",
+                &json!({"from_path": "otra", "to_path": "vacia"})
+            )),
+            "already_exists"
+        );
+        assert_eq!(snapshot(w.dir.path()), before);
+    }
+}
