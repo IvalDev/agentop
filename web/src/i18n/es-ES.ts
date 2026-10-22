@@ -400,6 +400,52 @@ export const esES = {
       configure: 'Configurar',
       actionTarget: '«{name}»',
     },
+    workspace: {
+      title: 'Espacio de trabajo local',
+      description:
+        'Concede al asistente una carpeta de tu equipo. La carpeta se queda en tu equipo: ' +
+        'no se sube al servidor y no se muestra aquí.',
+      generate: 'Generar código',
+      generating: 'Generando código…',
+      pairing: {
+        title: 'Código de emparejamiento',
+        expires: 'El código caduca el {date}.',
+        instructions: 'Abre el widget, entra en el menú → Espacio de trabajo y pega el código.',
+      },
+      list: {
+        title: 'Tus equipos',
+        caption: 'Equipos conectados a tu espacio de trabajo',
+        loading: 'Cargando tus equipos…',
+        loadError: 'No se han podido cargar tus equipos. Comprueba la conexión e inténtalo de nuevo.',
+        retry: 'Reintentar',
+        empty: 'Todavía no has conectado ningún equipo. Genera un código y pégalo en el widget.',
+        columns: {
+          name: 'Equipo',
+          status: 'Estado',
+          lastSeen: 'Última conexión',
+          actions: 'Acciones',
+        },
+        connected: 'Conectado',
+        disconnected: 'Desconectado',
+        neverSeen: 'Nunca se ha conectado',
+        revoke: 'Revocar',
+        actionTarget: '«{name}»',
+      },
+      revoke: {
+        title: 'Revocar «{name}»',
+        description:
+          'El equipo dejará de estar conectado y el asistente no podrá acceder a su carpeta. ' +
+          'La carpeta y sus archivos no se modifican.',
+        confirm: 'Revocar',
+        done: 'Has revocado el acceso de «{name}».',
+        gone: 'El equipo «{name}» ya no estaba conectado.',
+      },
+      cancel: 'Cancelar',
+      errors: {
+        generate: 'No se ha podido generar el código. Comprueba la conexión e inténtalo de nuevo.',
+        revoke: 'No se ha podido revocar el equipo. Comprueba la conexión e inténtalo de nuevo.',
+      },
+    },
   },
   onboarding: {
     loading: 'Cargando la configuración…',

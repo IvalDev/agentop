@@ -5,6 +5,7 @@ import { getOnboardingState } from '../api/onboarding';
 import type { ApiClient } from '../api/client';
 import { Alert } from '../components/atoms/Alert';
 import { Button } from '../components/atoms/Button';
+import { WorkspaceCard } from '../components/workspace/WorkspaceCard';
 import { usePageTitle } from '../hooks/usePageTitle';
 import { t } from '../i18n';
 import { paths } from '../routes/paths';
@@ -188,6 +189,7 @@ export function MyToolsPage() {
         )}
         {body}
       </section>
+      <WorkspaceCard api={api} />
     </div>
   );
 }
