@@ -144,12 +144,14 @@ flowchart LR
 datos: SQLite (`aiosqlite`) o PostgreSQL con pgvector. Los archivos se guardan en disco
 (`AA_STORAGE_BASE_DIR`).
 
-**CI** (`.github/workflows/ci.yml`, en cada pull request y en cada push a `main`):
+**Comprobaciones.** No hay CI en GitHub: se ejecutan en local antes de abrir cada pull request.
 
-| Job | Pasos |
+| Comando | Pasos |
 | --- | --- |
-| `backend` (Python 3.12) | `ruff check .`, `ruff format --check .`, `pytest` |
-| `web` (Node 22) | `npm run typecheck`, `npm run lint`, `npm test -- --run` (Vitest) |
+| `make lint` (Python 3.12) | `ruff check .`, `ruff format --check .` |
+| `make test` | `pytest` |
+| `make web-test` (Node 22) | `npm run typecheck`, `npm run lint`, `npm test -- --run` (Vitest) |
+| `cargo test --locked` y `cargo fmt --check` | Widget de escritorio, desde `desktop/src-tauri` |
 
 ## Cómo instalar
 
@@ -322,8 +324,8 @@ Una petición = una rama = un PR pequeño y verificable. El ciclo completo:
    <Stacked PRs only: previous PR, next PR, and what to review here.>
    ```
 
-6. **CI en verde y revisión.** GitHub no permite que el autor apruebe su propio PR; con un solo
-   mantenedor, el PR se revisa y se fusiona sin aprobación formal.
+6. **Revisión.** GitHub no permite que el autor apruebe su propio PR; con un solo mantenedor,
+   el PR se revisa y se fusiona sin aprobación formal.
 7. **Fusionar** según el tipo de PR, comprobando siempre la base antes
    (`gh pr view <N> --json baseRefName`):
 
@@ -368,7 +370,6 @@ No borres la rama del padre hasta haber cambiado la base del hijo.
 - [ ] `make lint` y `make test` en verde (y `make web-test` si cambia `web/`)
 - [ ] Unas 400 líneas cambiadas como máximo, o PR apilados, o `size:exception` justificada
 - [ ] Descripción con Summary, Key changes, Verification, Known limitations (y Chain context si está apilado)
-- [ ] CI en verde
 - [ ] Base comprobada antes de fusionar; en una pila, hijo con base `main` antes de fusionarlo
 - [ ] Rama borrada y `main` local actualizado
 
