@@ -13,10 +13,16 @@ user). Their precheck refuses an offline workspace, an escaped path, or a
 ``content`` over 50 000 characters *before* any approval request exists; the
 approved input then travels verbatim to the connector, which owns existence
 (``already_exists``/``not_found``) and the path jail on the device. The server
-never learns the absolute path and never stores the content.
+never learns the absolute path and keeps no copy of the folder: a write's
+content lives only in its approval request and audit trail, like the body of
+an email the agent sends.
 
-Refusals are :class:`ToolPrecheckError` values so the executor shows the model
-a short, user-safe reason (the offline message is the L1 contract text).
+Precheck refusals are :class:`ToolPrecheckError` values and the handlers'
+refusals (the connector's answer, an invalid response) are
+:class:`ToolRefusalError` values, so the executor shows the human and the model
+a short, user-safe reason either way (the offline message is the L1 contract
+text). Writes get their own wording for the connector's ``not_found``,
+``permission_denied``, and ``io_error``, and never target the granted root.
 """
 
 import asyncio
@@ -37,7 +43,7 @@ from app.modules.connectors.hub import (
 )
 from app.modules.documents.extract import DOCX_CONTENT_TYPE, extract_text
 from app.modules.identity.models import UserRole
-from app.modules.tools.exceptions import ToolPrecheckError
+from app.modules.tools.exceptions import ToolPrecheckError, ToolRefusalError
 from app.modules.tools.registry import (
     ApprovalPolicy,
     ToolContext,
@@ -78,6 +84,14 @@ _CONNECTOR_ERROR_MESSAGES = {
     "too_large": FILE_TOO_LARGE_MESSAGE,
     "io_error": READ_FAILED_MESSAGE,
 }
+#: Write wording for the codes whose read message would mislead after a write.
+_WRITE_ERROR_MESSAGES = {
+    **_CONNECTOR_ERROR_MESSAGES,
+    "not_found": "No existe ningún elemento con esa ruta en la carpeta concedida.",
+    "permission_denied": "No hay permiso para modificar ese elemento de la carpeta concedida.",
+    "io_error": "No se pudo completar la operación en la carpeta concedida.",
+}
+_WRITE_OPS = frozenset({"write_file", "create_folder", "move_path", "delete_path"})
 
 
 class ListFilesInput(BaseModel):
@@ -226,6 +240,14 @@ def _checked_path(path: str) -> str:
     return normalized
 
 
+def _checked_target(path: str) -> str:
+    """Like :func:`_checked_path`, but the granted root itself is never a write target."""
+    normalized = _checked_path(path)
+    if PurePosixPath(normalized) == PurePosixPath("."):
+        raise ToolPrecheckError(INVALID_PATH_MESSAGE)
+    return normalized
+
+
 def _require_online(context: ToolContext) -> None:
     connectors = context.connectors
     if connectors is None or not connectors.is_online(context.user.id):
@@ -253,7 +275,7 @@ async def precheck_read_file(context: ToolContext, validated_input: ReadFileInpu
 async def precheck_write_file(context: ToolContext, validated_input: WriteFileInput) -> None:
     """Refuse an offline workspace, an escaped path, or oversized content."""
     _require_online(context)
-    _checked_path(validated_input.path)
+    _checked_target(validated_input.path)
     if len(validated_input.content) > MAX_TEXT_CHARS:
         raise ToolPrecheckError(CONTENT_TOO_LARGE_MESSAGE)
 
@@ -261,39 +283,40 @@ async def precheck_write_file(context: ToolContext, validated_input: WriteFileIn
 async def precheck_single_path(
     context: ToolContext, validated_input: CreateFolderInput | DeletePathInput
 ) -> None:
-    """Refuse an offline workspace or an escaped path for one-path writes."""
+    """Refuse an offline workspace, an escaped path, or the root for one-path writes."""
     _require_online(context)
-    _checked_path(validated_input.path)
+    _checked_target(validated_input.path)
 
 
 async def precheck_move_path(context: ToolContext, validated_input: MovePathInput) -> None:
-    """Refuse an offline workspace or an escaped path on either end of the move."""
+    """Refuse an offline workspace, an escaped path, or the root on either end of the move."""
     _require_online(context)
-    _checked_path(validated_input.from_path)
-    _checked_path(validated_input.to_path)
+    _checked_target(validated_input.from_path)
+    _checked_target(validated_input.to_path)
 
 
-def _precheck_message(exc: ConnectorHubError) -> str:
+def _precheck_message(exc: ConnectorHubError, op: str) -> str:
+    messages = _WRITE_ERROR_MESSAGES if op in _WRITE_OPS else _CONNECTOR_ERROR_MESSAGES
     if isinstance(exc, (ConnectorOfflineError, ConnectorTimeoutError)):
         return WORKSPACE_OFFLINE_MESSAGE
     if isinstance(exc, ConnectorResponseError):
-        return _CONNECTOR_ERROR_MESSAGES.get(exc.code, READ_FAILED_MESSAGE)
-    return READ_FAILED_MESSAGE
+        return messages.get(exc.code, messages["io_error"])
+    return messages["io_error"]
 
 
 async def _request(context: ToolContext, op: str, args: dict[str, object]) -> dict[str, object]:
     """Send one operation to the user's connector, translating its failures."""
     connectors = context.connectors
     if connectors is None or not connectors.is_online(context.user.id):
-        raise ToolPrecheckError(WORKSPACE_OFFLINE_MESSAGE)
+        raise ToolRefusalError(WORKSPACE_OFFLINE_MESSAGE)
     try:
         result = await connectors.request(
             context.user.id, op, args, timeout=REQUEST_TIMEOUT_SECONDS
         )
     except ConnectorHubError as exc:
-        raise ToolPrecheckError(_precheck_message(exc)) from exc
+        raise ToolRefusalError(_precheck_message(exc, op)) from exc
     if not isinstance(result, dict):
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     return result
 
 
@@ -302,7 +325,7 @@ async def list_files(context: ToolContext, validated_input: ListFilesInput) -> L
     result = await _request(context, "list_files", {"path": validated_input.path})
     entries = result.get("entries")
     if not isinstance(entries, list):
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     return ListFilesOutput(path=validated_input.path, entries=entries[:MAX_LIST_ENTRIES])
 
 
@@ -310,7 +333,7 @@ async def read_file(context: ToolContext, validated_input: ReadFileInput) -> Rea
     """Read one allowed file and return its extracted, clipped text."""
     extension = _extension(validated_input.path)
     if extension not in ALLOWED_EXTENSIONS:
-        raise ToolPrecheckError(UNSUPPORTED_EXTENSION_MESSAGE)
+        raise ToolRefusalError(UNSUPPORTED_EXTENSION_MESSAGE)
 
     result = await _request(context, "read_file", {"path": validated_input.path})
     data_b64 = result.get("data_b64")
@@ -321,16 +344,16 @@ async def read_file(context: ToolContext, validated_input: ReadFileInput) -> Rea
         or isinstance(reported_size, bool)
         or reported_size < 0
     ):
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     if reported_size > MAX_FILE_BYTES or len(data_b64) > MAX_BASE64_CHARS:
-        raise ToolPrecheckError(FILE_TOO_LARGE_MESSAGE)
+        raise ToolRefusalError(FILE_TOO_LARGE_MESSAGE)
 
     try:
         data = base64.b64decode(data_b64, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ToolPrecheckError(READ_FAILED_MESSAGE) from exc
+        raise ToolRefusalError(READ_FAILED_MESSAGE) from exc
     if len(data) > MAX_FILE_BYTES:
-        raise ToolPrecheckError(FILE_TOO_LARGE_MESSAGE)
+        raise ToolRefusalError(FILE_TOO_LARGE_MESSAGE)
 
     if extension in {".txt", ".md"}:
         text = data.decode("utf-8", errors="replace")
@@ -339,7 +362,7 @@ async def read_file(context: ToolContext, validated_input: ReadFileInput) -> Rea
         try:
             text = await asyncio.to_thread(extract_text, data, content_type)
         except Exception as exc:
-            raise ToolPrecheckError(READ_FAILED_MESSAGE) from exc
+            raise ToolRefusalError(READ_FAILED_MESSAGE) from exc
 
     truncated = len(text) > MAX_TEXT_CHARS
     return ReadFileOutput(
@@ -364,7 +387,7 @@ async def write_file(context: ToolContext, validated_input: WriteFileInput) -> W
         or written < 0
         or not isinstance(created, bool)
     ):
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     return WriteFileOutput(path=validated_input.path, bytes=written, created=created)
 
 
@@ -391,7 +414,7 @@ async def delete_path(context: ToolContext, validated_input: DeletePathInput) ->
     result = await _request(context, "delete_path", {"path": validated_input.path})
     removed = result.get("removed")
     if not isinstance(removed, int) or isinstance(removed, bool) or removed < 0:
-        raise ToolPrecheckError(INVALID_RESPONSE_MESSAGE)
+        raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
     return DeletePathOutput(path=validated_input.path, removed=removed)
 
 
