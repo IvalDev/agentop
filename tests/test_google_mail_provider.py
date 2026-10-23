@@ -759,6 +759,8 @@ async def test_send_message_upload_requires_the_session_location() -> None:
         "https://uploads.example.test/upload?upload_id=x",
         "https://googleapis.com.example.test/upload?upload_id=x",
         "/upload/gmail/v1/users/me/messages/send?upload_id=x",
+        "https://user:secret@gmail.googleapis.com/upload?upload_id=x",
+        "https://[",
     ],
 )
 async def test_send_message_upload_refuses_a_session_outside_googleapis(location: str) -> None:

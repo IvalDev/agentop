@@ -60,11 +60,18 @@ GOOGLE_GMAIL_UPLOAD_SEND_URL = "https://gmail.googleapis.com/upload/gmail/v1/use
 
 
 def _is_googleapis_https(url: str) -> bool:
-    """Return whether ``url`` is an absolute HTTPS URL on ``googleapis.com`` or a subdomain."""
-    parsed = httpx.URL(url)
-    host = parsed.host
+    """Return whether ``url`` is an absolute HTTPS URL on ``googleapis.com`` or a subdomain.
+
+    A URL carrying userinfo is refused too: httpx would swap the Bearer
+    header for Basic auth built from it. An unparseable URL is refused.
+    """
+    try:
+        parsed = httpx.URL(url)
+        host = parsed.host
+    except (httpx.InvalidURL, ValueError):
+        return False
     on_googleapis = host == "googleapis.com" or host.endswith(".googleapis.com")
-    return parsed.scheme == "https" and on_googleapis
+    return parsed.scheme == "https" and on_googleapis and not parsed.userinfo
 
 
 #: Headers a ``format=metadata`` read asks for (G3.1: what a search hit shows).
@@ -147,7 +154,8 @@ class GoogleGmailProvider:
         """Send one authenticated request (owned or injected client).
 
         ``content`` is a raw body (the resumable upload's bytes); ``headers``
-        are added to the Bearer header, which they can never replace.
+        are added to the Bearer header, which they can never replace (userinfo
+        in ``url`` would: callers refuse such URLs, see :func:`_is_googleapis_https`).
         """
         request_headers = {**(headers or {}), "Authorization": f"Bearer {self._access_token}"}
         if self._client is not None:
