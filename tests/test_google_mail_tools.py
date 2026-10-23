@@ -66,13 +66,14 @@ from uuid import uuid4
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import Settings
 from app.core.crypto import decrypt_credentials, encrypt_credentials, generate_credentials_key
 from app.core.db import Database
 from app.modules.approvals.exceptions import ApprovalForbiddenError
 from app.modules.approvals.grants import mint_grant
+from app.modules.approvals.models import ApprovalRequest
 from app.modules.approvals.service import (
     approve_request,
     create_approval_request,
@@ -2883,3 +2884,68 @@ async def test_send_email_rejects_invalid_attachment_lists(
     )
 
     assert (result.status, result.error_kind) == ("error", "validation")
+
+
+#: What ``send_email`` stored for ``SEND_INPUT`` before attachments existed (496514f).
+PRE_ATTACHMENTS_SEND_PAYLOAD: dict[str, Any] = {
+    "to": ["ana@example.com"],
+    "subject": "Hola",
+    "body": "¿Cómo estás?",
+    "cc": [],
+    "bcc": [],
+    "thread_id": None,
+}
+PRE_ATTACHMENTS_SEND_KEY = (
+    "send_email:5a1d9127987dd502ca2e791c28a742ff57b7d607ff17766d002675ebe6a81982"
+)
+
+
+def test_send_email_without_attachments_keeps_its_stored_payload_and_action_key() -> None:
+    """Pending approvals bind the dumped input by hash: no attachments, no change."""
+    plain = SendEmailInput.model_validate(SEND_INPUT)
+    attached = SendEmailInput.model_validate(ATTACHED_INPUT)
+
+    assert plain.model_dump(mode="json") == PRE_ATTACHMENTS_SEND_PAYLOAD
+    assert compute_action_key("send_email", plain) == PRE_ATTACHMENTS_SEND_KEY
+    assert attached.model_dump(mode="json")["attachments"] == ATTACHED_INPUT["attachments"]
+    assert compute_action_key("send_email", attached) != PRE_ATTACHMENTS_SEND_KEY
+
+
+async def test_a_send_requested_before_attachments_existed_still_executes(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, mail_settings
+) -> None:
+    owner = seeded_users[OWNER]
+    await _seed_mailbox(seeded_db, owner, oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    async with seeded_db.sessionmaker() as session:
+        session.add(ModuleActivation(tenant_id=owner.tenant_id, module_key="google_mail"))
+        request = await create_approval_request(
+            session, mail_registry, owner, "send_email", SEND_INPUT, settings=mail_settings
+        )
+        await session.commit()
+        request_id = request.id
+    async with seeded_db.sessionmaker() as session:
+        # The row exactly as the previous release wrote it.
+        await session.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == request_id)
+            .values(input_payload=PRE_ATTACHMENTS_SEND_PAYLOAD, action_key=PRE_ATTACHMENTS_SEND_KEY)
+        )
+        await session.commit()
+    async with seeded_db.sessionmaker() as session:
+        await approve_request(session, owner, request_id)
+
+    async with seeded_db.sessionmaker() as session:
+        execution = await execute_approved_action(
+            session,
+            mail_registry,
+            owner,
+            request_id,
+            credentials_key=oauth_key,
+            settings=mail_settings,
+        )
+
+    assert execution.result.status == "ok", execution.result.error
+    assert len(fake.send_calls) == 1
+    assert fake.upload_calls == []

@@ -111,7 +111,14 @@ from pathlib import PurePosixPath
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -328,6 +335,19 @@ class SendEmailInput(BaseModel):
         if any(not path.strip() for path in value):
             raise ValueError("attachment entries must be workspace file paths")
         return value
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_attachments(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Dump a send without attachments exactly as before they existed.
+
+        An approval request stores this dump and binds it by hash
+        (``action_key``), so a request created by the previous release must
+        still match after the upgrade.
+        """
+        data = handler(self)
+        if not self.attachments:
+            data.pop("attachments", None)
+        return data
 
 
 class SendEmailOutput(BaseModel):
