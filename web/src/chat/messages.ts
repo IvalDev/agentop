@@ -10,7 +10,7 @@ export function activityMessage(activity: ChatActivity): string {
 }
 
 /** The approval actions the chat describes by name; any other tool is a generic action. */
-const DESCRIBED_ACTIONS = ['send_email', 'archive_message', 'add_label'] as const;
+const DESCRIBED_ACTIONS = ['send_email', 'archive_message', 'add_label', 'save_attachment'] as const;
 export type ApprovalActionKey = (typeof DESCRIBED_ACTIONS)[number] | 'other';
 
 /** Longest email body preview, in code points, before it is cut with "…". */
@@ -80,6 +80,7 @@ function detailFields(details: ApprovalDetails): Array<[DetailField, string | nu
         ['bcc', addressesOf(input.bcc)],
         ['subject', stringOf(input.subject)],
         ['body', bodyPreview(input.body)],
+        ['attachments', addressesOf(input.attachments)],
       ];
     case 'archive_message':
       return [['message', stringOf(input.message_id)]];
@@ -88,6 +89,12 @@ function detailFields(details: ApprovalDetails): Array<[DetailField, string | nu
         ['message', stringOf(input.message_id)],
         ['label', stringOf(input.label_id)],
       ];
+    case 'save_attachment':
+      return [
+        ['message', stringOf(input.message_id)],
+        ['part', stringOf(input.part_id)],
+        ['path', stringOf(input.path)],
+      ];
     case 'other':
       return [];
   }
@@ -95,8 +102,9 @@ function detailFields(details: ApprovalDetails): Array<[DetailField, string | nu
 
 /**
  * The arguments the user must see to confirm the action, labelled, in reading order: for an
- * email its recipients, subject, and a short body preview; for a message action the message
- * and label ids. Nothing else of the mailbox is shown; an unknown tool shows no arguments.
+ * email its recipients, subject, a short body preview, and attached files; for a message action
+ * the message and label ids; for a saved attachment the message, its part, and where it goes.
+ * Nothing else of the mailbox is shown; an unknown tool shows no arguments.
  */
 export function approvalDetailRows(details: ApprovalDetails): ApprovalDetailRow[] {
   return detailFields(details).flatMap(([field, value]) =>
