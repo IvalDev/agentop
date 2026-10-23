@@ -9,6 +9,7 @@ pub mod client;
 pub mod config;
 pub mod paths;
 pub mod protocol;
+pub mod transfer;
 
 #[cfg(test)]
 pub(crate) mod test_support {

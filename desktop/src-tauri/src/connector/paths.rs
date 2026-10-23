@@ -17,6 +17,8 @@ use base64::Engine;
 use serde::Serialize;
 use serde_json::Value;
 
+use super::transfer;
+
 /// Maximum entries returned by `list_files`.
 pub const MAX_ENTRIES: usize = 1000;
 
@@ -417,6 +419,33 @@ pub fn execute(root: &Path, op: &str, args: &Value) -> Result<Value, OpError> {
             required_arg(args, "to_path")?,
         )?),
         "delete_path" => serde_json::to_value(delete_path(root, required_arg(args, "path")?)?),
+        "file_info" => {
+            serde_json::to_value(transfer::file_info(root, required_arg(args, "path")?)?)
+        }
+        "read_chunk" => serde_json::to_value(transfer::read_chunk(
+            root,
+            required_arg(args, "path")?,
+            required_u64(args, "offset")?,
+            required_u64(args, "length")?,
+        )?),
+        "write_chunk" => serde_json::to_value(transfer::write_chunk(
+            root,
+            required_arg(args, "path")?,
+            required_arg(args, "upload_id")?,
+            required_u64(args, "offset")?,
+            required_arg(args, "data_b64")?,
+        )?),
+        "write_commit" => serde_json::to_value(transfer::write_commit(
+            root,
+            required_arg(args, "path")?,
+            required_arg(args, "upload_id")?,
+            required_u64(args, "size")?,
+        )?),
+        "write_abort" => serde_json::to_value(transfer::write_abort(
+            root,
+            required_arg(args, "path")?,
+            required_arg(args, "upload_id")?,
+        )?),
         _ => return Err(OpError::new("io_error", "Operación no soportada.")),
     };
 
@@ -447,6 +476,16 @@ fn required_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, OpError> {
             "El parámetro {name} debe ser texto."
         ))),
     }
+}
+
+/// Reads a required non-negative integer argument such as `offset`, `length`
+/// or `size`.
+fn required_u64(args: &Value, name: &str) -> Result<u64, OpError> {
+    args.get(name).and_then(Value::as_u64).ok_or_else(|| {
+        OpError::invalid_path(format!(
+            "El parámetro {name} debe ser un número entero no negativo."
+        ))
+    })
 }
 
 /// Formats a filesystem timestamp as UTC ISO-8601 (`2023-11-14T22:13:20Z`).
