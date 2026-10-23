@@ -31,7 +31,7 @@ from app.modules.catalog.manifest import AgentProfile, ModuleManifest, StepSpec
 GMAIL_MODIFY_SCOPE = "https://www.googleapis.com/auth/gmail.modify"
 GMAIL_SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send"
 
-#: The six chat tools the module contributes (G3: reads free, actions gated).
+#: The seven chat tools the module contributes (G3: reads free, actions gated).
 GOOGLE_MAIL_TOOLS = (
     "search_emails",
     "get_email",
@@ -39,14 +39,16 @@ GOOGLE_MAIL_TOOLS = (
     "send_email",
     "archive_message",
     "add_label",
+    "save_attachment",
 )
 
 #: How the chat agent's mail engine is routed and instructed (G3 completes it).
 GOOGLE_MAIL_AGENT_PROFILE = AgentProfile(
     routing_description=(
         "The user's own email in Gmail: finding and reading messages inside the "
-        "connected account and, with the user's confirmation, sending, archiving, "
-        "and labeling them."
+        "connected account and, with the user's confirmation, sending them (with files "
+        "from the workspace folder attached), archiving, labeling, and saving their "
+        "attachments to the workspace folder."
     ),
     instructions="""\
 - Use only the Gmail tools, never the knowledge base.
@@ -57,7 +59,10 @@ with one label, search_emails only returns messages under that label and get_ema
 refused for messages outside it. search_emails returns each message's id, thread id, \
 labels, subject, sender, date, and snippet: describe or choose messages from that, and call \
 get_email only when you need a message's full body. list_labels shows the mailbox's labels.
-- Actions (send_email, archive_message, add_label) never run without the user's approval, \
+- get_email lists attachments; save_attachment saves one to the workspace; \
+send_email attaches workspace files (25 MB max).
+- Actions (send_email, archive_message, add_label, save_attachment) never run without the \
+user's approval, \
 but you do not ask for it: call the tool as soon as the user asks for the action and its \
 details are clear. The app then shows the user an approval notice with those details and \
 Approve/Reject buttons, and the action runs only after the user confirmed it there. Never \

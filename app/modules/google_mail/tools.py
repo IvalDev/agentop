@@ -1,6 +1,6 @@
 """Google Mail chat tools (G3, google-mail M3): scoped reads and gated actions.
 
-Six ToolSpecs on module ``google_mail``, registered through
+Seven ToolSpecs on module ``google_mail``, registered through
 :func:`register_google_mail_tools`: the production fold in
 :func:`~app.modules.google_mail.registry.register_default_google_mail`
 registers them once at import time on the process-wide
@@ -25,7 +25,9 @@ Tool shapes (M3 — the approval policies differ on purpose, criterion 4):
   ``labelIds`` do not contain the selected label (criterion 3's heart);
   ``ALL`` skips the check. The body is the first ``text/plain`` part, or —
   for HTML-only mail — the first ``text/html`` part converted to plain
-  text with the stdlib parser (G8);
+  text with the stdlib parser (G8). Every part with a file name is listed
+  as an attachment (part id, file name, type, size) — never Gmail's long,
+  unstable ``attachmentId``;
 - ``list_labels`` — ``EXTRACT`` / viewer, no approval: the mailbox's
   label ids + display names (metadata only);
 - ``send_email`` — ``ACTION`` / operator, ``REQUIRE_APPROVAL``: builds a
@@ -35,8 +37,13 @@ Tool shapes (M3 — the approval policies differ on purpose, criterion 4):
   does NOT fill a missing ``From`` (G8: such a send arrived as "(unknown
   sender)" with no ``SENT`` label), so no readable address means no send,
   and an answer without the ``SENT`` label is never reported as sent.
-  EXEMPT from the label-membership check — a new message belongs to no
-  folder — but approval is ALWAYS required;
+  With ``attachments`` (relative paths in the user's workspace folder) the
+  precheck reads only their sizes and refuses more than
+  :data:`MAX_SEND_BYTES` (Gmail's 25 MB, body plus files, before
+  encoding); after approval the files are read through the chunked
+  connector ops and the ``multipart/mixed`` message goes through the
+  resumable upload. EXEMPT from the label-membership check — a new message
+  belongs to no folder — but approval is ALWAYS required;
 - ``archive_message`` — ``ACTION`` / operator, ``REQUIRE_APPROVAL``:
   ``modify`` removing ``INBOX``, only after verifying the message is
   inside the scope;
@@ -44,7 +51,12 @@ Tool shapes (M3 — the approval policies differ on purpose, criterion 4):
   ``REQUIRE_APPROVAL``: ``modify`` adding a label, only after verifying
   the TARGET MESSAGE is inside the scope (the label being applied may be
   any label except ``TRASH``/``SPAM`` — the constraint is on the message
-  acted upon).
+  acted upon);
+- ``save_attachment(message_id, part_id, path)`` — ``ACTION`` / operator,
+  ``REQUIRE_APPROVAL``: writes one attachment of an in-scope message,
+  byte for byte, to a relative path in the user's workspace folder through
+  the chunked connector ops (never over an existing file), up to
+  :data:`MAX_DOWNLOAD_BYTES` (Gmail's largest receivable message).
 
 No delete/trash tool, ever (MVP decision): ``add_label`` refuses ``TRASH``
 and ``SPAM`` at validation, since Gmail purges both after 30 days.
@@ -57,7 +69,7 @@ Gmail) is never touched — and only the approvals service mints the
 single-use grant that later unlocks exactly that tool + input
 (``action_key``), re-running the precheck right before the handler.
 ``tests/test_google_mail_tools.py`` proves both halves per action tool.
-The three actions also set ``requester_only_approval`` (G7): the handler
+The four actions also set ``requester_only_approval`` (G7): the handler
 runs with the identity of whoever executes the approved call, so only the
 requester may approve, reject, or execute it — another user of the tenant
 would otherwise act on their own mailbox.
@@ -88,16 +100,25 @@ import asyncio
 import base64
 import json
 import logging
+import mimetypes
 import re
 import time
 from datetime import UTC, datetime
 from email.message import EmailMessage as MimeMessage
 from email.utils import format_datetime, getaddresses, make_msgid, parseaddr
 from html.parser import HTMLParser
+from pathlib import PurePosixPath
 from typing import Any
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    field_validator,
+    model_serializer,
+)
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -110,6 +131,12 @@ from app.core.crypto import (
 from app.modules.catalog.registry import ModuleCatalog
 from app.modules.connections.models import UserConnection
 from app.modules.connections.service import create_or_update
+from app.modules.connectors.tools import checked_target, require_online
+from app.modules.connectors.transfer import (
+    read_workspace_file,
+    workspace_file_size,
+    write_workspace_file,
+)
 from app.modules.google_mail.manifest import GOOGLE_MAIL_MANIFEST
 from app.modules.google_mail.provider import (
     GmailAuthenticationError,
@@ -121,7 +148,7 @@ from app.modules.google_mail.provider import (
 from app.modules.google_mail.scope import ALL_SCOPE, ScopeSelection, get_effective_scope
 from app.modules.identity.models import UserRole
 from app.modules.oauth import service as oauth_service
-from app.modules.tools.exceptions import ToolPrecheckError
+from app.modules.tools.exceptions import ToolPrecheckError, ToolRefusalError
 from app.modules.tools.registry import (
     ApprovalPolicy,
     ToolContext,
@@ -145,6 +172,14 @@ OUT_OF_SCOPE = (
     "in Settings > Tools to access it"
 )
 
+ATTACHMENT_NOT_FOUND = (
+    "attachment not found in this message; call get_email for its attachments and part ids"
+)
+ATTACHMENT_TOO_LARGE = "attachment exceeds Gmail's 70 MB limit and cannot be downloaded"
+ATTACHMENTS_TOO_LARGE = (
+    "body and attachments exceed Gmail's 25 MB sending limit; attach fewer or smaller files"
+)
+
 #: Same refresh skew the calendar precheck uses (never refresh a live token).
 EXPIRY_SKEW_SECONDS = 60
 
@@ -159,6 +194,11 @@ MAX_BODY_LENGTH = 100_000
 MAX_DECODED_BODY_CHARS = 20_000
 #: Cap of the HTML source parsed for an HTML-only body (bounds the parser's work).
 MAX_HTML_SOURCE_CHARS = 1_000_000
+#: Gmail's sending limit: message content plus attachments, before encoding.
+MAX_SEND_BYTES = 25_000_000
+#: Gmail's largest receivable message (70 MB after encoding): no attachment is larger.
+MAX_DOWNLOAD_BYTES = 70_000_000
+MAX_ATTACHMENTS = 20
 
 #: The label ``archive_message`` removes (Gmail's system inbox label).
 INBOX_LABEL = "INBOX"
@@ -215,6 +255,15 @@ class GetEmailInput(BaseModel):
     message_id: str = Field(min_length=1)
 
 
+class EmailAttachment(BaseModel):
+    """One attachment of a message: what ``save_attachment`` needs to fetch it."""
+
+    part_id: str
+    filename: str
+    mime_type: str | None = None
+    size: int | None = None
+
+
 class EmailMessage(BaseModel):
     """One full message flattened for the model (``format=full``, trimmed)."""
 
@@ -227,6 +276,7 @@ class EmailMessage(BaseModel):
     to: list[str] = Field(default_factory=list)
     date: str | None = None
     body: str | None = None
+    attachments: list[EmailAttachment] = Field(default_factory=list)
 
 
 class GetEmailOutput(BaseModel):
@@ -265,6 +315,11 @@ class SendEmailInput(BaseModel):
     cc: list[str] = Field(default_factory=list, max_length=MAX_RECIPIENTS)
     bcc: list[str] = Field(default_factory=list, max_length=MAX_RECIPIENTS)
     thread_id: str | None = Field(default=None, min_length=1)
+    attachments: list[str] = Field(
+        default_factory=list,
+        max_length=MAX_ATTACHMENTS,
+        description="Relative paths of files in the user's workspace folder.",
+    )
 
     @field_validator("to", "cc", "bcc")
     @classmethod
@@ -273,6 +328,26 @@ class SendEmailInput(BaseModel):
             if not address.strip() or "@" not in address:
                 raise ValueError("recipient entries must be non-empty email addresses")
         return value
+
+    @field_validator("attachments")
+    @classmethod
+    def _attachments_are_paths(cls, value: list[str]) -> list[str]:
+        if any(not path.strip() for path in value):
+            raise ValueError("attachment entries must be workspace file paths")
+        return value
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_attachments(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """Dump a send without attachments exactly as before they existed.
+
+        An approval request stores this dump and binds it by hash
+        (``action_key``), so a request created by the previous release must
+        still match after the upgrade.
+        """
+        data = handler(self)
+        if not self.attachments:
+            data.pop("attachments", None)
+        return data
 
 
 class SendEmailOutput(BaseModel):
@@ -319,6 +394,26 @@ class AddLabelOutput(BaseModel):
     labeled: bool
     message_id: str
     label_id: str
+
+
+class SaveAttachmentInput(BaseModel):
+    """Typed input of ``save_attachment`` (the part id comes from ``get_email``)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    message_id: str = Field(min_length=1)
+    part_id: str = Field(min_length=1)
+    path: str = Field(
+        min_length=1, description="Relative destination path in the user's workspace folder."
+    )
+
+
+class SaveAttachmentOutput(BaseModel):
+    """Where the attachment was written and how many bytes it holds."""
+
+    path: str
+    bytes: int
+    filename: str
 
 
 # --- Connection precheck (calendar-style, scope-aware) --------------------------
@@ -515,8 +610,12 @@ async def _scoped_message_precheck(context: ToolContext, validated_input: BaseMo
     right before an approved handler, so an approval grant never widens
     the scope.
     """
+    await _in_scope_message(context, validated_input.message_id)
+
+
+async def _in_scope_message(context: ToolContext, message_id: str) -> dict[str, Any]:
+    """Fetch one message for a precheck, refusing it outside the scope (see above)."""
     selection, row, access_token = await _scoped_connection(context)
-    message_id = validated_input.message_id
     provider = _provider_for(row, access_token)
     try:
         message = await provider.get_message(message_id)
@@ -526,6 +625,7 @@ async def _scoped_message_precheck(context: ToolContext, validated_input: BaseMo
         raise ToolPrecheckError(EXPIRED) from None
     if not _in_scope(selection, _message_label_ids(message)):
         raise ToolPrecheckError(OUT_OF_SCOPE)
+    return message
 
 
 def _is_plain_address(value: Any) -> bool:
@@ -576,12 +676,47 @@ async def _send_email_precheck(context: ToolContext, validated_input: BaseModel)
     """
     _, row, access_token = await _scoped_connection(context)
     await _sender_address(_provider_for(row, access_token))
+    if validated_input.attachments:
+        await _check_attachment_budget(context, validated_input)
+
+
+async def _check_attachment_budget(context: ToolContext, validated_input: SendEmailInput) -> None:
+    """Refuse attachments that are missing or exceed :data:`MAX_SEND_BYTES` with the body.
+
+    Only sizes are read (``file_info``): the content waits for the approval.
+    """
+    require_online(context)
+    total = len(validated_input.body.encode("utf-8"))
+    for path in validated_input.attachments:
+        total += await workspace_file_size(context, path)
+        if total > MAX_SEND_BYTES:
+            raise ToolPrecheckError(ATTACHMENTS_TOO_LARGE)
+
+
+async def _save_attachment_precheck(
+    context: ToolContext, validated_input: SaveAttachmentInput
+) -> None:
+    """Precheck of ``save_attachment``: scope, the attachment part, and the target.
+
+    The message must be inside the scope (as for the other message tools)
+    and hold the requested attachment within :data:`MAX_DOWNLOAD_BYTES`;
+    the user's connector must be online and the path a write target inside
+    the granted folder. Nothing is downloaded or written before approval.
+    """
+    message = await _in_scope_message(context, validated_input.message_id)
+    part = _find_attachment(message, validated_input.part_id)
+    if part is None:
+        raise ToolPrecheckError(ATTACHMENT_NOT_FOUND)
+    if _attachment_size(part) > MAX_DOWNLOAD_BYTES:
+        raise ToolPrecheckError(ATTACHMENT_TOO_LARGE)
+    require_online(context)
+    checked_target(validated_input.path)
 
 
 # --- MIME building (stdlib email) ------------------------------------------------
 
 
-def _build_raw_mime(
+def _build_mime(
     *,
     sender: str,
     to: list[str],
@@ -589,8 +724,8 @@ def _build_raw_mime(
     body: str,
     cc: list[str] | None = None,
     bcc: list[str] | None = None,
-) -> str:
-    """One RFC 822 message, base64url-encoded for ``users.messagesSend``.
+) -> MimeMessage:
+    """One RFC 822 message from the connected address.
 
     ``From`` is ``sender`` — the connected address from ``users.getProfile``:
     Gmail does not fill a missing ``From`` (G8, the "(unknown sender)" send).
@@ -608,16 +743,86 @@ def _build_raw_mime(
     message["Date"] = format_datetime(datetime.now(UTC))
     message["Message-ID"] = make_msgid(domain=sender.rpartition("@")[2])
     message.set_content(body)
-    return base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+    return message
+
+
+def _build_raw_mime(**fields: Any) -> str:
+    """:func:`_build_mime`'s message, base64url-encoded for ``users.messagesSend``."""
+    return base64.urlsafe_b64encode(_build_mime(**fields).as_bytes()).decode("ascii")
+
+
+async def _attach_workspace_files(
+    context: ToolContext, message: MimeMessage, validated_input: SendEmailInput
+) -> None:
+    """Read each attachment from the workspace (after approval) and add it to ``message``.
+
+    What the body leaves of :data:`MAX_SEND_BYTES` bounds every read, so a
+    file that grew since the precheck is refused before it is read in full
+    and nothing is sent. The type comes from the file extension.
+    """
+    budget = MAX_SEND_BYTES - len(validated_input.body.encode("utf-8"))
+    for path in validated_input.attachments:
+        data = await read_workspace_file(
+            context, path, max_bytes=budget, too_large_message=ATTACHMENTS_TOO_LARGE
+        )
+        budget -= len(data)
+        filename = PurePosixPath(path.replace("\\", "/")).name
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        maintype, _, subtype = content_type.partition("/")
+        message.add_attachment(data, maintype=maintype, subtype=subtype, filename=filename)
 
 
 # --- Message flattening ----------------------------------------------------------
 
 
+def _decode_body_bytes(data: str) -> bytes:
+    """base64url-decode one MIME part body, padded or not."""
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
 def _decode_body_data(data: str) -> str:
-    """base64url-decode one MIME part body (never raises into the model)."""
-    padded = data + "=" * (-len(data) % 4)
-    return base64.urlsafe_b64decode(padded).decode("utf-8", errors="replace")
+    """base64url-decode one MIME part body as text (never raises into the model)."""
+    return _decode_body_bytes(data).decode("utf-8", errors="replace")
+
+
+def _part_body(part: dict[str, Any]) -> dict[str, Any]:
+    body = part.get("body")
+    return body if isinstance(body, dict) else {}
+
+
+def _attachment_parts(part: Any) -> list[dict[str, Any]]:
+    """Every part with a file name and a part id inside a ``format=full`` tree, in order."""
+    if not isinstance(part, dict):
+        return []
+    found = []
+    filename, part_id = part.get("filename"), part.get("partId")
+    if isinstance(filename, str) and filename and isinstance(part_id, str) and part_id:
+        found.append(part)
+    children = part.get("parts")
+    for child in children if isinstance(children, list) else []:
+        found.extend(_attachment_parts(child))
+    return found
+
+
+def _find_attachment(message: Any, part_id: str) -> dict[str, Any] | None:
+    payload = message.get("payload") if isinstance(message, dict) else None
+    return next((part for part in _attachment_parts(payload) if part["partId"] == part_id), None)
+
+
+def _attachment_size(part: dict[str, Any]) -> int:
+    """Gmail's byte count of the part data (encoding notwithstanding); 0 when absent."""
+    size = _part_body(part).get("size")
+    return size if isinstance(size, int) and not isinstance(size, bool) else 0
+
+
+def _map_attachment(part: dict[str, Any]) -> EmailAttachment:
+    mime_type = part.get("mimeType")
+    return EmailAttachment(
+        part_id=part["partId"],
+        filename=part["filename"],
+        mime_type=mime_type if isinstance(mime_type, str) else None,
+        size=_attachment_size(part),
+    )
 
 
 def _first_part_text(part: Any, mime_type: str) -> str | None:
@@ -777,6 +982,7 @@ def _map_message(item: dict[str, Any]) -> EmailMessage:
         to=[address for _, address in getaddresses([headers.get("to", "")])],
         date=headers.get("date") or None,
         body=_message_body(payload),
+        attachments=[_map_attachment(part) for part in _attachment_parts(payload)],
     )
 
 
@@ -872,16 +1078,19 @@ async def send_email_handler(
 ) -> SendEmailOutput:
     """Send one MIME message from the connected address (label-exempt, never approval-exempt).
 
-    The sender is read again here (the precheck cannot pass it through the
-    frozen context); without a usable address nothing is sent. Gmail's
-    answer must carry the ``SENT`` label: the G8 send that arrived as
-    "(unknown sender)" came back with no ``labelIds`` at all, so an answer
-    without ``SENT`` is a masked failure, never a reported success.
+    With attachments, the workspace files are read now (after approval) and
+    the ``multipart/mixed`` message goes through the resumable upload;
+    without them, the JSON ``raw`` send is unchanged. The sender is read again
+    here (the precheck cannot pass it through the frozen context); without a
+    usable address nothing is sent. Gmail's answer must carry the ``SENT``
+    label: the G8 send that arrived as "(unknown sender)" came back with no
+    ``labelIds`` at all, so an answer without ``SENT`` is a masked failure,
+    never a reported success.
     """
     _, row, access_token = await _scoped_connection(context)
     provider = _provider_for(row, access_token)
     sender = await _sender_address(provider)
-    raw = _build_raw_mime(
+    message = _build_mime(
         sender=sender,
         to=validated_input.to,
         subject=validated_input.subject,
@@ -889,7 +1098,17 @@ async def send_email_handler(
         cc=validated_input.cc,
         bcc=validated_input.bcc,
     )
-    payload = await provider.send_message(raw_mime_b64url=raw, thread_id=validated_input.thread_id)
+    if validated_input.attachments:
+        await _attach_workspace_files(context, message, validated_input)
+        # A JSON ``raw`` body is no place for 25 MB: the resumable upload takes it.
+        payload = await provider.send_message_upload(
+            mime=message.as_bytes(), thread_id=validated_input.thread_id
+        )
+    else:
+        raw = base64.urlsafe_b64encode(message.as_bytes()).decode("ascii")
+        payload = await provider.send_message(
+            raw_mime_b64url=raw, thread_id=validated_input.thread_id
+        )
     labels = payload.get("labelIds")
     if not isinstance(labels, list) or SENT_LABEL not in labels:
         logger.warning("google_mail send answered without the SENT label")
@@ -931,6 +1150,36 @@ async def add_label_handler(context: ToolContext, validated_input: AddLabelInput
     )
 
 
+async def save_attachment_handler(
+    context: ToolContext, validated_input: SaveAttachmentInput
+) -> SaveAttachmentOutput:
+    """Write one attachment of an in-scope message into the workspace (membership: the precheck).
+
+    An inline part carries its bytes in ``body.data``; any other is fetched
+    with ``users.messages.attachments.get``. The chunked connector write
+    never replaces an existing file and aborts its upload on failure.
+    """
+    _, row, access_token = await _scoped_connection(context)
+    provider = _provider_for(row, access_token)
+    message = await provider.get_message(validated_input.message_id)
+    part = _find_attachment(message, validated_input.part_id)
+    if part is None:
+        raise ToolRefusalError(ATTACHMENT_NOT_FOUND)
+    body = _part_body(part)
+    attachment_id = body.get("attachmentId")
+    if isinstance(attachment_id, str) and attachment_id:
+        data = await provider.get_attachment(validated_input.message_id, attachment_id)
+    else:
+        inline = body.get("data")
+        data = _decode_body_bytes(inline) if isinstance(inline, str) else b""
+    if len(data) > MAX_DOWNLOAD_BYTES:
+        raise ToolRefusalError(ATTACHMENT_TOO_LARGE)
+    result = await write_workspace_file(context, validated_input.path, data)
+    return SaveAttachmentOutput(
+        path=str(result["path"]), bytes=len(data), filename=part["filename"]
+    )
+
+
 # --- ToolSpecs -------------------------------------------------------------------
 
 
@@ -957,8 +1206,8 @@ GET_EMAIL = ToolSpec(
     name="get_email",
     description=(
         "Read one Gmail message in full (subject, sender, recipients, date, snippet, "
-        "plain-text body, labels); refused when the message is outside the mailbox "
-        "scope the user chose."
+        "plain-text body, labels, and its attachments with part id, file name, type, "
+        "and size); refused when the message is outside the mailbox scope the user chose."
     ),
     kind=ToolKind.EXTRACT,
     approval_policy=ApprovalPolicy.ALLOW_WITHOUT_APPROVAL,
@@ -990,8 +1239,9 @@ SEND_EMAIL = ToolSpec(
     name="send_email",
     description=(
         "Send one email from the connected mailbox (recipients, subject, body; "
-        "optional cc/bcc and a thread id when replying). The user is always asked to "
-        "confirm before it is sent."
+        "optional cc/bcc, a thread id when replying, and attachments: relative paths of "
+        "files in the user's workspace folder, up to 25 MB with the body). The user is "
+        "always asked to confirm before it is sent."
     ),
     kind=ToolKind.ACTION,
     approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
@@ -1041,35 +1291,70 @@ ADD_LABEL = ToolSpec(
     requester_only_approval=True,
 )
 
+SAVE_ATTACHMENT = ToolSpec(
+    name="save_attachment",
+    description=(
+        "Save one attachment of a Gmail message into the user's workspace folder: the "
+        "message id, the attachment's part id from get_email, and a relative destination "
+        "path (an existing file is never replaced). Only messages inside the mailbox scope "
+        "the user chose; up to 70 MB. The user is always asked to confirm."
+    ),
+    kind=ToolKind.ACTION,
+    approval_policy=ApprovalPolicy.REQUIRE_APPROVAL,
+    required_role=UserRole.OPERATOR,
+    handler=save_attachment_handler,
+    input_model=SaveAttachmentInput,
+    output_model=SaveAttachmentOutput,
+    precheck=_save_attachment_precheck,
+    module=MODULE_KEY,
+    # Writes into the requester's own folder from their own mailbox (G7).
+    requester_only_approval=True,
+)
+
 
 def register_google_mail_tools(registry: ToolRegistry) -> None:
-    """Register the six google_mail tools on ``registry``.
+    """Register the seven google_mail tools on ``registry``.
 
     Explicit entry point: importing this module registers nothing. The
     production fold (:func:`~app.modules.google_mail.registry.register_default_google_mail`,
     the reviewed google-mail G3 allowlist entry) calls it once at import
     time on ``default_registry``; tests call it against a LOCAL registry.
     """
-    for spec in (SEARCH_EMAILS, GET_EMAIL, LIST_LABELS, SEND_EMAIL, ARCHIVE_MESSAGE, ADD_LABEL):
+    for spec in (
+        SEARCH_EMAILS,
+        GET_EMAIL,
+        LIST_LABELS,
+        SEND_EMAIL,
+        ARCHIVE_MESSAGE,
+        ADD_LABEL,
+        SAVE_ATTACHMENT,
+    ):
         registry.register(spec)
 
 
 __all__ = [
     "ADD_LABEL",
     "ARCHIVE_MESSAGE",
+    "ATTACHMENTS_TOO_LARGE",
+    "ATTACHMENT_NOT_FOUND",
+    "ATTACHMENT_TOO_LARGE",
     "EXPIRED",
     "GET_EMAIL",
     "LIST_LABELS",
+    "MAX_DOWNLOAD_BYTES",
+    "MAX_SEND_BYTES",
     "METADATA_CONCURRENCY",
     "MODULE_KEY",
     "NOT_CONFIGURED",
     "OUT_OF_SCOPE",
+    "SAVE_ATTACHMENT",
     "SEARCH_EMAILS",
     "SEND_EMAIL",
     "AddLabelInput",
     "AddLabelOutput",
     "ArchiveMessageInput",
     "ArchiveMessageOutput",
+    "EmailAttachment",
     "EmailMessage",
     "EmailSummary",
     "GetEmailInput",
@@ -1077,6 +1362,8 @@ __all__ = [
     "ListLabelsInput",
     "ListLabelsOutput",
     "MailLabel",
+    "SaveAttachmentInput",
+    "SaveAttachmentOutput",
     "SearchEmailsInput",
     "SearchEmailsOutput",
     "SendEmailInput",

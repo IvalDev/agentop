@@ -99,6 +99,13 @@ describe('ApprovalNoticeView', () => {
     expect(screen.queryByText(/final secreto/)).not.toBeInTheDocument();
   });
 
+  it('lists the workspace files an email attaches', () => {
+    const attachments = ['Facturas/f42.pdf', 'datos/raw.bin'];
+    renderNotice({ ...READY, details: { ...SEND, input: { ...SEND.input, attachments } } });
+
+    expect(details(notice('Enviar un correo')).Adjuntos).toBe('Facturas/f42.pdf, datos/raw.bin');
+  });
+
   it.each([
     ['archive_message', { message_id: 'm1' }, 'Archivar un correo', { 'Correo (identificador)': 'm1' }],
     [
@@ -106,6 +113,12 @@ describe('ApprovalNoticeView', () => {
       { message_id: 'm1', label_id: 'Label_9' },
       'Añadir una etiqueta a un correo',
       { 'Correo (identificador)': 'm1', Etiqueta: 'Label_9' },
+    ],
+    [
+      'save_attachment',
+      { message_id: 'm1', part_id: '1', path: 'Facturas/f42.pdf' },
+      'Guardar un adjunto en tu carpeta',
+      { 'Correo (identificador)': 'm1', 'Adjunto (parte)': '1', 'Guardar en': 'Facturas/f42.pdf' },
     ],
   ])('says which message %s acts on', (toolName, input, title, rows) => {
     renderNotice({ ...READY, details: { ...SEND, toolName, input } }, { ...APPROVAL, toolName });
@@ -171,6 +184,16 @@ describe('ApprovalNoticeView', () => {
     );
 
     expect(notice('Archivar un correo')).toHaveTextContent('Correo archivado.');
+  });
+
+  it('names a saved attachment by what it did', () => {
+    const input = { message_id: 'm1', part_id: '1', path: 'f42.pdf' };
+    renderNotice(
+      { ...READY, details: { ...SEND, toolName: 'save_attachment', input, status: 'executed' } },
+      { ...APPROVAL, toolName: 'save_attachment' },
+    );
+
+    expect(notice('Guardar un adjunto en tu carpeta')).toHaveTextContent('Adjunto guardado.');
   });
 
   it('refuses to decide after a forbidden reply, with a clear message', () => {
