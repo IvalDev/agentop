@@ -23,6 +23,10 @@ refusals (the connector's answer, an invalid response) are
 a short, user-safe reason either way (the offline message is the L1 contract
 text). Writes get their own wording for the connector's ``not_found``,
 ``permission_denied``, and ``io_error``, and never target the granted root.
+
+:func:`require_online`, :func:`checked_path`, :func:`checked_target`, and
+:func:`request_connector` are shared with :mod:`app.modules.connectors.transfer`
+(chunked binary transfers) so every workspace caller refuses with this wording.
 """
 
 import asyncio
@@ -91,7 +95,18 @@ _WRITE_ERROR_MESSAGES = {
     "permission_denied": "No hay permiso para modificar ese elemento de la carpeta concedida.",
     "io_error": "No se pudo completar la operación en la carpeta concedida.",
 }
-_WRITE_OPS = frozenset({"write_file", "create_folder", "move_path", "delete_path"})
+#: Ops answered with the write wording, including the chunked uploads of ``transfer``.
+_WRITE_OPS = frozenset(
+    {
+        "write_file",
+        "create_folder",
+        "move_path",
+        "delete_path",
+        "write_chunk",
+        "write_commit",
+        "write_abort",
+    }
+)
 
 
 class ListFilesInput(BaseModel):
@@ -228,7 +243,7 @@ class DeletePathOutput(BaseModel):
     removed: int
 
 
-def _checked_path(path: str) -> str:
+def checked_path(path: str) -> str:
     """Return the POSIX-normalized path or refuse traversal/absolute paths."""
     if len(path) > MAX_PATH_CHARS or "\x00" in path:
         raise ToolPrecheckError(INVALID_PATH_MESSAGE)
@@ -240,33 +255,34 @@ def _checked_path(path: str) -> str:
     return normalized
 
 
-def _checked_target(path: str) -> str:
-    """Like :func:`_checked_path`, but the granted root itself is never a write target."""
-    normalized = _checked_path(path)
+def checked_target(path: str) -> str:
+    """Like :func:`checked_path`, but the granted root itself is never a write target."""
+    normalized = checked_path(path)
     if PurePosixPath(normalized) == PurePosixPath("."):
         raise ToolPrecheckError(INVALID_PATH_MESSAGE)
     return normalized
 
 
-def _require_online(context: ToolContext) -> None:
+def require_online(context: ToolContext) -> None:
+    """Refuse (as a precheck) when the requester has no online connector."""
     connectors = context.connectors
     if connectors is None or not connectors.is_online(context.user.id):
         raise ToolPrecheckError(WORKSPACE_OFFLINE_MESSAGE)
 
 
 def _extension(path: str) -> str:
-    return PurePosixPath(_checked_path(path)).suffix.lower()
+    return PurePosixPath(checked_path(path)).suffix.lower()
 
 
 async def precheck_list_files(context: ToolContext, validated_input: ListFilesInput) -> None:
     """Refuse an offline workspace or a path outside the granted folder."""
-    _require_online(context)
-    _checked_path(validated_input.path)
+    require_online(context)
+    checked_path(validated_input.path)
 
 
 async def precheck_read_file(context: ToolContext, validated_input: ReadFileInput) -> None:
     """Refuse an offline workspace, an escaped path, or an unsupported format."""
-    _require_online(context)
+    require_online(context)
     extension = _extension(validated_input.path)
     if extension not in ALLOWED_EXTENSIONS:
         raise ToolPrecheckError(UNSUPPORTED_EXTENSION_MESSAGE)
@@ -274,8 +290,8 @@ async def precheck_read_file(context: ToolContext, validated_input: ReadFileInpu
 
 async def precheck_write_file(context: ToolContext, validated_input: WriteFileInput) -> None:
     """Refuse an offline workspace, an escaped path, or oversized content."""
-    _require_online(context)
-    _checked_target(validated_input.path)
+    require_online(context)
+    checked_target(validated_input.path)
     if len(validated_input.content) > MAX_TEXT_CHARS:
         raise ToolPrecheckError(CONTENT_TOO_LARGE_MESSAGE)
 
@@ -284,15 +300,15 @@ async def precheck_single_path(
     context: ToolContext, validated_input: CreateFolderInput | DeletePathInput
 ) -> None:
     """Refuse an offline workspace, an escaped path, or the root for one-path writes."""
-    _require_online(context)
-    _checked_target(validated_input.path)
+    require_online(context)
+    checked_target(validated_input.path)
 
 
 async def precheck_move_path(context: ToolContext, validated_input: MovePathInput) -> None:
     """Refuse an offline workspace, an escaped path, or the root on either end of the move."""
-    _require_online(context)
-    _checked_target(validated_input.from_path)
-    _checked_target(validated_input.to_path)
+    require_online(context)
+    checked_target(validated_input.from_path)
+    checked_target(validated_input.to_path)
 
 
 def _precheck_message(exc: ConnectorHubError, op: str) -> str:
@@ -304,7 +320,9 @@ def _precheck_message(exc: ConnectorHubError, op: str) -> str:
     return messages["io_error"]
 
 
-async def _request(context: ToolContext, op: str, args: dict[str, object]) -> dict[str, object]:
+async def request_connector(
+    context: ToolContext, op: str, args: dict[str, object]
+) -> dict[str, object]:
     """Send one operation to the user's connector, translating its failures."""
     connectors = context.connectors
     if connectors is None or not connectors.is_online(context.user.id):
@@ -322,7 +340,7 @@ async def _request(context: ToolContext, op: str, args: dict[str, object]) -> di
 
 async def list_files(context: ToolContext, validated_input: ListFilesInput) -> ListFilesOutput:
     """List one folder of the user's granted workspace through the connector."""
-    result = await _request(context, "list_files", {"path": validated_input.path})
+    result = await request_connector(context, "list_files", {"path": validated_input.path})
     entries = result.get("entries")
     if not isinstance(entries, list):
         raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
@@ -335,7 +353,7 @@ async def read_file(context: ToolContext, validated_input: ReadFileInput) -> Rea
     if extension not in ALLOWED_EXTENSIONS:
         raise ToolRefusalError(UNSUPPORTED_EXTENSION_MESSAGE)
 
-    result = await _request(context, "read_file", {"path": validated_input.path})
+    result = await request_connector(context, "read_file", {"path": validated_input.path})
     data_b64 = result.get("data_b64")
     reported_size = result.get("size")
     if (
@@ -375,7 +393,7 @@ async def read_file(context: ToolContext, validated_input: ReadFileInput) -> Rea
 
 async def write_file(context: ToolContext, validated_input: WriteFileInput) -> WriteFileOutput:
     """Create or overwrite one text file through the connector."""
-    result = await _request(
+    result = await request_connector(
         context,
         "write_file",
         {"path": validated_input.path, "content": validated_input.content},
@@ -395,13 +413,13 @@ async def create_folder(
     context: ToolContext, validated_input: CreateFolderInput
 ) -> CreateFolderOutput:
     """Create one folder; existence is decided by the connector."""
-    await _request(context, "create_folder", {"path": validated_input.path})
+    await request_connector(context, "create_folder", {"path": validated_input.path})
     return CreateFolderOutput(path=validated_input.path)
 
 
 async def move_path(context: ToolContext, validated_input: MovePathInput) -> MovePathOutput:
     """Move or rename one path; the connector never overwrites the destination."""
-    await _request(
+    await request_connector(
         context,
         "move_path",
         {"from_path": validated_input.from_path, "to_path": validated_input.to_path},
@@ -411,7 +429,7 @@ async def move_path(context: ToolContext, validated_input: MovePathInput) -> Mov
 
 async def delete_path(context: ToolContext, validated_input: DeletePathInput) -> DeletePathOutput:
     """Delete one path (recursively for folders) through the connector."""
-    result = await _request(context, "delete_path", {"path": validated_input.path})
+    result = await request_connector(context, "delete_path", {"path": validated_input.path})
     removed = result.get("removed")
     if not isinstance(removed, int) or isinstance(removed, bool) or removed < 0:
         raise ToolRefusalError(INVALID_RESPONSE_MESSAGE)
