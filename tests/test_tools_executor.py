@@ -832,7 +832,9 @@ async def test_without_active_modules_there_is_no_module_gate(
 #: tools: three free reads, three approval-gated actions); agent-workspace L1
 #: allowlist change: the two connector-backed reads of the user's granted
 #: folder (their ``path`` is relative to that folder and jailed by the
-#: connector; the server never opens a file).
+#: connector; the server never opens a file); mail-attachments allowlist
+#: change, human-requested 2026-10-22: ``save_attachment`` writes one Gmail
+#: attachment to a relative ``path`` in that folder, approval-gated.
 BUILTIN_TOOL_ALLOWLIST = {
     "search_documents",
     "list_files",
@@ -850,6 +852,7 @@ BUILTIN_TOOL_ALLOWLIST = {
     "send_email",
     "archive_message",
     "add_label",
+    "save_attachment",
 }
 
 #: Input field names that would hint at shell, SQL, or filesystem access.
@@ -864,6 +867,7 @@ CONNECTOR_PATH_TOOLS = {
     "create_folder",
     "move_path",
     "delete_path",
+    "save_attachment",
 }
 
 

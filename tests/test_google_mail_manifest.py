@@ -35,6 +35,7 @@ GOOGLE_MAIL_TOOLS = (
     "send_email",
     "archive_message",
     "add_label",
+    "save_attachment",
 )
 
 

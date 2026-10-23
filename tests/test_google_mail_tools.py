@@ -40,6 +40,14 @@ Contract under test (google-mail M3 / acceptance criteria 3–5):
   answer lacks the ``SENT`` label is never reported as sent;
 - readable bodies (G8): ``get_email`` falls back to the first ``text/html``
   part converted to plain text when no ``text/plain`` part exists;
+- attachments (mail-attachments S1–S3): ``get_email`` lists each attachment's
+  part id, file name, type, and size; ``save_attachment`` (ACTION / operator,
+  ``REQUIRE_APPROVAL``, requester-only) writes one attachment byte for byte into
+  the user's workspace folder through the chunked connector ops, refusing an
+  unknown part, an out-of-scope message, and anything over Gmail's 70 MB; with
+  ``attachments`` ``send_email`` reads workspace files after approval, sends a
+  ``multipart/mixed`` message through the resumable upload, and refuses more
+  than Gmail's 25 MB (body plus files, before encoding) before approval;
 - there is no delete/trash tool, ever.
 """
 
@@ -58,13 +66,14 @@ from uuid import uuid4
 import httpx
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.core.config import Settings
 from app.core.crypto import decrypt_credentials, encrypt_credentials, generate_credentials_key
 from app.core.db import Database
 from app.modules.approvals.exceptions import ApprovalForbiddenError
 from app.modules.approvals.grants import mint_grant
+from app.modules.approvals.models import ApprovalRequest
 from app.modules.approvals.service import (
     approve_request,
     create_approval_request,
@@ -73,6 +82,12 @@ from app.modules.approvals.service import (
 )
 from app.modules.catalog.models import ModuleActivation
 from app.modules.connections.models import ConnectionStatus, UserConnection
+from app.modules.connectors.hub import ConnectorResponseError
+from app.modules.connectors.tools import (
+    ALREADY_EXISTS_MESSAGE,
+    INVALID_PATH_MESSAGE,
+    WORKSPACE_OFFLINE_MESSAGE,
+)
 from app.modules.google_mail import tools as mail_tools
 from app.modules.google_mail.provider import (
     GOOGLE_GMAIL_MESSAGES_URL,
@@ -86,13 +101,19 @@ from app.modules.google_mail.provider import (
 )
 from app.modules.google_mail.scope import ALL_SCOPE
 from app.modules.google_mail.tools import (
+    ATTACHMENT_NOT_FOUND,
+    ATTACHMENT_TOO_LARGE,
+    ATTACHMENTS_TOO_LARGE,
     EXPIRED,
+    MAX_DOWNLOAD_BYTES,
+    MAX_SEND_BYTES,
     METADATA_CONCURRENCY,
     NOT_CONFIGURED,
     OUT_OF_SCOPE,
     SEARCH_EMAILS,
     AddLabelInput,
     ArchiveMessageInput,
+    SaveAttachmentInput,
     SendEmailInput,
     register_google_mail_tools,
 )
@@ -175,7 +196,7 @@ def oauth_key() -> str:
 
 @pytest.fixture
 def mail_registry() -> ToolRegistry:
-    """A LOCAL registry holding the six google_mail tools (never the default)."""
+    """A LOCAL registry holding the seven google_mail tools (never the default)."""
     registry = ToolRegistry()
     register_google_mail_tools(registry)
     return registry
@@ -217,9 +238,12 @@ class FakeGmail:
         modify_error: Exception | None = None,
         profile: dict[str, Any] | None = None,
         profile_error: Exception | None = None,
+        attachments: dict[str, bytes] | None = None,
         explode: bool = False,
     ) -> None:
         self.explode = explode
+        # Bytes ``users.messages.attachments.get`` answers, per attachment id.
+        self.attachments = attachments if attachments is not None else {}
         self.profile = profile if profile is not None else {"emailAddress": "agent@acme.test"}
         self.profile_error = profile_error
         self.listed = listed if listed is not None else []
@@ -256,6 +280,8 @@ class FakeGmail:
         self.metadata_in_flight = 0
         self.metadata_max_in_flight = 0
         self.send_calls: list[dict[str, Any]] = []
+        self.upload_calls: list[dict[str, Any]] = []
+        self.attachment_calls: list[tuple[str, str]] = []
         self.modify_calls: list[dict[str, Any]] = []
 
     def __call__(self, *, access_token: str) -> "FakeGmailProvider":
@@ -320,6 +346,16 @@ class FakeGmailProvider:
         if self._factory.send_error is not None:
             raise self._factory.send_error
         return dict(self._factory.sent)
+
+    async def send_message_upload(self, **kwargs: Any) -> dict[str, Any]:
+        self._factory.upload_calls.append(kwargs)
+        if self._factory.send_error is not None:
+            raise self._factory.send_error
+        return dict(self._factory.sent)
+
+    async def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        self._factory.attachment_calls.append((message_id, attachment_id))
+        return self._factory.attachments[attachment_id]
 
     async def modify_message(self, **kwargs: Any) -> dict[str, Any]:
         self._factory.modify_calls.append(kwargs)
@@ -399,6 +435,7 @@ async def run_tool(
     settings: Settings | None = None,
     active_modules: set[str] | None = None,
     approval_grant=None,
+    connectors=None,
 ):
     """One ``execute_tool`` call on a fresh session (what the agent loop does)."""
     async with db.sessionmaker() as session:
@@ -412,6 +449,7 @@ async def run_tool(
             settings=settings,
             active_modules=active_modules if active_modules is not None else {"google_mail"},
             approval_grant=approval_grant,
+            connectors=connectors,
         )
 
 
@@ -434,8 +472,8 @@ async def stored_blob(db: Database, user: CurrentUser, key: str) -> dict[str, An
 # --- Spec shapes and input validation ------------------------------------------
 
 
-def test_register_google_mail_tools_registers_six_specs_on_a_local_registry() -> None:
-    """Six tools: three free reads, three approval-gated actions. No delete tool."""
+def test_register_google_mail_tools_registers_seven_specs_on_a_local_registry() -> None:
+    """Seven tools: three free reads, four approval-gated actions. No delete tool."""
     registry = ToolRegistry()
 
     register_google_mail_tools(registry)
@@ -447,6 +485,7 @@ def test_register_google_mail_tools_registers_six_specs_on_a_local_registry() ->
         "send_email",
         "archive_message",
         "add_label",
+        "save_attachment",
     ]
     assert not any("delete" in name or "trash" in name for name in registry.names())
 
@@ -461,7 +500,7 @@ def test_tool_specs_declare_module_roles_kinds_and_policies(mail_registry: ToolR
             UserRole.VIEWER,
         )
         assert spec.module == "google_mail"
-    for name in ("send_email", "archive_message", "add_label"):
+    for name in ("send_email", "archive_message", "add_label", "save_attachment"):
         spec = mail_registry.get(name)
         assert (spec.kind, spec.approval_policy, spec.required_role) == (
             ToolKind.ACTION,
@@ -476,7 +515,7 @@ def test_mailbox_actions_are_decided_only_by_their_requester(mail_registry: Tool
     """G7: each action runs on the requester's own connection; reads need no decision at all."""
     for name in ("search_emails", "get_email", "list_labels"):
         assert mail_registry.get(name).requester_only_approval is False, name
-    for name in ("send_email", "archive_message", "add_label"):
+    for name in ("send_email", "archive_message", "add_label", "save_attachment"):
         assert mail_registry.get(name).requester_only_approval is True, name
 
 
@@ -2235,3 +2274,678 @@ def test_precheck_error_carries_the_out_of_scope_reason() -> None:
     error = ToolPrecheckError(OUT_OF_SCOPE)
 
     assert error.reason == OUT_OF_SCOPE
+
+
+# --- Attachments (mail-attachments S1–S3) ---------------------------------------
+
+
+class FakeWorkspace:
+    """In-memory desktop connector answering the chunked transfer ops.
+
+    ``files`` maps workspace paths to bytes; uploads live in ``temps`` (per
+    upload id) until ``write_commit`` moves them, mirroring the desktop rules
+    the tools rely on: offsets must follow each other and an existing
+    destination is ``already_exists``.
+    """
+
+    def __init__(self, files: dict[str, bytes] | None = None, *, online: bool = True) -> None:
+        self.files = dict(files or {})
+        self.online = online
+        self.temps: dict[str, bytearray] = {}
+        self.ops: list[str] = []
+
+    def is_online(self, user_id: int) -> bool:
+        return self.online
+
+    async def request(self, user_id: int, op: str, args: dict, timeout: float = 30.0) -> dict:
+        self.ops.append(op)
+        return getattr(self, f"_{op}")(args)
+
+    def _existing(self, path: str) -> bytes:
+        if path not in self.files:
+            raise ConnectorResponseError("not_found", "El archivo no existe.")
+        return self.files[path]
+
+    def _file_info(self, args: dict) -> dict:
+        return {"path": args["path"], "size": len(self._existing(args["path"]))}
+
+    def _read_chunk(self, args: dict) -> dict:
+        data = self._existing(args["path"])
+        chunk = data[args["offset"] : args["offset"] + args["length"]]
+        return {"data_b64": base64.b64encode(chunk).decode("ascii"), "size": len(data)}
+
+    def _write_chunk(self, args: dict) -> dict:
+        if args["offset"] == 0:
+            if args["path"] in self.files:
+                raise ConnectorResponseError("already_exists", "Ya existe.")
+            self.temps[args["upload_id"]] = bytearray()
+        temp = self.temps[args["upload_id"]]
+        assert len(temp) == args["offset"]
+        temp += base64.b64decode(args["data_b64"], validate=True)
+        return {"path": args["path"], "upload_id": args["upload_id"], "written": len(temp)}
+
+    def _write_commit(self, args: dict) -> dict:
+        temp = self.temps.pop(args["upload_id"])
+        assert len(temp) == args["size"]
+        self.files[args["path"]] = bytes(temp)
+        return {"path": args["path"], "bytes": len(temp), "created": True}
+
+    def _write_abort(self, args: dict) -> dict:
+        removed = self.temps.pop(args["upload_id"], None) is not None
+        return {"path": args["path"], "removed": removed}
+
+
+#: A PDF larger than one 4 MiB connector chunk, with every byte value.
+PDF_BYTES = b"%PDF-1.7\n" + bytes(range(256)) * 20_000
+CSV_TEXT = b"total,42\n"
+PDF_ATTACHMENT_ID = "ANGjdJ8w" + "x" * 300  # Gmail's ids are long and opaque
+
+
+def _attachment_message(*, pdf_size: int = len(PDF_BYTES)) -> dict[str, Any]:
+    """A Label_7 message with a body, a PDF attachment, and a nested inline CSV."""
+    return {
+        **IN_SCOPE_MESSAGE,
+        "payload": {
+            "partId": "",
+            "mimeType": "multipart/mixed",
+            "filename": "",
+            "headers": IN_SCOPE_MESSAGE["payload"]["headers"],
+            "body": {"size": 0},
+            "parts": [
+                {
+                    "partId": "0",
+                    "mimeType": "text/plain",
+                    "filename": "",
+                    "body": {"size": 22, "data": _b64("Please pay invoice 42.")},
+                },
+                {
+                    "partId": "1",
+                    "mimeType": "application/pdf",
+                    "filename": "invoice-42.pdf",
+                    "body": {"attachmentId": PDF_ATTACHMENT_ID, "size": pdf_size},
+                },
+                {
+                    "partId": "2",
+                    "mimeType": "multipart/mixed",
+                    "filename": "",
+                    "body": {"size": 0},
+                    "parts": [
+                        {
+                            "partId": "2.0",
+                            "mimeType": "text/csv",
+                            "filename": "totals.csv",
+                            "body": {
+                                "size": len(CSV_TEXT),
+                                "data": base64.urlsafe_b64encode(CSV_TEXT).decode("ascii"),
+                            },
+                        }
+                    ],
+                },
+            ],
+        },
+    }
+
+
+def _attachment_fake(**kwargs: Any) -> FakeGmail:
+    fake = FakeGmail(
+        message=kwargs.pop("message", _attachment_message()),
+        attachments={PDF_ATTACHMENT_ID: PDF_BYTES},
+        **kwargs,
+    )
+    register_provider("google", fake)
+    return fake
+
+
+SAVE_INPUT: dict[str, Any] = {"message_id": "m1", "part_id": "1", "path": "Facturas/f42.pdf"}
+
+
+def _save_grant(raw_input: dict[str, Any] = SAVE_INPUT):
+    validated = SaveAttachmentInput.model_validate(raw_input)
+    return mint_grant(uuid4(), compute_action_key("save_attachment", validated))
+
+
+async def test_get_email_lists_every_attachment_with_its_part_id(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    _attachment_fake()
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "get_email",
+        GET_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    message = result.output.message
+    assert message.body == "Please pay invoice 42."
+    assert [attachment.model_dump() for attachment in message.attachments] == [
+        {
+            "part_id": "1",
+            "filename": "invoice-42.pdf",
+            "mime_type": "application/pdf",
+            "size": len(PDF_BYTES),
+        },
+        {"part_id": "2.0", "filename": "totals.csv", "mime_type": "text/csv", "size": 9},
+    ]
+    assert PDF_ATTACHMENT_ID not in result.output.model_dump_json()
+
+
+async def test_get_email_without_attachments_lists_none(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    register_provider("google", FakeGmail())
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "get_email",
+        GET_INPUT,
+        credentials_key=oauth_key,
+    )
+
+    assert result.status == "ok"
+    assert result.output.message.attachments == []
+
+
+async def test_save_attachment_without_grant_is_approval_required_and_touches_nothing(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = _attachment_fake()
+    workspace = FakeWorkspace()
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        SAVE_INPUT,
+        credentials_key=oauth_key,
+        connectors=workspace,
+    )
+
+    assert result.status == "approval_required"
+    assert result.approval_request is not None
+    assert result.approval_request.tool_name == "save_attachment"
+    assert fake.attachment_calls == []
+    assert workspace.ops == []
+    assert workspace.files == {}
+
+
+async def test_save_attachment_writes_the_attachment_byte_for_byte_in_chunks(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = _attachment_fake()
+    workspace = FakeWorkspace()
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        SAVE_INPUT,
+        credentials_key=oauth_key,
+        connectors=workspace,
+        approval_grant=_save_grant(),
+    )
+
+    assert result.status == "ok"
+    assert result.output.model_dump() == {
+        "path": "Facturas/f42.pdf",
+        "bytes": len(PDF_BYTES),
+        "filename": "invoice-42.pdf",
+    }
+    assert workspace.files == {"Facturas/f42.pdf": PDF_BYTES}
+    assert workspace.ops == ["write_chunk", "write_chunk", "write_commit"]
+    assert workspace.temps == {}
+    assert fake.attachment_calls == [("m1", PDF_ATTACHMENT_ID)]
+
+
+async def test_save_attachment_decodes_an_inline_part_without_downloading(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = _attachment_fake()
+    workspace = FakeWorkspace()
+    raw_input = {"message_id": "m1", "part_id": "2.0", "path": "totals.csv"}
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        raw_input,
+        credentials_key=oauth_key,
+        connectors=workspace,
+        approval_grant=_save_grant(raw_input),
+    )
+
+    assert result.status == "ok"
+    assert workspace.files == {"totals.csv": CSV_TEXT}
+    assert fake.attachment_calls == []
+
+
+async def test_save_attachment_of_an_out_of_scope_message_is_refused_before_approval(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await seed_scope(seeded_db, seeded_users[OWNER], "Label_7")
+    await seed_connection(seeded_db, seeded_users[OWNER], key=oauth_key)
+    fake = _attachment_fake(message={**_attachment_message(), "labelIds": ["INBOX"]})
+    workspace = FakeWorkspace()
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        SAVE_INPUT,
+        credentials_key=oauth_key,
+        connectors=workspace,
+        approval_grant=_save_grant(),
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {OUT_OF_SCOPE}"
+    assert fake.attachment_calls == []
+    assert workspace.ops == []
+
+
+@pytest.mark.parametrize("part_id", ["7", "0", "2"], ids=["missing", "body", "container"])
+async def test_save_attachment_refuses_a_part_that_is_not_an_attachment(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, part_id
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = _attachment_fake()
+    workspace = FakeWorkspace()
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        {**SAVE_INPUT, "part_id": part_id},
+        credentials_key=oauth_key,
+        connectors=workspace,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {ATTACHMENT_NOT_FOUND}"
+    assert fake.attachment_calls == []
+    assert workspace.ops == []
+
+
+async def test_save_attachment_refuses_more_than_gmails_70_mb(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = _attachment_fake(message=_attachment_message(pdf_size=MAX_DOWNLOAD_BYTES + 1))
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        SAVE_INPUT,
+        credentials_key=oauth_key,
+        connectors=FakeWorkspace(),
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {ATTACHMENT_TOO_LARGE}"
+    assert MAX_DOWNLOAD_BYTES == 70_000_000
+    assert fake.attachment_calls == []
+
+
+@pytest.mark.parametrize(
+    ("workspace", "path", "reason"),
+    [
+        (FakeWorkspace(online=False), "f42.pdf", WORKSPACE_OFFLINE_MESSAGE),
+        (None, "f42.pdf", WORKSPACE_OFFLINE_MESSAGE),
+        (FakeWorkspace(), "../f42.pdf", INVALID_PATH_MESSAGE),
+        (FakeWorkspace(), "/etc/f42.pdf", INVALID_PATH_MESSAGE),
+        (FakeWorkspace(), ".", INVALID_PATH_MESSAGE),
+    ],
+    ids=["offline", "no-connector", "traversal", "absolute", "root"],
+)
+async def test_save_attachment_prechecks_the_workspace_and_the_path(
+    seeded_db: Database,
+    seeded_users,
+    mail_registry: ToolRegistry,
+    oauth_key,
+    workspace,
+    path,
+    reason,
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = _attachment_fake()
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        {**SAVE_INPUT, "path": path},
+        credentials_key=oauth_key,
+        connectors=workspace,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {reason}"
+    assert fake.attachment_calls == []
+
+
+async def test_save_attachment_never_overwrites_an_existing_file(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    _attachment_fake()
+    workspace = FakeWorkspace({"Facturas/f42.pdf": b"mine"})
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "save_attachment",
+        SAVE_INPUT,
+        credentials_key=oauth_key,
+        connectors=workspace,
+        approval_grant=_save_grant(),
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {ALREADY_EXISTS_MESSAGE}"
+    assert workspace.files == {"Facturas/f42.pdf": b"mine"}
+    assert workspace.temps == {}
+
+
+ATTACHED_INPUT: dict[str, Any] = {
+    **SEND_INPUT,
+    "attachments": ["Facturas/f42.pdf", "datos/raw.bin"],
+}
+RAW_BIN = b"\x00\xff\x10binary"
+
+
+def _attached_workspace() -> FakeWorkspace:
+    return FakeWorkspace({"Facturas/f42.pdf": PDF_BYTES, "datos/raw.bin": RAW_BIN})
+
+
+async def test_send_email_with_attachments_waits_for_approval_without_reading_files(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    workspace = _attached_workspace()
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        ATTACHED_INPUT,
+        credentials_key=oauth_key,
+        connectors=workspace,
+    )
+
+    assert result.status == "approval_required"
+    assert result.approval_request is not None
+    assert result.approval_request.input["attachments"] == ATTACHED_INPUT["attachments"]
+    assert workspace.ops == ["file_info", "file_info"]  # sizes only, no content
+    assert fake.send_calls == [] and fake.upload_calls == []
+
+
+async def test_send_email_attaches_workspace_files_through_the_resumable_upload(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    raw_input = {**ATTACHED_INPUT, "thread_id": "t-9"}
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        raw_input,
+        credentials_key=oauth_key,
+        connectors=_attached_workspace(),
+        approval_grant=_send_grant(raw_input),
+    )
+
+    assert result.status == "ok"
+    assert fake.send_calls == []
+    [call] = fake.upload_calls
+    assert call["thread_id"] == "t-9"
+    mime = message_from_bytes(call["mime"], policy=default)
+    assert mime.get_content_type() == "multipart/mixed"
+    assert mime["To"] == "ana@example.com"
+    assert mime.get_body(("plain",)).get_content().strip() == "¿Cómo estás?"
+    attachments = [
+        (part.get_filename(), part.get_content_type(), part.get_content())
+        for part in mime.iter_attachments()
+    ]
+    assert attachments == [
+        ("f42.pdf", "application/pdf", PDF_BYTES),
+        ("raw.bin", "application/octet-stream", RAW_BIN),
+    ]
+
+
+async def test_send_email_without_attachments_never_contacts_the_workspace(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        SEND_INPUT,
+        credentials_key=oauth_key,
+        approval_grant=_send_grant(),
+    )
+
+    assert result.status == "ok"
+    assert len(fake.send_calls) == 1
+    assert fake.upload_calls == []
+
+
+async def test_send_email_upload_without_the_sent_label_is_not_reported_as_sent(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail(sent={"id": "sent-1", "labelIds": []})
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        ATTACHED_INPUT,
+        credentials_key=oauth_key,
+        connectors=_attached_workspace(),
+        approval_grant=_send_grant(ATTACHED_INPUT),
+    )
+
+    assert (result.status, result.error, result.error_kind) == ("error", "tool_failed", "execution")
+    assert len(fake.upload_calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("workspace", "reason"),
+    [
+        (FakeWorkspace({"Facturas/f42.pdf": PDF_BYTES}), "El archivo no existe."),
+        (FakeWorkspace(online=False), WORKSPACE_OFFLINE_MESSAGE),
+        (None, WORKSPACE_OFFLINE_MESSAGE),
+    ],
+    ids=["missing-file", "offline", "no-connector"],
+)
+async def test_send_email_with_attachments_prechecks_the_workspace_files(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, workspace, reason
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        ATTACHED_INPUT,
+        credentials_key=oauth_key,
+        connectors=workspace,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {reason}"
+    assert fake.send_calls == [] and fake.upload_calls == []
+
+
+async def test_send_email_refuses_attachments_over_gmails_25_mb_before_approval(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    body_bytes = len(SEND_INPUT["body"].encode("utf-8"))
+    workspace = FakeWorkspace({"big.bin": b"\x00" * (MAX_SEND_BYTES - body_bytes + 1)})
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        {**SEND_INPUT, "attachments": ["big.bin"]},
+        credentials_key=oauth_key,
+        connectors=workspace,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "precheck")
+    assert result.error == f"precheck_failed: {ATTACHMENTS_TOO_LARGE}"
+    assert MAX_SEND_BYTES == 25_000_000
+    assert workspace.ops == ["file_info"]
+    assert fake.send_calls == [] and fake.upload_calls == []
+
+
+async def test_send_email_accepts_attachments_filling_exactly_25_mb(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key
+) -> None:
+    await _seed_mailbox(seeded_db, seeded_users[OWNER], oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    body_bytes = len(SEND_INPUT["body"].encode("utf-8"))
+    big = b"\x01" * (MAX_SEND_BYTES - body_bytes)
+    raw_input = {**SEND_INPUT, "attachments": ["big.bin"]}
+
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        raw_input,
+        credentials_key=oauth_key,
+        connectors=FakeWorkspace({"big.bin": big}),
+        approval_grant=_send_grant(raw_input),
+    )
+
+    assert result.status == "ok"
+    [call] = fake.upload_calls
+    [part] = message_from_bytes(call["mime"], policy=default).iter_attachments()
+    assert part.get_content() == big
+
+
+@pytest.mark.parametrize(
+    "attachments",
+    [[""], ["a.pdf"] * 21],
+    ids=["blank", "too-many"],
+)
+async def test_send_email_rejects_invalid_attachment_lists(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, attachments
+) -> None:
+    result = await run_tool(
+        seeded_db,
+        seeded_users[OWNER],
+        mail_registry,
+        "send_email",
+        {**SEND_INPUT, "attachments": attachments},
+        credentials_key=oauth_key,
+    )
+
+    assert (result.status, result.error_kind) == ("error", "validation")
+
+
+#: What ``send_email`` stored for ``SEND_INPUT`` before attachments existed (496514f).
+PRE_ATTACHMENTS_SEND_PAYLOAD: dict[str, Any] = {
+    "to": ["ana@example.com"],
+    "subject": "Hola",
+    "body": "¿Cómo estás?",
+    "cc": [],
+    "bcc": [],
+    "thread_id": None,
+}
+PRE_ATTACHMENTS_SEND_KEY = (
+    "send_email:5a1d9127987dd502ca2e791c28a742ff57b7d607ff17766d002675ebe6a81982"
+)
+
+
+def test_send_email_without_attachments_keeps_its_stored_payload_and_action_key() -> None:
+    """Pending approvals bind the dumped input by hash: no attachments, no change."""
+    plain = SendEmailInput.model_validate(SEND_INPUT)
+    attached = SendEmailInput.model_validate(ATTACHED_INPUT)
+
+    assert plain.model_dump(mode="json") == PRE_ATTACHMENTS_SEND_PAYLOAD
+    assert compute_action_key("send_email", plain) == PRE_ATTACHMENTS_SEND_KEY
+    assert attached.model_dump(mode="json")["attachments"] == ATTACHED_INPUT["attachments"]
+    assert compute_action_key("send_email", attached) != PRE_ATTACHMENTS_SEND_KEY
+
+
+async def test_a_send_requested_before_attachments_existed_still_executes(
+    seeded_db: Database, seeded_users, mail_registry: ToolRegistry, oauth_key, mail_settings
+) -> None:
+    owner = seeded_users[OWNER]
+    await _seed_mailbox(seeded_db, owner, oauth_key)
+    fake = FakeGmail()
+    register_provider("google", fake)
+    async with seeded_db.sessionmaker() as session:
+        session.add(ModuleActivation(tenant_id=owner.tenant_id, module_key="google_mail"))
+        request = await create_approval_request(
+            session, mail_registry, owner, "send_email", SEND_INPUT, settings=mail_settings
+        )
+        await session.commit()
+        request_id = request.id
+    async with seeded_db.sessionmaker() as session:
+        # The row exactly as the previous release wrote it.
+        await session.execute(
+            update(ApprovalRequest)
+            .where(ApprovalRequest.id == request_id)
+            .values(input_payload=PRE_ATTACHMENTS_SEND_PAYLOAD, action_key=PRE_ATTACHMENTS_SEND_KEY)
+        )
+        await session.commit()
+    async with seeded_db.sessionmaker() as session:
+        await approve_request(session, owner, request_id)
+
+    async with seeded_db.sessionmaker() as session:
+        execution = await execute_approved_action(
+            session,
+            mail_registry,
+            owner,
+            request_id,
+            credentials_key=oauth_key,
+            settings=mail_settings,
+        )
+
+    assert execution.result.status == "ok", execution.result.error
+    assert len(fake.send_calls) == 1
+    assert fake.upload_calls == []

@@ -14,7 +14,7 @@ Entry points:
 - :func:`register_default_google_mail` — the production wiring: ``app.main``
   executes it once at import time (reviewed google-mail allowlist change);
   a second call raises ``ModuleRegistrationError``. It ALSO registers the
-  module's scope options provider (G2) AND the six chat tools on the
+  module's scope options provider (G2) AND the seven chat tools on the
   process-wide tool registry (G3) — both folds live here because the
   reviewed ``app.main`` block calls this function once and its own comment
   points here (the manifest duplicate raises first, so a second call stays
