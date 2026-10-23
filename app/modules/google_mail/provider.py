@@ -7,13 +7,17 @@ this seam, never to Google directly:
   fulfils: ``get_profile`` and ``list_labels`` (G1/G2) plus the G3
   operations ``list_messages``, ``get_message``, ``get_message_metadata``
   (G3.1: the per-hit read of the enriched search), ``send_message``, and
-  ``modify_message``;
+  ``modify_message``, plus the attachment operations ``get_attachment`` and
+  ``send_message_upload``;
 - :class:`GoogleGmailProvider` — the MVP adapter: ``get_profile`` reads the
   mailbox profile through the Gmail API with a Bearer header and nothing
   else, proving the connection end to end and surfacing the connected
   address; ``list_labels`` reads ``users.labelsList`` for the G2 scope
   step; the G3 methods read, send, and relabel messages
-  (``users.messagesList``/``Get``/``Send``/``Modify``);
+  (``users.messagesList``/``Get``/``Send``/``Modify``); ``get_attachment``
+  downloads one part body (``users.messages.attachments.get``) and
+  ``send_message_upload`` sends a message too large for the JSON ``raw``
+  body through the resumable ``/upload`` send URI;
 - the registry — provider-name → **factory**, because tokens are per-user
   while the registry is process-wide (same single-process contract as the
   calendar provider registry): :func:`register_provider` overwrites like
@@ -35,6 +39,7 @@ surfaces them as masked ``tool_failed`` results (never a 500, never a
 token leak).
 """
 
+import base64
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol, runtime_checkable
 from urllib.parse import quote
@@ -49,6 +54,25 @@ GOOGLE_GMAIL_LABELS_URL = "https://gmail.googleapis.com/gmail/v1/users/me/labels
 
 #: Gmail API ``users.messages`` collection endpoint (G3: list; send appends ``/send``).
 GOOGLE_GMAIL_MESSAGES_URL = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
+
+#: Gmail API ``users.messagesSend`` media upload URI (resumable: ``uploadType=resumable``).
+GOOGLE_GMAIL_UPLOAD_SEND_URL = "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send"
+
+
+def _is_googleapis_https(url: str) -> bool:
+    """Return whether ``url`` is an absolute HTTPS URL on ``googleapis.com`` or a subdomain.
+
+    A URL carrying userinfo is refused too: httpx would swap the Bearer
+    header for Basic auth built from it. An unparseable URL is refused.
+    """
+    try:
+        parsed = httpx.URL(url)
+        host = parsed.host
+    except (httpx.InvalidURL, ValueError):
+        return False
+    on_googleapis = host == "googleapis.com" or host.endswith(".googleapis.com")
+    return parsed.scheme == "https" and on_googleapis and not parsed.userinfo
+
 
 #: Headers a ``format=metadata`` read asks for (G3.1: what a search hit shows).
 METADATA_HEADERS = ("Subject", "From", "Date")
@@ -98,6 +122,12 @@ class GmailProvider(Protocol):
         remove_label_ids: Sequence[str] | None = None,
     ) -> dict[str, Any]: ...
 
+    async def get_attachment(self, message_id: str, attachment_id: str) -> bytes: ...
+
+    async def send_message_upload(
+        self, *, mime: bytes, thread_id: str | None = None
+    ) -> dict[str, Any]: ...
+
 
 class GoogleGmailProvider:
     """Gmail adapter bound to one user's access token.
@@ -112,17 +142,29 @@ class GoogleGmailProvider:
         self._client = client
 
     async def _request(
-        self, method: str, url: str, *, params: dict[str, Any] | None = None, json: Any = None
+        self,
+        method: str,
+        url: str,
+        *,
+        params: dict[str, Any] | None = None,
+        json: Any = None,
+        content: bytes | None = None,
+        headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        """Send one authenticated request (owned or injected client)."""
-        headers = {"Authorization": f"Bearer {self._access_token}"}
+        """Send one authenticated request (owned or injected client).
+
+        ``content`` is a raw body (the resumable upload's bytes); ``headers``
+        are added to the Bearer header, which they can never replace (userinfo
+        in ``url`` would: callers refuse such URLs, see :func:`_is_googleapis_https`).
+        """
+        request_headers = {**(headers or {}), "Authorization": f"Bearer {self._access_token}"}
         if self._client is not None:
             return await self._client.request(
-                method, url, params=params, json=json, headers=headers
+                method, url, params=params, json=json, content=content, headers=request_headers
             )
         async with httpx.AsyncClient() as owned_client:
             return await owned_client.request(
-                method, url, params=params, json=json, headers=headers
+                method, url, params=params, json=json, content=content, headers=request_headers
             )
 
     @staticmethod
@@ -315,6 +357,76 @@ class GoogleGmailProvider:
         self._raise_for_status(response)
         return self._require_id(self._json_object(response))
 
+    async def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
+        """Download one attachment body (``users.messages.attachments.get``).
+
+        The answer is a ``MessagePartBody`` whose ``data`` is base64url; Gmail
+        may omit its padding, so it is restored before the strict decode.
+
+        Raises:
+            GmailAuthenticationError: the API answered 401/403.
+            GmailNotFoundError: the API answered 404 (message or attachment gone).
+            GmailProviderError: any other non-2xx status, a non-JSON body,
+                or a payload without base64url ``data``.
+            httpx.RequestError: the API could not be reached (engine: 502).
+        """
+        url = (
+            f"{GOOGLE_GMAIL_MESSAGES_URL}/{quote(message_id, safe='')}"
+            f"/attachments/{quote(attachment_id, safe='')}"
+        )
+        response = await self._request("GET", url)
+        self._raise_for_status(response)
+        data = self._json_object(response).get("data")
+        if not isinstance(data, str):
+            raise GmailProviderError("Gmail API response has no attachment data")
+        try:
+            return base64.b64decode(data + "=" * (-len(data) % 4), altchars=b"-_", validate=True)
+        except ValueError as exc:  # binascii.Error, or non-ASCII text
+            raise GmailProviderError("Gmail API attachment data is not base64url") from exc
+
+    async def send_message_upload(
+        self, *, mime: bytes, thread_id: str | None = None
+    ) -> dict[str, Any]:
+        """Send one RFC 822 message through a resumable upload and return its resource.
+
+        For messages too large for :meth:`send_message`'s JSON ``raw`` body:
+        a POST to the ``/upload`` send URI (``uploadType=resumable``) opens a
+        session — the metadata body carries ``threadId`` when replying, the
+        ``X-Upload-Content-*`` headers announce the media — and its
+        ``Location`` header names the session URI, which then receives the
+        raw ``mime`` bytes in one PUT.
+
+        Raises:
+            GmailAuthenticationError: either step answered 401/403.
+            GmailNotFoundError: either step answered 404 (e.g. an expired session).
+            GmailProviderError: any other non-2xx status, an initiation without
+                a ``Location``, a non-JSON message, or one without a string ``id``.
+            httpx.RequestError: the API could not be reached (engine: 502).
+        """
+        metadata: dict[str, Any] = {} if thread_id is None else {"threadId": thread_id}
+        initiation = await self._request(
+            "POST",
+            GOOGLE_GMAIL_UPLOAD_SEND_URL,
+            params={"uploadType": "resumable"},
+            json=metadata,
+            headers={
+                "X-Upload-Content-Type": "message/rfc822",
+                "X-Upload-Content-Length": str(len(mime)),
+            },
+        )
+        self._raise_for_status(initiation)
+        session_url = initiation.headers.get("Location")
+        if not session_url:
+            raise GmailProviderError("Gmail API upload session has no Location")
+        if not _is_googleapis_https(session_url):
+            # The PUT carries the Bearer token, so it only ever goes to Google.
+            raise GmailProviderError("Gmail API upload session Location is not a googleapis URL")
+        response = await self._request(
+            "PUT", session_url, content=mime, headers={"Content-Type": "message/rfc822"}
+        )
+        self._raise_for_status(response)
+        return self._require_id(self._json_object(response))
+
 
 #: Process-wide registry: provider name → factory building a per-user adapter.
 provider_registry: dict[str, Callable[..., GmailProvider]] = {}
@@ -346,6 +458,7 @@ __all__ = [
     "GOOGLE_GMAIL_LABELS_URL",
     "GOOGLE_GMAIL_MESSAGES_URL",
     "GOOGLE_GMAIL_PROFILE_URL",
+    "GOOGLE_GMAIL_UPLOAD_SEND_URL",
     "METADATA_HEADERS",
     "GmailAuthenticationError",
     "GmailNotFoundError",

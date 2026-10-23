@@ -21,6 +21,13 @@ Contract under test (the tester's and tools' HTTP seam, mirroring
 - ``send_message`` POSTs ``users.messagesSend`` with the base64url ``raw``
   MIME and an optional ``threadId``; ``modify_message`` POSTs
   ``users.messagesModify`` with ``addLabelIds``/``removeLabelIds``;
+- ``get_attachment`` GETs ``users.messages.attachments.get`` and decodes the
+  base64url ``data`` (with or without padding) to the attachment's bytes;
+- ``send_message_upload`` sends a large RFC 822 message through the resumable
+  upload protocol: a POST to the ``/upload`` send URI with
+  ``uploadType=resumable``, the ``X-Upload-Content-*`` headers and the
+  ``threadId`` metadata, then a PUT of the raw bytes to the session URI the
+  ``Location`` header names;
 - 401/403 → :class:`GmailAuthenticationError` (the tester answers False);
   404 → :class:`GmailNotFoundError` (a :class:`GmailProviderError`
   subclass, so a search can skip a message deleted between list and get);
@@ -32,6 +39,8 @@ Contract under test (the tester's and tools' HTTP seam, mirroring
   like ``register_tester``, ``get_provider`` raises :class:`UnknownProviderError`.
 """
 
+import base64
+import json
 from typing import Any
 
 import httpx
@@ -64,6 +73,25 @@ def provider_registry_clean() -> Any:
 
 def test_google_adapter_satisfies_the_gmail_provider_protocol() -> None:
     assert isinstance(GoogleGmailProvider(ACCESS_TOKEN), GmailProvider)
+
+
+def test_gmail_provider_protocol_declares_the_attachment_operations() -> None:
+    legacy = (
+        "get_profile",
+        "list_labels",
+        "list_messages",
+        "get_message",
+        "get_message_metadata",
+        "send_message",
+        "modify_message",
+    )
+
+    def stub(*names: str) -> object:
+        return type("Stub", (), {name: lambda self: None for name in names})()
+
+    assert isinstance(stub(*legacy, "get_attachment", "send_message_upload"), GmailProvider)
+    assert not isinstance(stub(*legacy, "get_attachment"), GmailProvider)
+    assert not isinstance(stub(*legacy, "send_message_upload"), GmailProvider)
 
 
 async def test_get_profile_sends_bearer_and_returns_the_payload() -> None:
@@ -430,6 +458,31 @@ async def test_send_message_maps_other_errors_to_provider_error() -> None:
             await provider.send_message(raw_mime_b64url="cmF3")
 
 
+async def test_send_message_still_posts_one_json_request_to_the_send_endpoint() -> None:
+    """The JSON ``raw`` path is unchanged by the resumable upload sharing ``_request``."""
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request.read()
+        requests.append(request)
+        return httpx.Response(200, json={"id": "sent-1", "threadId": "t-9"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        payload = await provider.send_message(raw_mime_b64url="cmF3", thread_id="t-9")
+
+    assert payload == {"id": "sent-1", "threadId": "t-9"}
+    assert len(requests) == 1
+    (request,) = requests
+    assert request.method == "POST"
+    assert str(request.url) == f"{GOOGLE_GMAIL_MESSAGES_URL}/send"
+    assert request.headers["Authorization"] == f"Bearer {ACCESS_TOKEN}"
+    assert request.headers["Content-Type"] == "application/json"
+    assert "X-Upload-Content-Type" not in request.headers
+    assert "X-Upload-Content-Length" not in request.headers
+    assert json.loads(request.content) == {"raw": "cmF3", "threadId": "t-9"}
+
+
 # --- modify_message (users.messagesModify) --------------------------------------
 
 
@@ -499,6 +552,305 @@ async def test_modify_message_maps_other_errors_to_provider_error() -> None:
         provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
         with pytest.raises(GmailProviderError):
             await provider.modify_message(message_id="m1")
+
+
+# --- get_attachment (users.messages.attachments.get) ----------------------------
+
+#: Every byte value, so the base64url form uses ``-``/``_`` and needs padding.
+ATTACHMENT_BYTES = bytes(range(256))
+ATTACHMENT_PADDED = base64.urlsafe_b64encode(ATTACHMENT_BYTES).decode("ascii")
+ATTACHMENT_UNPADDED = ATTACHMENT_PADDED.rstrip("=")
+
+
+def test_attachment_fixture_exercises_the_url_safe_alphabet_and_padding() -> None:
+    assert "-" in ATTACHMENT_PADDED and "_" in ATTACHMENT_PADDED
+    assert ATTACHMENT_PADDED.endswith("=") and not ATTACHMENT_UNPADDED.endswith("=")
+
+
+@pytest.mark.parametrize(
+    "data", [ATTACHMENT_PADDED, ATTACHMENT_UNPADDED], ids=["padded", "unpadded"]
+)
+async def test_get_attachment_gets_the_part_body_and_returns_the_decoded_bytes(
+    data: str,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200, json={"attachmentId": "ANGj-d_9", "size": len(ATTACHMENT_BYTES), "data": data}
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        content = await provider.get_attachment("m1", "ANGj-d_9")
+
+    assert content == ATTACHMENT_BYTES
+    assert len(requests) == 1
+    (request,) = requests
+    assert request.method == "GET"
+    assert str(request.url) == f"{GOOGLE_GMAIL_MESSAGES_URL}/m1/attachments/ANGj-d_9"
+    assert request.headers["Authorization"] == f"Bearer {ACCESS_TOKEN}"
+
+
+async def test_get_attachment_returns_empty_bytes_for_an_empty_part() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"size": 0, "data": ""})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        assert await provider.get_attachment("m1", "a1") == b""
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"attachmentId": "a1", "size": 3}, {"size": 3, "data": None}, {"size": 3, "data": 123}],
+)
+async def test_get_attachment_requires_string_data(payload: dict[str, Any]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="data"):
+            await provider.get_attachment("m1", "a1")
+
+
+@pytest.mark.parametrize(
+    "data", ["a", "ab!c", "é"], ids=["bad-length", "bad-alphabet", "non-ascii"]
+)
+async def test_get_attachment_rejects_data_that_is_not_base64url(data: str) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"size": 1, "data": data})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="data"):
+            await provider.get_attachment("m1", "a1")
+
+
+async def test_get_attachment_rejects_non_json_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>not json</html>")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="non-JSON"):
+            await provider.get_attachment("m1", "a1")
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [
+        (401, GmailAuthenticationError),
+        (403, GmailAuthenticationError),
+        (404, GmailNotFoundError),
+        (500, GmailProviderError),
+    ],
+)
+async def test_get_attachment_maps_http_errors(status: int, error: type[Exception]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json={"error": {"code": status}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(error) as caught:
+            await provider.get_attachment("m1", "a1")
+
+    assert type(caught.value) is error
+
+
+# --- send_message_upload (users.messagesSend, resumable upload) -----------------
+
+#: The resumable upload URI, spelled out so a constant change cannot hide a drift.
+UPLOAD_INITIATION_URL = (
+    "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=resumable"
+)
+#: The session URI Google returns in ``Location`` (its own query must survive verbatim).
+SESSION_URL = (
+    "https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send"
+    "?uploadType=resumable&upload_id=xa298sd_sdlkj2"
+)
+#: An RFC 822 message whose body carries every byte value, CRLF included.
+UPLOAD_MIME = b"From: agent@acme.test\r\nSubject: Report\r\n\r\n" + bytes(range(256))
+
+
+def _upload_handler(
+    requests: list[httpx.Request],
+    *,
+    initiation: httpx.Response | None = None,
+    upload: httpx.Response | None = None,
+) -> Any:
+    """Answer the initiation POST, then the session PUT, recording both requests."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        request.read()
+        requests.append(request)
+        if request.method == "POST":
+            return initiation or httpx.Response(200, headers={"Location": SESSION_URL})
+        return upload or httpx.Response(201, json={"id": "sent-1", "threadId": "t-9"})
+
+    return handler
+
+
+@pytest.mark.parametrize("upload_status", [200, 201])
+async def test_send_message_upload_initiates_a_session_and_puts_the_raw_message(
+    upload_status: int,
+) -> None:
+    requests: list[httpx.Request] = []
+    resource = {"id": "sent-1", "threadId": "t-9", "labelIds": ["SENT"]}
+    handler = _upload_handler(requests, upload=httpx.Response(upload_status, json=resource))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        payload = await provider.send_message_upload(mime=UPLOAD_MIME, thread_id="t-9")
+
+    assert payload == resource
+    assert [request.method for request in requests] == ["POST", "PUT"]
+    initiation, upload = requests
+
+    assert str(initiation.url) == UPLOAD_INITIATION_URL
+    assert initiation.url.params.get("uploadType") == "resumable"
+    assert initiation.headers["Authorization"] == f"Bearer {ACCESS_TOKEN}"
+    assert initiation.headers["X-Upload-Content-Type"] == "message/rfc822"
+    assert initiation.headers["X-Upload-Content-Length"] == str(len(UPLOAD_MIME))
+    assert initiation.headers["Content-Type"] == "application/json"
+    assert json.loads(initiation.content) == {"threadId": "t-9"}
+
+    assert str(upload.url) == SESSION_URL
+    assert upload.headers["Authorization"] == f"Bearer {ACCESS_TOKEN}"
+    assert upload.headers["Content-Type"] == "message/rfc822"
+    assert upload.headers["Content-Length"] == str(len(UPLOAD_MIME))
+    assert "X-Upload-Content-Type" not in upload.headers
+    assert upload.content == UPLOAD_MIME
+
+
+async def test_send_message_upload_sends_empty_metadata_without_a_thread() -> None:
+    requests: list[httpx.Request] = []
+    handler = _upload_handler(requests)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        payload = await provider.send_message_upload(mime=UPLOAD_MIME)
+
+    assert payload == {"id": "sent-1", "threadId": "t-9"}
+    initiation, upload = requests
+    assert str(initiation.url) == UPLOAD_INITIATION_URL
+    assert json.loads(initiation.content) == {}
+    assert upload.content == UPLOAD_MIME
+
+
+async def test_send_message_upload_requires_the_session_location() -> None:
+    requests: list[httpx.Request] = []
+    handler = _upload_handler(requests, initiation=httpx.Response(200))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="Location"):
+            await provider.send_message_upload(mime=UPLOAD_MIME)
+
+    assert [request.method for request in requests] == ["POST"]  # nothing uploaded
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send?upload_id=x",
+        "https://uploads.example.test/upload?upload_id=x",
+        "https://googleapis.com.example.test/upload?upload_id=x",
+        "/upload/gmail/v1/users/me/messages/send?upload_id=x",
+        "https://user:secret@gmail.googleapis.com/upload?upload_id=x",
+        "https://[",
+    ],
+)
+async def test_send_message_upload_refuses_a_session_outside_googleapis(location: str) -> None:
+    requests: list[httpx.Request] = []
+    handler = _upload_handler(
+        requests, initiation=httpx.Response(200, headers={"Location": location})
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="Location"):
+            await provider.send_message_upload(mime=UPLOAD_MIME)
+
+    assert [request.method for request in requests] == ["POST"]  # the token never left
+
+
+async def test_send_message_upload_accepts_the_documented_www_googleapis_session() -> None:
+    requests: list[httpx.Request] = []
+    location = "https://www.googleapis.com/upload/gmail/v1/users/me/messages/send?upload_id=x"
+    handler = _upload_handler(
+        requests, initiation=httpx.Response(200, headers={"Location": location})
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        await provider.send_message_upload(mime=UPLOAD_MIME)
+
+    assert str(requests[1].url) == location
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [(401, GmailAuthenticationError), (403, GmailAuthenticationError), (500, GmailProviderError)],
+)
+async def test_send_message_upload_maps_initiation_errors(
+    status: int, error: type[Exception]
+) -> None:
+    requests: list[httpx.Request] = []
+    failure = httpx.Response(status, headers={"Location": SESSION_URL}, json={"error": {}})
+    handler = _upload_handler(requests, initiation=failure)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(error) as caught:
+            await provider.send_message_upload(mime=UPLOAD_MIME)
+
+    assert type(caught.value) is error
+    assert [request.method for request in requests] == ["POST"]
+
+
+@pytest.mark.parametrize(
+    ("status", "error"),
+    [
+        (401, GmailAuthenticationError),
+        (403, GmailAuthenticationError),
+        (404, GmailNotFoundError),
+        (500, GmailProviderError),
+    ],
+)
+async def test_send_message_upload_maps_upload_errors(status: int, error: type[Exception]) -> None:
+    requests: list[httpx.Request] = []
+    handler = _upload_handler(requests, upload=httpx.Response(status, json={"error": {}}))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(error) as caught:
+            await provider.send_message_upload(mime=UPLOAD_MIME)
+
+    assert type(caught.value) is error
+    assert [request.method for request in requests] == ["POST", "PUT"]
+
+
+async def test_send_message_upload_requires_an_id_in_the_message() -> None:
+    requests: list[httpx.Request] = []
+    handler = _upload_handler(requests, upload=httpx.Response(201, json={"threadId": "t-9"}))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="id"):
+            await provider.send_message_upload(mime=UPLOAD_MIME)
+
+
+async def test_send_message_upload_rejects_a_non_json_message() -> None:
+    requests: list[httpx.Request] = []
+    handler = _upload_handler(requests, upload=httpx.Response(201, text="<html>nope</html>"))
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = GoogleGmailProvider(ACCESS_TOKEN, client=client)
+        with pytest.raises(GmailProviderError, match="non-JSON"):
+            await provider.send_message_upload(mime=UPLOAD_MIME)
 
 
 def test_registry_stores_factories_and_overwrites() -> None:
